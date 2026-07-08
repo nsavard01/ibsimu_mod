@@ -1,0 +1,225 @@
+Ion Beam Simulator 1.0.6dev (89c1280, Thu Oct 26 17:14:45 2023 +0300)
+------------ Test1 ------------
+Constructing geometry
+  origo     =        -0.05        -0.05            0
+  size      =           11           11            1
+  max       =         0.05         0.05            0
+  h         = 0.01
+  nodecount = 121
+  Done
+Building mesh
+  Done. Built mesh with:
+  81 pure vacuum nodes
+  0 near solid nodes
+  0 neumann nodes
+  40 dirichlet nodes
+  time used = 0.000611 s (0.000509 s realtime)
+Solving problem
+  dof = 81
+  Using BiCGSTAB-ILU0 solver (imax = 10000, eps = 0.0001, threads = 4)
+  
+  error estimate = 0
+  iterations = 0
+  
+  Timing summary:
+    SpMV          : 0.0171869 s
+    Preconditioner: 0 s
+    Dot products  : 0 s
+    Norms         : 0.00403884 s
+    Vector ops    : 0 s
+  time used = 0.048932 s (0.021486 s realtime)
+Calculating efield
+Calculating particle trajectories
+  Using solid collision model
+  Using relativistic iterator
+  Finalizing space charge density map (PIC method)
+  Particle histories (1 total):
+    flown = 0
+    time limited = 0
+    step count limited = 1
+    bad definitions = 0
+    beam to boundary 1 = 0 A/m (0 particles)
+    beam to boundary 2 = 0 A/m (0 particles)
+    beam to boundary 3 = 0 A/m (0 particles)
+    beam to boundary 4 = 0 A/m (0 particles)
+    beam to boundary 5 = 0 A/m (0 particles)
+    beam to boundary 6 = 0 A/m (0 particles)
+    total steps = 100
+    steps per particle (ave) = 100
+  time used = 0.063721 s (0.002011 s realtime)
+Making trajectory diagnostics at y = 0
+  number of trajectories = 13
+  total current = 0 A/m
+Plotting to PNG-file "particles_relativistic.png"
+------------ Test2 ------------
+Constructing geometry
+  origo     =            0        -0.05        -0.05
+  size      =           51           51           51
+  max       =          0.1         0.05         0.05
+  h         = 0.002
+  nodecount = 132651
+  Done
+Building mesh
+  Done. Built mesh with:
+  94312 pure vacuum nodes
+  5263 near solid nodes
+  7800 neumann nodes
+  25276 dirichlet nodes
+  12594 solid 7 nodes
+  12586 solid 8 nodes
+  time used = 0.043059 s (0.021138 s realtime)
+Calculating efield
+Solving problem
+  dof = 107375
+  Using BiCGSTAB-ILU0 solver (imax = 10000, eps = 0.0001, threads = 4)
+  
+  error estimate = 4.83299e-05
+  iterations = 23
+  
+  Timing summary:
+    SpMV          : 0.0349991 s
+    Preconditioner: 0.0864054 s
+    Dot products  : 0.00910014 s
+    Norms         : 0.00551181 s
+    Vector ops    : 0.0191075 s
+  time used = 4.04746 s (0.161855 s realtime)
+Calculating efield
+Defining a cylindrical beam
+  Total beam current 3.92699 A
+Calculating particle trajectories
+  Using solid collision model
+  Using relativistic iterator
+  Finalizing space charge density map (PIC method)
+  Particle histories (4000 total):
+    flown = 4000
+    time limited = 0
+    step count limited = 0
+    bad definitions = 0
+    beam to boundary 1 = 0 A (0 particles)
+    beam to boundary 2 = -3.92699 A (4000 particles)
+    beam to boundary 3 = 0 A (0 particles)
+    beam to boundary 4 = 0 A (0 particles)
+    beam to boundary 5 = 0 A (0 particles)
+    beam to boundary 6 = 0 A (0 particles)
+    beam to boundary 7 = 0 A (0 particles)
+    beam to boundary 8 = 0 A (0 particles)
+    total steps = 208858
+    steps per particle (ave) = 52.2145
+  time used = 0.78029 s (0.203175 s realtime)
+Solving problem
+  dof = 107375
+  Using BiCGSTAB-ILU0 solver (imax = 10000, eps = 0.0001, threads = 4)
+  
+  error estimate = 6.83917e-05
+  iterations = 1
+  
+  Timing summary:
+    SpMV          : 0.036052 s
+    Preconditioner: 0.0883832 s
+    Dot products  : 0.00962006 s
+    Norms         : 0.00575968 s
+    Vector ops    : 0.019748 s
+  time used = 0.207121 s (0.045289 s realtime)
+Calculating efield
+Defining a cylindrical beam
+  Total beam current 3.92699 A
+Calculating particle trajectories
+  Using solid collision model
+  Using relativistic iterator
+  Finalizing space charge density map (PIC method)
+  Particle histories (4000 total):
+    flown = 4000
+    time limited = 0
+    step count limited = 0
+    bad definitions = 0
+    beam to boundary 1 = 0 A (0 particles)
+    beam to boundary 2 = -3.92699 A (4000 particles)
+    beam to boundary 3 = 0 A (0 particles)
+    beam to boundary 4 = 0 A (0 particles)
+    beam to boundary 5 = 0 A (0 particles)
+    beam to boundary 6 = 0 A (0 particles)
+    beam to boundary 7 = 0 A (0 particles)
+    beam to boundary 8 = 0 A (0 particles)
+    total steps = 279795
+    steps per particle (ave) = 69.9488
+  time used = 1.27602 s (0.273877 s realtime)
+Solving problem
+  dof = 107375
+  Using BiCGSTAB-ILU0 solver (imax = 10000, eps = 0.0001, threads = 4)
+  
+  error estimate = 9.03209e-05
+  iterations = 0
+  
+  Timing summary:
+    SpMV          : 0.0367229 s
+    Preconditioner: 0.0883832 s
+    Dot products  : 0.00962006 s
+    Norms         : 0.00598823 s
+    Vector ops    : 0.019748 s
+  time used = 0.106771 s (0.040528 s realtime)
+Calculating efield
+Defining a cylindrical beam
+  Total beam current 3.92699 A
+Calculating particle trajectories
+  Using solid collision model
+  Using relativistic iterator
+  Finalizing space charge density map (PIC method)
+  Particle histories (4000 total):
+    flown = 4000
+    time limited = 0
+    step count limited = 0
+    bad definitions = 0
+    beam to boundary 1 = 0 A (0 particles)
+    beam to boundary 2 = -3.92699 A (4000 particles)
+    beam to boundary 3 = 0 A (0 particles)
+    beam to boundary 4 = 0 A (0 particles)
+    beam to boundary 5 = 0 A (0 particles)
+    beam to boundary 6 = 0 A (0 particles)
+    beam to boundary 7 = 0 A (0 particles)
+    beam to boundary 8 = 0 A (0 particles)
+    total steps = 279795
+    steps per particle (ave) = 69.9488
+  time used = 1.17548 s (0.255407 s realtime)
+Solving problem
+  dof = 107375
+  Using BiCGSTAB-ILU0 solver (imax = 10000, eps = 0.0001, threads = 4)
+  
+  error estimate = 9.03209e-05
+  iterations = 0
+  
+  Timing summary:
+    SpMV          : 0.0372783 s
+    Preconditioner: 0.0883832 s
+    Dot products  : 0.00962006 s
+    Norms         : 0.00624339 s
+    Vector ops    : 0.019748 s
+  time used = 0.084013 s (0.0237 s realtime)
+Calculating efield
+Defining a cylindrical beam
+  Total beam current 3.92699 A
+Calculating particle trajectories
+  Using solid collision model
+  Using relativistic iterator
+  Finalizing space charge density map (PIC method)
+  Particle histories (4000 total):
+    flown = 4000
+    time limited = 0
+    step count limited = 0
+    bad definitions = 0
+    beam to boundary 1 = 0 A (0 particles)
+    beam to boundary 2 = -3.92699 A (4000 particles)
+    beam to boundary 3 = 0 A (0 particles)
+    beam to boundary 4 = 0 A (0 particles)
+    beam to boundary 5 = 0 A (0 particles)
+    beam to boundary 6 = 0 A (0 particles)
+    beam to boundary 7 = 0 A (0 particles)
+    beam to boundary 8 = 0 A (0 particles)
+    total steps = 279795
+    steps per particle (ave) = 69.9488
+  time used = 1.2176 s (0.266284 s realtime)
+Plotting to PNG-file "particles_relativistic2_xy.png"
+Making trajectory diagnostics at x = 0.1
+  number of trajectories = 4000
+  total current = -3.92699 A
+Ending simulation
+  time used = 10.3635 s (1.49228 s realtime)

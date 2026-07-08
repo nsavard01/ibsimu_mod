@@ -1,0 +1,33 @@
+Ion Beam Simulator 1.0.6dev (89c1280, Thu Oct 26 17:14:45 2023 +0300)
+Constructing geometry
+  origo     =            0            0            0
+  size      =           41           41            1
+  max       =         0.08         0.08            0
+  h         = 0.002
+  nodecount = 1681
+  Done
+Building mesh
+  Done. Built mesh with:
+  787 pure vacuum nodes
+  66 near solid nodes
+  44 neumann nodes
+  784 dirichlet nodes
+  98 solid 7 nodes
+  686 solid 8 nodes
+  time used = 0.000805 s (0.00079 s realtime)
+Solving problem
+  dof = 897
+  Using BiCGSTAB-ILU0 solver (imax = 10000, eps = 0.0001, threads = 4)
+  
+  error estimate = 6.88096e-05
+  iterations = 18
+  
+  Timing summary:
+    SpMV          : 0.0187215 s
+    Preconditioner: 0.00164053 s
+    Dot products  : 0.000153927 s
+    Norms         : 0.00414287 s
+    Vector ops    : 0.000284344 s
+  time used = 0.143686 s (0.025473 s realtime)
+Ending simulation
+  time used = 0.552906 s (0.03997 s realtime)
