@@ -1,3 +1,0 @@
-compmath.lo: compmath.cpp /usr/include/stdc-predef.h compmath.hpp
-/usr/include/stdc-predef.h:
-compmath.hpp:

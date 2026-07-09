@@ -1,3 +1,0 @@
-sort.lo: sort.cpp /usr/include/stdc-predef.h sort.hpp
-/usr/include/stdc-predef.h:
-sort.hpp:

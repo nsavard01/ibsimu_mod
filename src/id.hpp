@@ -1,1 +1,0 @@
-#define IBSIMU_GIT_ID "89c1280, Thu Oct 26 17:14:45 2023 +0300"

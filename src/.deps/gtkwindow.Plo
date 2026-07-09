@@ -1,3 +1,0 @@
-gtkwindow.lo: gtkwindow.cpp /usr/include/stdc-predef.h gtkwindow.hpp
-/usr/include/stdc-predef.h:
-gtkwindow.hpp:
