@@ -98,6 +98,35 @@ std::string GMG_Precond::typestring( void ) const
  * Hierarchy construction
  */
 
+/* Refreshes _level[0]'s VALUES only, in place, reusing the ptr/col
+ * layout already established by build_level0() in prepare(). Safe
+ * because A's sparsity PATTERN is invariant for the lifetime of this
+ * preconditioner (fixed by geometry/discretization), so only VALUES
+ * need updating from one construct() call to the next -- e.g. every
+ * Newton round and every major cycle, as the nonlinear plasma model's
+ * Jacobian diagonal evolves with the current potential. Mirrors
+ * build_level0()'s value-assignment loop exactly (same order), just
+ * without touching ptr/col or re-pushing a level.
+ */
+void GMG_Precond::refresh_level0_values( const CRowMatrix &A )
+{
+    Level &lev = _level[0];
+    int nfull = (int)_node_map.size();
+
+    for( int m = 0; m < nfull; m++ ) {
+        int32_t r = _node_map[m];
+        int p = lev.ptr[m];
+        if( r < 0 ) {
+            lev.val[p] = 1.0;
+        } else {
+            int a0 = A.ptr(r), a1 = A.ptr(r+1);
+            for( int a = a0; a < a1; a++, p++ )
+                lev.val[p] = A.val(a);
+        }
+    }
+}
+
+
 /* Embeds matrix A (A.rows() == number of *free* nodes, "dof") into a
  * level-0 operator sized nx0*ny0*nz0 (the full mesh), using
  * _node_map/_row_to_node built by prepare(). Every eliminated
@@ -549,10 +578,43 @@ void GMG_Precond::prepare( const CRowMatrix &A )
 }
 
 
+/* prepare() (called once, lazily, from here on first use) builds
+ * everything that depends only on A's sparsity PATTERN: level sizing,
+ * the geometric transfer operators P/R, and the red/black/leftover
+ * coloring at every level -- all fixed for the lifetime of this
+ * preconditioner, since the discretization's nonzero pattern never
+ * changes (only the nonlinear plasma model's Jacobian VALUES do, via
+ * its diagonal contribution). prepare() also performs an initial
+ * values pass (level-0 embedding + Galerkin coarsening) as a side
+ * effect of bootstrapping the hierarchy, which is why construct()
+ * does not need to repeat that work on the very first call.
+ *
+ * Every call after the first must still refresh VALUE-dependent state
+ * throughout the hierarchy: level 0's embedded values (from A, which
+ * generally differs from the matrix prepare() last saw -- e.g. a new
+ * Newton round or new major cycle), level 0's diagonal, and every
+ * coarser level's Galerkin-coarsened operator + diagonal (rebuilt from
+ * the now-current fine values). Skipping this after the first call was
+ * a real bug: it silently reused a hierarchy frozen at whatever
+ * Jacobian prepare() happened to see once, for the rest of the
+ * preconditioner's lifetime, degrading (though never breaking
+ * correctness of) BiCGSTAB's convergence rate more and more as the
+ * actual matrix drifted from that frozen snapshot.
+ */
 void GMG_Precond::construct( const CRowMatrix &A )
 {
-    if( !_prepared )
+    if( !_prepared ) {
         prepare( A );
+        return;
+    }
+
+    refresh_level0_values( A );
+    find_diagonals( _level[0] );
+
+    for( size_t l = 1; l < _level.size(); l++ ) {
+        galerkin_coarsen( _level[l-1], _level[l] );
+        find_diagonals( _level[l] );
+    }
 }
 
 
@@ -675,12 +737,10 @@ void GMG_Precond::smooth_to_convergence( const Level &lev, std::vector<double> &
                     relax_serial( lev, x, b, lev.leftover, w );
             }
 
-            if( (s + 1) % 10 == 0 ) {
-                double rn2 = residual_norm2( lev, x, b, r );
-                if( rn2 <= rtol*rtol*rn2_0 ) {
-                    s++;
-                    break;
-                }
+            double rn2 = residual_norm2( lev, x, b, r );
+            if( rn2 <= rtol*rtol*rn2_0 ) {
+                s++;
+                break;
             }
         }
     }
