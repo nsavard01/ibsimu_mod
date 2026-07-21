@@ -524,6 +524,12 @@ uint8_t Geometry::bracket_ndist( int32_t i, int32_t j, int32_t k, int32_t solid,
 }
 
 
+double Geometry::solid_face_frac( int32_t i, int32_t j, int32_t k, uint32_t solid, int sign, int coord ) const
+{
+    return( bracket_ndist( i, j, k, (int32_t)solid, sign, coord ) / 255.0 );
+}
+
+
 Vec3D Geometry::surface_normal( const Vec3D &x ) const
 {
     switch( geom_mode() ) {
@@ -1158,6 +1164,129 @@ void Geometry::build_mesh_parallel_prepare_1d( void )
 }
 
 
+/* See the doc comment on override_dielectric_box_boundary_3d() in the
+ * header for the full rationale: a dielectric solid's interior tag
+ * (SMESH_NODE_ID_PURE_VACUUM with the solid number in its lower bits)
+ * is applied before box-edge classification and, unlike a Dirichlet
+ * solid, is never itself excluded from further consideration by that
+ * pass -- so if the dielectric reaches the simulation box edge, that
+ * boundary layer is left tagged as ordinary free interior instead of
+ * the box's actual Dirichlet/Neumann condition, which is both
+ * physically wrong right at that surface and a mesh-edge read past
+ * the domain in add_vacuum_node().
+ */
+void Geometry::override_dielectric_box_boundary_3d( void )
+{
+    // Deliberately mirrors build_mesh_parallel_prepare_3d()'s own
+    // box-edge decision tree exactly (all six Dirichlet-type checks
+    // first, in axis order, then all six Neumann-type checks, same
+    // order) -- not just "whichever face is handled last in some loop
+    // wins" -- so a dielectric-claimed boundary/edge/corner cell
+    // resolves to *exactly* the same classification a non-dielectric
+    // vacuum cell in that position would have gotten. An earlier
+    // version of this function got this wrong (checked one face's
+    // Dirichlet-or-Neumann in isolation, in a per-face loop), which
+    // would have misclassified shared edge/corner cells relative to
+    // the ordinary vacuum case.
+    for( int32_t k = 0; k < _size[2]; k++ ) {
+	for( int32_t j = 0; j < _size[1]; j++ ) {
+	    for( int32_t i = 0; i < _size[0]; i++ ) {
+
+		uint32_t node = mesh(i,j,k);
+		if( (node & SMESH_NODE_ID_MASK) != SMESH_NODE_ID_PURE_VACUUM ||
+		    (node & SMESH_NEAR_SOLID_INDEX_MASK) == 0 )
+		    continue; // not a dielectric node here -- nothing to fix
+
+		if( i == 0 && get_boundary(1).type() == BOUND_DIRICHLET )
+		    mesh(i,j,k) = SMESH_NODE_ID_DIRICHLET | 1;
+		else if( i == _size[0]-1 && get_boundary(2).type() == BOUND_DIRICHLET )
+		    mesh(i,j,k) = SMESH_NODE_ID_DIRICHLET | 2;
+		else if( j == 0 && get_boundary(3).type() == BOUND_DIRICHLET )
+		    mesh(i,j,k) = SMESH_NODE_ID_DIRICHLET | 3;
+		else if( j == _size[1]-1 && get_boundary(4).type() == BOUND_DIRICHLET )
+		    mesh(i,j,k) = SMESH_NODE_ID_DIRICHLET | 4;
+		else if( k == 0 && get_boundary(5).type() == BOUND_DIRICHLET )
+		    mesh(i,j,k) = SMESH_NODE_ID_DIRICHLET | 5;
+		else if( k == _size[2]-1 && get_boundary(6).type() == BOUND_DIRICHLET )
+		    mesh(i,j,k) = SMESH_NODE_ID_DIRICHLET | 6;
+		else if( i == 0 )
+		    mesh(i,j,k) = SMESH_NODE_ID_NEUMANN | 1;
+		else if( i == _size[0]-1 )
+		    mesh(i,j,k) = SMESH_NODE_ID_NEUMANN | 2;
+		else if( j == 0 )
+		    mesh(i,j,k) = SMESH_NODE_ID_NEUMANN | 3;
+		else if( j == _size[1]-1 )
+		    mesh(i,j,k) = SMESH_NODE_ID_NEUMANN | 4;
+		else if( k == 0 )
+		    mesh(i,j,k) = SMESH_NODE_ID_NEUMANN | 5;
+		else if( k == _size[2]-1 )
+		    mesh(i,j,k) = SMESH_NODE_ID_NEUMANN | 6;
+		// else: not on any box edge -- genuinely interior
+		// dielectric node, left untouched.
+	    }
+	}
+    }
+}
+
+
+/* See override_dielectric_box_boundary_3d() -- same rationale, and same
+ * "mirror build_mesh_parallel_prepare_2d()'s decision tree exactly"
+ * requirement, 2d/CYL.
+ */
+void Geometry::override_dielectric_box_boundary_2d( void )
+{
+    for( int32_t j = 0; j < _size[1]; j++ ) {
+	for( int32_t i = 0; i < _size[0]; i++ ) {
+
+	    uint32_t node = mesh(i,j);
+	    if( (node & SMESH_NODE_ID_MASK) != SMESH_NODE_ID_PURE_VACUUM ||
+		(node & SMESH_NEAR_SOLID_INDEX_MASK) == 0 )
+		continue;
+
+	    if( i == 0 && get_boundary(1).type() == BOUND_DIRICHLET )
+		mesh(i,j) = SMESH_NODE_ID_DIRICHLET | 1;
+	    else if( i == _size[0]-1 && get_boundary(2).type() == BOUND_DIRICHLET )
+		mesh(i,j) = SMESH_NODE_ID_DIRICHLET | 2;
+	    else if( j == 0 && get_boundary(3).type() == BOUND_DIRICHLET )
+		mesh(i,j) = SMESH_NODE_ID_DIRICHLET | 3;
+	    else if( j == _size[1]-1 && get_boundary(4).type() == BOUND_DIRICHLET )
+		mesh(i,j) = SMESH_NODE_ID_DIRICHLET | 4;
+	    else if( i == 0 )
+		mesh(i,j) = SMESH_NODE_ID_NEUMANN | 1;
+	    else if( i == _size[0]-1 )
+		mesh(i,j) = SMESH_NODE_ID_NEUMANN | 2;
+	    else if( j == 0 )
+		mesh(i,j) = SMESH_NODE_ID_NEUMANN | 3;
+	    else if( j == _size[1]-1 )
+		mesh(i,j) = SMESH_NODE_ID_NEUMANN | 4;
+	}
+    }
+}
+
+
+/* See override_dielectric_box_boundary_3d() -- same rationale, 1d. */
+void Geometry::override_dielectric_box_boundary_1d( void )
+{
+    uint32_t node = mesh(0);
+    if( (node & SMESH_NODE_ID_MASK) == SMESH_NODE_ID_PURE_VACUUM &&
+	(node & SMESH_NEAR_SOLID_INDEX_MASK) != 0 ) {
+	if( get_boundary(1).type() == BOUND_DIRICHLET )
+	    mesh(0) = SMESH_NODE_ID_DIRICHLET | 1;
+	else
+	    mesh(0) = SMESH_NODE_ID_NEUMANN | 1;
+    }
+
+    node = mesh(_size[0]-1);
+    if( (node & SMESH_NODE_ID_MASK) == SMESH_NODE_ID_PURE_VACUUM &&
+	(node & SMESH_NEAR_SOLID_INDEX_MASK) != 0 ) {
+	if( get_boundary(2).type() == BOUND_DIRICHLET )
+	    mesh(_size[0]-1) = SMESH_NODE_ID_DIRICHLET | 2;
+	else
+	    mesh(_size[0]-1) = SMESH_NODE_ID_NEUMANN | 2;
+    }
+}
+
+
 /* Mesh building, OpenMP notes
  * ----------------------------
  * Marking which solid (if any) each mesh node belongs to used to be done
@@ -1302,6 +1431,10 @@ void Geometry::build_mesh_parallel_thread_3d( void )
     // Serial part: mark box boundaries/vacuum and prepare near solid data
     build_mesh_parallel_prepare_3d();
 
+    // Fix up any dielectric solid that reaches the box edge -- see the
+    // doc comment on override_dielectric_box_boundary_3d().
+    override_dielectric_box_boundary_3d();
+
     // Parallel: Build near solid data
 #pragma omp parallel for num_threads(nthreads) collapse(3) schedule(dynamic,64)
     for( int32_t k = 0; k < _size[2]; k++ ) {
@@ -1363,6 +1496,11 @@ void Geometry::build_mesh_parallel_thread_2d( void )
     // Serial part: mark box boundaries/vacuum and prepare near solid data
     build_mesh_parallel_prepare_2d();
 
+    // Fix up any dielectric solid that reaches the box edge -- see the
+    // doc comment on override_dielectric_box_boundary_3d() (same
+    // rationale, 2d/CYL).
+    override_dielectric_box_boundary_2d();
+
     // Parallel: Build near solid data
 #pragma omp parallel for num_threads(nthreads) collapse(2) schedule(dynamic,64)
     for( int32_t j = 0; j < _size[1]; j++ ) {
@@ -1399,6 +1537,11 @@ void Geometry::build_mesh_parallel_thread_1d( void )
 
     // Mark rest of mesh nodes and prepare for building near solid data
     build_mesh_parallel_prepare_1d();
+
+    // Fix up any dielectric solid that reaches the box edge -- see the
+    // doc comment on override_dielectric_box_boundary_3d() (same
+    // rationale, 1d).
+    override_dielectric_box_boundary_1d();
 
     // Build near solid data
     for( int32_t i = 0; i < _size[0]; i++ ) {

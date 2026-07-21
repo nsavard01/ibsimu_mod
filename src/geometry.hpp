@@ -268,6 +268,33 @@ class Geometry : public Mesh
     void build_mesh_parallel_prepare_2d( void );
     void build_mesh_parallel_prepare_1d( void );
 
+    /*! \brief Re-apply the simulation box's own boundary condition to
+     *  any of the six (3d)/four (2d)/two (1d) boundary faces that a
+     *  dielectric solid's interior has claimed.
+     *
+     *  A dielectric solid's interior is tagged SMESH_NODE_ID_PURE_VACUUM
+     *  (see build_mesh_parallel_thread_3d()), so if it happens to reach
+     *  the simulation box edge, build_mesh_parallel_prepare_3d()'s
+     *  box-edge classification pass -- which only classifies still-
+     *  unclaimed (mesh==0) nodes -- skips it, leaving that boundary
+     *  layer tagged as ordinary free dielectric interior instead of the
+     *  box's actual Dirichlet/Neumann condition. That is both physically
+     *  wrong (the box condition, not the dielectric's bulk equation,
+     *  applies exactly at that surface) and a crash: add_vacuum_node()
+     *  would read one mesh node past the domain edge trying to reach a
+     *  neighbour that doesn't exist. Called once, after
+     *  build_mesh_parallel_prepare_*(), this walks only the boundary
+     *  faces (cheap, O(surface area) not O(volume)) and overwrites any
+     *  face node still tagged as dielectric with the box's own
+     *  condition, in the same xmin/xmax/ymin/ymax/zmin/zmax priority
+     *  order the box-edge classification itself uses (so a shared edge/
+     *  corner cell resolves the same way it would without a dielectric
+     *  there). Interior dielectric nodes are untouched.
+     */
+    void override_dielectric_box_boundary_3d( void );
+    void override_dielectric_box_boundary_2d( void );
+    void override_dielectric_box_boundary_1d( void );
+
     /*! \brief Narrow [imin,imax] (inclusive) along one mesh axis to
      *  the node range that can overlap world-space bounds [bmin,bmax],
      *  clamped to the existing mesh axis. Leaves imin/imax untouched
@@ -412,6 +439,28 @@ public:
      *  Uses solid data.
      */
     bool inside( uint32_t n, const Vec3D &x ) const;
+
+    /*! \brief Fractional distance (0,1] from mesh node (\a i, \a j, \a
+     *  k) to the surface of solid \a solid, walking in direction \a
+     *  sign (+1 or -1) along axis \a coord (0, 1 or 2). A return value
+     *  of 1.0 means the surface is (at least) a full cell width \a h
+     *  away in that direction -- i.e. no correction is needed -- and
+     *  smaller values mean the surface sits closer to node (i,j,k) than
+     *  a full cell width.
+     *
+     *  This is a public wrapper around the same bisection used by the
+     *  conductor near-solid mechanism (see is_near_solid()/bracket_ndist()),
+     *  exposed for EpotMatrixSolver::add_vacuum_node() to place a
+     *  dielectric material interface at its true sub-cell position
+     *  (needed for an arbitrary, e.g. STL-imported, surface) rather than
+     *  assuming it always falls exactly halfway between two mesh nodes
+     *  (which is only true for a grid-aligned interface). Unlike the
+     *  conductor case, a dielectric interior stays an ordinary free
+     *  (PURE_VACUUM-tagged) node rather than being reclassified
+     *  near-solid, so this fractional distance is computed on demand
+     *  here instead of being cached in _nearsolid.
+     */
+    double solid_face_frac( int32_t i, int32_t j, int32_t k, uint32_t solid, int sign, int coord ) const;
 
     /*! \brief Find solid \a n surface location by bracketing.
      *
