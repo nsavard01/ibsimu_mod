@@ -50,7 +50,7 @@
 
 
 DXFSolid::DXFSolid( MyDXFFile *dxffile, const std::string &layername )
-    : _func(&unity)
+    : _func(&unity), _has_bbox(false)
 {
     ibsimu.message( 1 ) << "Defining electrode \'" << layername << "\'\n";
 
@@ -81,13 +81,20 @@ DXFSolid::DXFSolid( MyDXFFile *dxffile, const std::string &layername )
 
     _entities = new MyDXFEntities( dxffile, ent, loop );
     _selection = _entities->selection_all();
-    
+
     if( (int)layer->size()-(int)loop->size() > 0 )
-	ibsimu.message( 1 ) << "  removed " 
-			    << (int)layer->size()-(int)loop->size() 
+	ibsimu.message( 1 ) << "  removed "
+			    << (int)layer->size()-(int)loop->size()
 			    << " entities\n";
-    ibsimu.message( 1 ) << "  solid defined using " 
+    ibsimu.message( 1 ) << "  solid defined using "
 			<< _entities->size() << " entities\n";
+
+    // Cache the 2D extent of the loop now, while dxffile is still
+    // guaranteed to be alive -- the class intentionally keeps no
+    // dependency on dxffile after construction.
+    Transformation ident;
+    _entities->get_bbox( _selection, _bbox_min, _bbox_max, dxffile, &ident );
+    _has_bbox = true;
 
     delete layer;
     delete loop;
@@ -95,7 +102,7 @@ DXFSolid::DXFSolid( MyDXFFile *dxffile, const std::string &layername )
 
 
 DXFSolid::DXFSolid( MyDXFFile *dxffile, MyDXFEntities *ent )
-    : _func(&unity)
+    : _func(&unity), _has_bbox(false)
 {
     if( ent->size() == 0 ) {
 	throw( Error( ERROR_LOCATION, "No entities" ) );
@@ -113,11 +120,18 @@ DXFSolid::DXFSolid( MyDXFFile *dxffile, MyDXFEntities *ent )
     _selection = _entities->selection_all();
 
     if( (int)all->size()-(int)loop->size() > 0 )
-	ibsimu.message( 1 ) << "  removed " 
-			    << (int)all->size()-(int)loop->size() 
+	ibsimu.message( 1 ) << "  removed "
+			    << (int)all->size()-(int)loop->size()
 			    << " entities\n";
-    ibsimu.message( 1 ) << "  solid defined using " 
+    ibsimu.message( 1 ) << "  solid defined using "
 			<< _entities->size() << " entities\n";
+
+    // Cache the 2D extent of the loop now, while dxffile is still
+    // guaranteed to be alive -- the class intentionally keeps no
+    // dependency on dxffile after construction.
+    Transformation ident;
+    _entities->get_bbox( _selection, _bbox_min, _bbox_max, dxffile, &ident );
+    _has_bbox = true;
 
     delete all;
     delete loop;
@@ -125,7 +139,7 @@ DXFSolid::DXFSolid( MyDXFFile *dxffile, MyDXFEntities *ent )
 
 
 DXFSolid::DXFSolid( std::istream &is )
-    : _func(&unity), _entities(NULL), _selection(NULL)
+    : _func(&unity), _entities(NULL), _selection(NULL), _has_bbox(false)
 {
     ibsimu.message( MSG_WARNING, 1 ) << "Warning: loading of DXFSolid not implemented\n";
     ibsimu.flush();
@@ -192,6 +206,47 @@ bool DXFSolid::inside( const Vec3D &x ) const
 	return( false );
 
     return( _entities->inside_loop( _selection, z[0], z[1] ) );
+}
+
+
+bool DXFSolid::get_bbox( Vec3D &min, Vec3D &max ) const
+{
+    if( !_entities || !_has_bbox )
+	return( false );
+
+    double xlo = _bbox_min[0], xhi = _bbox_max[0];
+    double ylo = _bbox_min[1], yhi = _bbox_max[1];
+
+    // Local (pre-_T) box implied by the current 2D<-3D mapping. Only
+    // the built-in mappings are handled -- a user-supplied _func can
+    // return NaN to force "inside" for arbitrary input, which makes
+    // it impossible to infer any bound from the 2D loop extent alone.
+    Vec3D lo, hi;
+    if( _func == &unity ) {
+	// (x,y) come straight from the dxf loop; z is the extrusion
+	// direction and is not constrained at all.
+	lo = Vec3D( xlo, ylo, -BBOX_HUGE );
+	hi = Vec3D( xhi, yhi,  BBOX_HUGE );
+    } else if( _func == &rotx ) {
+	// x comes straight from the loop; (y,z) lie on a disc of
+	// radius up to max(|ylo|,|yhi|) around the x-axis.
+	double rmax = fabs(ylo) > fabs(yhi) ? fabs(ylo) : fabs(yhi);
+	lo = Vec3D( xlo, -rmax, -rmax );
+	hi = Vec3D( xhi,  rmax,  rmax );
+    } else if( _func == &roty ) {
+	double rmax = fabs(ylo) > fabs(yhi) ? fabs(ylo) : fabs(yhi);
+	lo = Vec3D( -rmax, xlo, -rmax );
+	hi = Vec3D(  rmax, xhi,  rmax );
+    } else if( _func == &rotz ) {
+	double rmax = fabs(ylo) > fabs(yhi) ? fabs(ylo) : fabs(yhi);
+	lo = Vec3D( -rmax, -rmax, xlo );
+	hi = Vec3D(  rmax,  rmax, xhi );
+    } else {
+	// Custom user-defined mapping -- no safe bound available.
+	return( false );
+    }
+
+    return( bbox_from_local_box( lo, hi, min, max ) );
 }
 
 

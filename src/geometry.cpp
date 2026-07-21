@@ -46,6 +46,7 @@
 #include <math.h>
 #include <string.h>
 #include <limits>
+#include <omp.h>
 #include "stlfile.hpp"
 #include "geometry.hpp"
 #include "func_solid.hpp"
@@ -182,9 +183,6 @@ Geometry::Geometry( geom_mode_e geom_mode, Int3D size, Vec3D origo, double h )
     _built = false;
     _smesh = new uint32_t[_size[0]*_size[1]*_size[2]];
 
-    pthread_mutex_init( &_mutex, NULL );
-    pthread_cond_init( &_cond, NULL );
-
     ibsimu.message( 1 ) << "Done\n";
     ibsimu.dec_indent();
 }
@@ -223,11 +221,8 @@ Geometry::Geometry( std::istream &is )
 
     uint32_t nearsolidsize = read_int32( is );
     _nearsolid.resize( nearsolidsize );
-    read_compressed_block( is, sizeof(uint8_t)*nearsolidsize, 
+    read_compressed_block( is, sizeof(uint8_t)*nearsolidsize,
 			   (int8_t *)&_nearsolid[0] );
-
-    pthread_mutex_init( &_mutex, NULL );
-    pthread_cond_init( &_cond, NULL );
 
     ibsimu.dec_indent();
 }
@@ -236,8 +231,6 @@ Geometry::Geometry( std::istream &is )
 Geometry::~Geometry()
 {
     delete [] _smesh;
-    pthread_mutex_destroy( &_mutex );
-    pthread_cond_destroy( &_cond );
 	for (size_t i = 0; i < _sdata.size(); i++) {
         delete _sdata[i];
     }
@@ -1153,40 +1146,139 @@ void Geometry::build_mesh_parallel_prepare_1d( void )
 }
 
 
-void Geometry::build_mesh_parallel_thread_3d( BuildMeshData *bmd )
+/* Mesh building, OpenMP notes
+ * ----------------------------
+ * Marking which solid (if any) each mesh node belongs to used to be done
+ * node-major: for every node, call the combined Geometry::inside(x),
+ * which itself loops over solids from highest numbered to lowest,
+ * calling _sdata[a]->inside(x) and stopping at the first match ("highest
+ * overlapping solid wins"). That means consecutive mesh nodes processed
+ * by a thread routinely dispatch through a *different* Solid subclass's
+ * virtual inside() on every iteration (FuncSolid, DXFSolid, STLSolid,
+ * ...), which is unfriendly to both the branch predictor and the
+ * instruction cache.
+ *
+ * The loop below is solid-major instead: it still visits solids from
+ * highest to lowest, but for a fixed solid it sweeps the *entire* mesh
+ * (in parallel) before moving to the next one, skipping any node
+ * already claimed by a higher priority solid. This keeps every thread
+ * inside a single Solid subclass's inside() for the full sweep, and
+ * exposes far more independent work to the scheduler than slicing the
+ * grid into one contiguous strip per thread, so OpenMP's dynamic
+ * scheduling can keep every thread busy even when the cost of inside()
+ * varies wildly across the mesh (e.g. STL/DXF solids vs. simple
+ * FuncSolids, or regions near a lot of solid boundaries vs. open
+ * vacuum). The total number of inside() calls, and the result, are
+ * identical to the original node-major version.
+ *
+ * Threading itself is done with OpenMP rather than hand-rolled pthreads
+ * plus a mutex/condition-variable barrier. The barrier is unnecessary
+ * complexity here: two ordinary "#pragma omp for" work-sharing loops
+ * inside one "#pragma omp parallel" region already provide the barrier
+ * (all threads finish the first loop before any of them starts the
+ * second), so the same result is reached with far less code and no
+ * chance of a missed wakeup/deadlock in the synchronization logic.
+ */
+
+
+void Geometry::restrict_axis_range( double bmin, double bmax, double origo, int32_t size,
+				    int32_t &imin, int32_t &imax ) const
 {
-    // Parallel: Mark solid (Dirichlet) nodes. Others left to zero.
-    for( int32_t k = bmd->index; k < _size[2]; k += ibsimu.get_thread_count() ) {
-	double z = k*_h+_origo[2];
-	for( int32_t j = 0; j < _size[1]; j++ ) {
-	    double y = j*_h+_origo[1];
-	    for( int32_t i = 0; i < _size[0]; i++ ) {
-		double x = i*_h+_origo[0];
-		uint32_t nid = inside( Vec3D(x,y,z) );
-		if( nid )
-		    mesh(i,j,k) = SMESH_NODE_ID_DIRICHLET | nid;
-		else
-		    mesh(i,j,k) = 0;
+    const double sanity_limit = 1.0e10;
+
+    // Solid::bbox_from_local_box() flags an axis it cannot bound by
+    // giving it a "mesh-implausible" magnitude -- leave the full
+    // range in that case.
+    if( fabs(bmin) >= sanity_limit || fabs(bmax) >= sanity_limit )
+	return;
+
+    // One extra node of margin on each side to absorb floating point
+    // rounding right at the box edge.
+    int32_t lo = (int32_t)floor( (bmin-origo)/_h ) - 1;
+    int32_t hi = (int32_t)ceil ( (bmax-origo)/_h ) + 1;
+
+    if( lo < 0 )
+	lo = 0;
+    if( hi > size-1 )
+	hi = size-1;
+
+    if( lo > hi ) {
+	// Bounding box doesn't overlap the mesh at all along this axis.
+	imin = 0;
+	imax = -1;
+    } else {
+	imin = lo;
+	imax = hi;
+    }
+}
+
+
+void Geometry::solid_node_range( const Solid *solid,
+				 int32_t &imin, int32_t &imax,
+				 int32_t &jmin, int32_t &jmax,
+				 int32_t &kmin, int32_t &kmax ) const
+{
+    imin = 0; imax = _size[0]-1;
+    jmin = 0; jmax = _size[1]-1;
+    kmin = 0; kmax = _size[2]-1;
+
+    Vec3D bmin, bmax;
+    if( !solid->get_bbox( bmin, bmax ) )
+	return;
+
+    restrict_axis_range( bmin[0], bmax[0], _origo[0], _size[0], imin, imax );
+    restrict_axis_range( bmin[1], bmax[1], _origo[1], _size[1], jmin, jmax );
+    if( _geom_mode == MODE_3D )
+	restrict_axis_range( bmin[2], bmax[2], _origo[2], _size[2], kmin, kmax );
+}
+
+
+void Geometry::build_mesh_parallel_thread_3d( void )
+{
+    int nthreads = (int)ibsimu.get_thread_count();
+    uint32_t ntot = (uint32_t)_size[0]*(uint32_t)_size[1]*(uint32_t)_size[2];
+
+    // Start from an all-vacuum mesh.
+    memset( _smesh, 0, sizeof(uint32_t)*ntot );
+
+    // Parallel: mark solid (Dirichlet) nodes, solid-major, highest
+    // numbered solid first (see note above).
+#pragma omp parallel num_threads(nthreads)
+    {
+	for( ssize_t a = (ssize_t)_sdata.size()-1; a >= 0; a-- ) {
+
+	    const Solid *solid = _sdata[a];
+	    uint32_t nid = SMESH_NODE_ID_DIRICHLET | (uint32_t)(a+7);
+
+	    // Restrict the sweep to the node range the solid's bbox
+	    // can possibly touch (falls back to the whole mesh when
+	    // no useful bound is available -- see Solid::get_bbox()).
+	    int32_t imin, imax, jmin, jmax, kmin, kmax;
+	    solid_node_range( solid, imin, imax, jmin, jmax, kmin, kmax );
+
+#pragma omp for collapse(3) schedule(dynamic,64)
+	    for( int32_t k = kmin; k <= kmax; k++ ) {
+		for( int32_t j = jmin; j <= jmax; j++ ) {
+		    for( int32_t i = imin; i <= imax; i++ ) {
+
+			if( mesh(i,j,k) != 0 )
+			    continue;
+
+			Vec3D x( i*_h+_origo[0], j*_h+_origo[1], k*_h+_origo[2] );
+			if( solid->inside( x ) )
+			    mesh(i,j,k) = nid;
+		    }
+		}
 	    }
 	}
     }
 
-    // Serial part: edges and preparation for near solid nodes
-    pthread_mutex_lock( &_mutex );
-    _done++;
-    if( _done == ibsimu.get_thread_count() ) {
-	// Mark rest of mesh nodes and prepare for building near solid data
-	build_mesh_parallel_prepare_3d();
-	pthread_cond_broadcast( &_cond );
-    } else {
-	do {
-	    pthread_cond_wait( &_cond, &_mutex );
-	} while( _done != ibsimu.get_thread_count() );
-    }
-    pthread_mutex_unlock( &_mutex );
+    // Serial part: mark box boundaries/vacuum and prepare near solid data
+    build_mesh_parallel_prepare_3d();
 
     // Parallel: Build near solid data
-    for( int32_t k = bmd->index; k < _size[2]; k += ibsimu.get_thread_count() ) {
+#pragma omp parallel for num_threads(nthreads) collapse(3) schedule(dynamic,64)
+    for( int32_t k = 0; k < _size[2]; k++ ) {
 	for( int32_t j = 0; j < _size[1]; j++ ) {
 	    for( int32_t i = 0; i < _size[0]; i++ ) {
 
@@ -1202,39 +1294,49 @@ void Geometry::build_mesh_parallel_thread_3d( BuildMeshData *bmd )
 }
 
 
-void Geometry::build_mesh_parallel_thread_2d( BuildMeshData *bmd )
+void Geometry::build_mesh_parallel_thread_2d( void )
 {
-    // Parallel: Mark solid (Dirichlet) nodes. Others left to zero.
-    for( int32_t j = bmd->index; j < _size[1]; j += ibsimu.get_thread_count() ) {
-	double y = j*_h+_origo[1];
-	for( int32_t i = 0; i < _size[0]; i++ ) {
-	    double x = i*_h+_origo[0];
-	    uint32_t nid = inside( Vec3D(x,y) );
-	    if( nid )
-		mesh(i,j) = SMESH_NODE_ID_DIRICHLET | nid;
-	    else
-		mesh(i,j) = 0;
+    int nthreads = (int)ibsimu.get_thread_count();
+    uint32_t ntot = (uint32_t)_size[0]*(uint32_t)_size[1];
+
+    // Start from an all-vacuum mesh.
+    memset( _smesh, 0, sizeof(uint32_t)*ntot );
+
+    // Parallel: mark solid (Dirichlet) nodes, solid-major, highest
+    // numbered solid first (see note above).
+#pragma omp parallel num_threads(nthreads)
+    {
+	for( ssize_t a = (ssize_t)_sdata.size()-1; a >= 0; a-- ) {
+
+	    const Solid *solid = _sdata[a];
+	    uint32_t nid = SMESH_NODE_ID_DIRICHLET | (uint32_t)(a+7);
+
+	    int32_t imin, imax, jmin, jmax, kmin, kmax;
+	    solid_node_range( solid, imin, imax, jmin, jmax, kmin, kmax );
+
+#pragma omp for collapse(2) schedule(dynamic,64)
+	    for( int32_t j = jmin; j <= jmax; j++ ) {
+		for( int32_t i = imin; i <= imax; i++ ) {
+
+		    if( mesh(i,j) != 0 )
+			continue;
+
+		    Vec3D x( i*_h+_origo[0], j*_h+_origo[1] );
+		    if( solid->inside( x ) )
+			mesh(i,j) = nid;
+		}
+	    }
 	}
     }
 
-    // Serial part: edges and preparation for near solid nodes
-    pthread_mutex_lock( &_mutex );
-    _done++;
-    if( _done == ibsimu.get_thread_count() ) {
-	// Mark rest of mesh nodes and prepare for building near solid data
-	build_mesh_parallel_prepare_2d();
-	pthread_cond_broadcast( &_cond );
-    } else {
-	do {
-	    pthread_cond_wait( &_cond, &_mutex );
-	} while( _done != ibsimu.get_thread_count() );
-    }
-    pthread_mutex_unlock( &_mutex );
+    // Serial part: mark box boundaries/vacuum and prepare near solid data
+    build_mesh_parallel_prepare_2d();
 
     // Parallel: Build near solid data
-    for( int32_t j = bmd->index; j < _size[1]; j += ibsimu.get_thread_count() ) {
+#pragma omp parallel for num_threads(nthreads) collapse(2) schedule(dynamic,64)
+    for( int32_t j = 0; j < _size[1]; j++ ) {
 	for( int32_t i = 0; i < _size[0]; i++ ) {
-	    
+
 	    uint32_t node = mesh(i,j);
 	    uint32_t node_id = node & SMESH_NODE_ID_MASK;
 	    if( node_id == SMESH_NODE_ID_NEAR_SOLID ) {
@@ -1262,7 +1364,7 @@ void Geometry::build_mesh_parallel_thread_1d( void )
     build_mesh_parallel_prepare_1d();
 
     // Build near solid data
-    for( int32_t i = 0; i < _size[0]; i++ ) {	    
+    for( int32_t i = 0; i < _size[0]; i++ ) {
 	uint32_t node = mesh(i);
 	uint32_t node_id = node & SMESH_NODE_ID_MASK;
 	if( node_id == SMESH_NODE_ID_NEAR_SOLID ) {
@@ -1270,25 +1372,6 @@ void Geometry::build_mesh_parallel_thread_1d( void )
 	    build_mesh_parallel_near_solid( index, i, 0, 0 );
 	}
     }
-}
-
-
-void Geometry::build_mesh_parallel_thread( BuildMeshData *bmd )
-{
-    if( _geom_mode == MODE_3D )
-	build_mesh_parallel_thread_3d( bmd );
-    else if( _geom_mode == MODE_2D || _geom_mode == MODE_CYL )
-	build_mesh_parallel_thread_2d( bmd );
-    else
-	throw( ErrorAssert( ERROR_LOCATION ) );
-}
-
-
-void *Geometry::build_mesh_parallel_entry( void *data )
-{
-    BuildMeshData *bmd = (BuildMeshData *)data;
-    bmd->geom->build_mesh_parallel_thread( bmd );
-    return( NULL );
 }
 
 
@@ -1300,21 +1383,12 @@ void Geometry::build_mesh_parallel( void )
 	return;
     }
 
-    BuildMeshData bmd[ibsimu.get_thread_count()];
-
-    // Prepare common data
-    _done = 0;
-
-    // Start threads
-    for( uint32_t a = 0; a < ibsimu.get_thread_count(); a++ ) {
-	bmd[a].index = a;
-	bmd[a].geom = this;
-	pthread_create( &bmd[a].thread, NULL, build_mesh_parallel_entry, (void *)&bmd[a] );
-    }
-
-    // Join threads
-    for( uint32_t a = 0; a < ibsimu.get_thread_count(); a++ )
-	pthread_join( bmd[a].thread, NULL );    
+    if( _geom_mode == MODE_3D )
+	build_mesh_parallel_thread_3d();
+    else if( _geom_mode == MODE_2D || _geom_mode == MODE_CYL )
+	build_mesh_parallel_thread_2d();
+    else
+	throw( ErrorAssert( ERROR_LOCATION ) );
 }
 
 

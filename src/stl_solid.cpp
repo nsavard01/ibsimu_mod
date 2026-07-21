@@ -98,6 +98,30 @@ bool STLSolid::inside( const Vec3D &x ) const
 }
 
 
+bool STLSolid::get_bbox( Vec3D &min, Vec3D &max ) const
+{
+    if( _stl.empty() )
+	return( false );
+
+    // Union of all STL files' bounding boxes, in the solid's native
+    // (pre-_T) coordinate frame.
+    Vec3D lo, hi;
+    _stl[0]->get_bbox( lo, hi );
+    for( size_t a = 1; a < _stl.size(); a++ ) {
+	Vec3D mi, ma;
+	_stl[a]->get_bbox( mi, ma );
+	for( int b = 0; b < 3; b++ ) {
+	    if( mi[b] < lo[b] )
+		lo[b] = mi[b];
+	    if( ma[b] > hi[b] )
+		hi[b] = ma[b];
+	}
+    }
+
+    return( bbox_from_local_box( lo, hi, min, max ) );
+}
+
+
 void STLSolid::add_stl_file( class STLFile *stl )
 {
     if( stl == NULL )

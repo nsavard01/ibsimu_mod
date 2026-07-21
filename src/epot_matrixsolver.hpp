@@ -48,6 +48,8 @@
 #include "epot_solver.hpp"
 #include "crowmatrix.hpp"
 #include "mvector.hpp"
+#include <vector>
+#include <utility>
 
 
 #define N2D_TYPE_MASK   0x80000000 // 100...
@@ -112,7 +114,60 @@ protected:
 
     MeshScalarField       *_epot;
     const MeshScalarField *_scharge;
-    
+
+    /*! \brief Per-row buffers used to make build_mat_vec() thread-safe.
+     *
+     *  CRowMatrix::construct_add() appends each entry at a single
+     *  shared cursor (the next free slot is only known once every
+     *  earlier row has finished writing), so it cannot be called
+     *  directly from multiple threads working on different rows at
+     *  once. Instead, set_link() buffers each row's (column, value)
+     *  pairs here -- indexed by dof/row so each row's slot is written
+     *  by exactly one thread -- and build_mat_vec() copies them into
+     *  _fd_mat via construct_add() afterwards, in a cheap serial
+     *  compaction pass that does no stencil math.
+     */
+    std::vector<std::vector<std::pair<int32_t,double> > > _row_entries;
+
+    /*! \brief True once the linear (geometry-only) part of the matrix
+     *  and rhs has been built and cached for the current preprocess()
+     *  .. postprocess() bracket.
+     *
+     *  The matrix stencil (neighbour coefficients, boundary/near-solid
+     *  weighting, Dirichlet-neighbour rhs contributions) and the
+     *  constant space-charge rhs term depend only on the mesh,
+     *  boundary conditions and \a scharge -- none of which change
+     *  between Newton iterations of a single subsolve() call. Only the
+     *  plasma-dependent rhs term and diagonal (_d_vec) actually depend
+     *  on the current solution guess \a X, and those are recomputed
+     *  every call by update_nonlinear_node(). Set back to false by
+     *  reset_matrix(), so it is naturally rebuilt once per solve.
+     */
+    bool                    _linear_built;
+
+    /*! \brief Cached constant (epot-independent) part of the rhs
+     *  vector, snapshotted right after the linear part is built.
+     *  Restored into _fd_vec at the start of every later build_mat_vec()
+     *  call so the nonlinear pass only has to add the plasma term on
+     *  top, instead of re-deriving it from scratch.
+     */
+    Vector                 *_fd_vec_base;
+
+    /*! \brief Cached pure-linear diagonal of _fd_mat (J0(a,a) for each
+     *  row a), captured right after the linear part is built.
+     *
+     *  get_resjac() forms the true Jacobian diagonal each Newton
+     *  iteration as J0(a,a) - D(a) (see build_mat_vec()'s doc comment
+     *  at the top of the file for the R = J0*X - B(X), J = J0 + I*D(X)
+     *  convention). With _fd_mat now a cached, persistent matrix
+     *  instead of one rebuilt from scratch every call, get_resjac()
+     *  can no longer just subtract D(a) from whatever is currently in
+     *  the diagonal -- that would accumulate corrections across
+     *  iterations instead of re-deriving them from the fixed linear
+     *  diagonal. This cache is what lets it set() the diagonal fresh
+     *  from J0(a,a) each time instead.
+     */
+    std::vector<double>     _fd_mat_diag0;
 
     /*! \brief Constructor.
      */
@@ -171,6 +226,18 @@ private:
     void build_mat_vec( void );
 
     void set_link( uint32_t a, uint32_t b, double val );
+
+    /*! \brief Add the epot-dependent plasma contribution (rhs term and
+     *  diagonal derivative) for free node \a a at mesh location
+     *  (i,j,k)/x. Called once per Newton iteration for every free node,
+     *  after the cached linear part has been restored into _fd_vec.
+     *  This is the part of the old per-node add_*_node() bodies that
+     *  actually depends on the current solution guess (via _sol) and
+     *  so cannot be cached across Newton iterations. No-op if the
+     *  solver is not using a plasma model.
+     */
+    void update_nonlinear_node( uint32_t a, uint32_t i, uint32_t j, uint32_t k, const Vec3D &x );
+
     void add_vacuum_node( uint32_t i, uint32_t j, uint32_t k, const Vec3D &x );
     void add_near_solid_node_1d( uint32_t i, const Vec3D &x );
     void add_near_solid_node_2d( uint32_t i, uint32_t j, const Vec3D &x );

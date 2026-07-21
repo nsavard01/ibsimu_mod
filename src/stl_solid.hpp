@@ -84,6 +84,13 @@ public:
      */
     virtual bool inside( const Vec3D &x ) const;
 
+    /*! \brief Return a conservative world-space bounding box built
+     *  from the union of the bounding boxes of the STL files added
+     *  with add_stl_file(), transformed through the solid's current
+     *  \a _T. Returns false if no STL file has been added.
+     */
+    virtual bool get_bbox( Vec3D &min, Vec3D &max ) const;
+
     /*! \brief Add entity from STL-file to object.
      *
      *  The STLFile stl is owned by STLSolid after calling this

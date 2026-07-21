@@ -44,6 +44,7 @@
 #include "epot_matrixsolver.hpp"
 #include "constants.hpp"
 #include "ibsimu.hpp"
+#include <omp.h>
 
 
 EpotMatrixSolver::Node2DoF::Node2DoF() 
@@ -112,7 +113,8 @@ void EpotMatrixSolver::Node2DoF::debug_print( std::ostream &os ) const
 
 
 EpotMatrixSolver::EpotMatrixSolver( Geometry &geom )
-    : EpotSolver(geom), _dof(0), _fd_mat(0), _fd_vec(0), _d_vec(0)
+    : EpotSolver(geom), _dof(0), _fd_mat(0), _fd_vec(0), _d_vec(0),
+      _linear_built(false), _fd_vec_base(0)
 {
 
 }
@@ -125,12 +127,14 @@ EpotMatrixSolver::EpotMatrixSolver( Geometry &geom, std::istream &s )
 }
 
 
-EpotMatrixSolver::~EpotMatrixSolver() 
+EpotMatrixSolver::~EpotMatrixSolver()
 {
     if( _fd_mat )
         delete _fd_mat;
     if( _fd_vec )
         delete _fd_vec;
+    if( _fd_vec_base )
+        delete _fd_vec_base;
 }
 
 
@@ -151,14 +155,62 @@ void EpotMatrixSolver::set_link( uint32_t a, uint32_t b, double val )
         (*_fd_vec)(a) += -val * (*_epot)(b & N2D_INDEX_MASK);
     } else {
 	//std::cout << "matrix construct\n";
-        (*_fd_mat).construct_add( a & N2D_INDEX_MASK, 
-				  b & N2D_INDEX_MASK, val );
+	// Buffered instead of a direct CRowMatrix::construct_add() call
+	// so build_mat_vec() can fill different rows from different
+	// threads -- see _row_entries' doc comment in the header. Row
+	// a's buffer is only ever touched by the single thread that
+	// owns node/row a in build_mat_vec()'s parallel loop.
+	_row_entries[a & N2D_INDEX_MASK].push_back(
+	    std::make_pair( (int32_t)(b & N2D_INDEX_MASK), val ) );
+    }
+}
+
+
+/* Epot-dependent plasma contribution to rhs/diagonal for free node a.
+ * Consolidated out of add_vacuum_node()/add_near_solid_node()/
+ * add_neumann_node(), which used to each carry an identical copy of
+ * this block. Called once per Newton iteration (not cached), since it
+ * is the one part of matrix/rhs construction that genuinely depends on
+ * the current solution guess X via _sol.
+ */
+void EpotMatrixSolver::update_nonlinear_node( uint32_t a, uint32_t i, uint32_t j, uint32_t k, const Vec3D &x )
+{
+    if( _plasma != PLASMA_PEXP && _plasma != PLASMA_NSIMP && _plasma != PLASMA_SHIELD )
+	return;
+
+    bool inplasma = true;
+    if( _plasma_calc_func )
+	// Test if within plasma calculation region
+	inplasma = (*_plasma_calc_func)(x);
+
+    if( !inplasma ) {
+	(*_d_vec)(a) = 0; // No plasma calculation
+    } else if( _plasma == PLASMA_PEXP ) {
+	double p = (*_sol)(a);
+	double rhst, drhst;
+	pexp_newton( rhst, drhst, p );
+	(*_fd_vec)(a) += rhst;
+	(*_d_vec)(a) = drhst;
+    } else if( _plasma == PLASMA_NSIMP ) {
+	double p = (*_sol)(a);
+	double rhst, drhst;
+	nsimp_newton( rhst, drhst, p );
+	(*_fd_vec)(a) += rhst;
+	(*_d_vec)(a) = drhst;
+    } else if( _plasma == PLASMA_SHIELD ) {
+	double p = (*_sol)(a);
+	double rhst, drhst;
+	shield_newton( rhst, drhst, p );
+	double R = -(*_scharge)(i,j,k)*_geom.h()*_geom.h()/EPSILON0;
+	(*_fd_vec)(a) += R*rhst;
+	(*_d_vec)(a) = R*drhst;
     }
 }
 
 
 void EpotMatrixSolver::add_vacuum_node( uint32_t i, uint32_t j, uint32_t k, const Vec3D &x )
 {
+    (void)x; // no longer used here -- see update_nonlinear_node()
     uint32_t a = _n2d(i,j,k) & N2D_INDEX_MASK;
 
     switch( _geom.geom_mode() ) {
@@ -192,36 +244,11 @@ void EpotMatrixSolver::add_vacuum_node( uint32_t i, uint32_t j, uint32_t k, cons
         break;
     }
 
-    if( _plasma == PLASMA_PEXP || _plasma == PLASMA_NSIMP || _plasma == PLASMA_SHIELD ) {
-
-	bool inplasma = true;
-	if( _plasma_calc_func )
-	    // Test if within plasma calculation region
-	    inplasma = (*_plasma_calc_func)(x);
-
-	if( !inplasma ) {
-	    (*_d_vec)(a) = 0; // No plasma calculation
-	} else if( _plasma == PLASMA_PEXP ) {
-	    double p = (*_sol)(a);
-	    double rhst, drhst;
-	    pexp_newton( rhst, drhst, p );
-	    (*_fd_vec)(a) += rhst;
-	    (*_d_vec)(a) = drhst;
-	} else if( _plasma == PLASMA_NSIMP ) {
-	    double p = (*_sol)(a);
-	    double rhst, drhst;
-	    nsimp_newton( rhst, drhst, p );
-	    (*_fd_vec)(a) += rhst;
-	    (*_d_vec)(a) = drhst;
-	} else if( _plasma == PLASMA_SHIELD ) {
-	    double p = (*_sol)(a);
-	    double rhst, drhst;
-	    shield_newton( rhst, drhst, p );
-	    double R = -(*_scharge)(i,j,k)*_geom.h()*_geom.h()/EPSILON0;
-	    (*_fd_vec)(a) += R*rhst;
-	    (*_d_vec)(a) = R*drhst;
-	}
-    }
+    // Nonlinear (plasma) contribution to rhs/diagonal is epot-dependent
+    // and is added separately, once per Newton iteration, by
+    // update_nonlinear_node() -- see build_mat_vec(). Everything in
+    // this function is geometry-only and gets cached after the first
+    // build.
 
     // Right hand side
     if( _plasma != PLASMA_SHIELD )
@@ -540,36 +567,11 @@ void EpotMatrixSolver::add_near_solid_node( uint32_t i, uint32_t j, uint32_t k, 
 	break;
     }
 
-    if( _plasma == PLASMA_PEXP || _plasma == PLASMA_NSIMP || _plasma == PLASMA_SHIELD ) {
-
-	bool inplasma = true;
-	if( _plasma_calc_func )
-	    // Test if within plasma calculation region
-	    inplasma = (*_plasma_calc_func)(x);
-
-	if( !inplasma ) {
-	    (*_d_vec)(a) = 0; // No plasma calculation
-	} else if( _plasma == PLASMA_PEXP ) {
-	    double p = (*_sol)(a);
-	    double rhst, drhst;
-	    pexp_newton( rhst, drhst, p );
-	    (*_fd_vec)(a) += rhst;
-	    (*_d_vec)(a) = drhst;
-	} else if( _plasma == PLASMA_NSIMP ) {
-	    double p = (*_sol)(a);
-	    double rhst, drhst;
-	    nsimp_newton( rhst, drhst, p );
-	    (*_fd_vec)(a) += rhst;
-	    (*_d_vec)(a) = drhst;
-	} else if( _plasma == PLASMA_SHIELD ) {
-	    double p = (*_sol)(a);
-	    double rhst, drhst;
-	    shield_newton( rhst, drhst, p );
-	    double R = -(*_scharge)(i,j,k)*_geom.h()*_geom.h()/EPSILON0;
-	    (*_fd_vec)(a) += R*rhst;
-	    (*_d_vec)(a) = R*drhst;
-	}
-    }
+    // Nonlinear (plasma) contribution to rhs/diagonal is epot-dependent
+    // and is added separately, once per Newton iteration, by
+    // update_nonlinear_node() -- see build_mat_vec(). Everything in
+    // this function is geometry-only and gets cached after the first
+    // build.
 
     // Right hand side
     if( _plasma != PLASMA_SHIELD )
@@ -731,36 +733,11 @@ void EpotMatrixSolver::add_neumann_node( uint32_t i, uint32_t j, uint32_t k, con
         break;
     }
 
-    if( _plasma == PLASMA_PEXP || _plasma == PLASMA_NSIMP || _plasma == PLASMA_SHIELD ) {
-
-	bool inplasma = true;
-	if( _plasma_calc_func )
-	    // Test if within plasma calculation region
-	    inplasma = (*_plasma_calc_func)(x);
-
-	if( !inplasma ) {
-	    (*_d_vec)(a) = 0; // No plasma calculation
-	} else if( _plasma == PLASMA_PEXP ) {
-	    double p = (*_sol)(a);
-	    double rhst, drhst;
-	    pexp_newton( rhst, drhst, p );
-	    (*_fd_vec)(a) += rhst;
-	    (*_d_vec)(a) = drhst;
-	} else if( _plasma == PLASMA_NSIMP ) {
-	    double p = (*_sol)(a);
-	    double rhst, drhst;
-	    nsimp_newton( rhst, drhst, p );
-	    (*_fd_vec)(a) += rhst;
-	    (*_d_vec)(a) = drhst;
-	} else if( _plasma == PLASMA_SHIELD ) {
-	    double p = (*_sol)(a);
-	    double rhst, drhst;
-	    shield_newton( rhst, drhst, p );
-	    double R = -(*_scharge)(i,j,k)*_geom.h()*_geom.h()/EPSILON0;
-	    (*_fd_vec)(a) += R*rhst;
-	    (*_d_vec)(a) = R*drhst;
-	}
-    }
+    // Nonlinear (plasma) contribution to rhs/diagonal is epot-dependent
+    // and is added separately, once per Newton iteration, by
+    // update_nonlinear_node() -- see build_mat_vec(). Everything in
+    // this function is geometry-only and gets cached after the first
+    // build.
 
     // Right hand side
     if( _plasma != PLASMA_SHIELD )
@@ -774,9 +751,14 @@ void EpotMatrixSolver::reset_matrix( void )
         delete _fd_mat;
     if( _fd_vec )
         delete _fd_vec;
+    if( _fd_vec_base )
+        delete _fd_vec_base;
     _fd_mat = 0;
     _fd_vec = 0;
+    _fd_vec_base = 0;
     _dof = 0;
+    _linear_built = false;
+    _fd_mat_diag0.clear();
 
     _n2d.clear();
 }
@@ -848,42 +830,143 @@ void EpotMatrixSolver::build_mat_vec( void )
 {
     if( _dof == 0  )
 	throw( Error( ERROR_LOCATION, "preprocess not done" ) );
-    _fd_mat->clear();
-    _fd_vec->clear();
 
-    // Build matrix and rhs vector
-    Vec3D x;
-    for( uint32_t k = 0; k < _geom.size(2); k++ ) {
-	x[2] = _geom.origo(2) + _geom.h()*k;
-	for( uint32_t j = 0; j < _geom.size(1); j++ ) {
-	    x[1] = _geom.origo(1) + _geom.h()*j;
-            for( uint32_t i = 0; i < _geom.size(0); i++ ) {
-		x[0] = _geom.origo(0) + _geom.h()*i;
+    int nthreads = (int)ibsimu.get_thread_count();
 
-		uint32_t a = (k*_geom.size(1)+j)*_geom.size(0)+i;
-		uint32_t mesh = _geom.mesh(a);
-		uint32_t node_id = mesh & SMESH_NODE_ID_MASK;
-		bool fixed = mesh & SMESH_NODE_FIXED;
+    if( !_linear_built ) {
 
-		if( fixed ) {
-		    //ibsimu.message( 1 ) << "Fixed\n";
-		    continue;
-		} else if( node_id == SMESH_NODE_ID_PURE_VACUUM ) {
-		    //ibsimu.message( 1 ) << "Vacuum\n";
-		    add_vacuum_node( i, j, k, x );
-		} else if( node_id == SMESH_NODE_ID_NEAR_SOLID ) {
-		    //ibsimu.message( 1 ) << "Near solid\n";
-		    add_near_solid_node( i, j, k, x );
-		} else if( node_id == SMESH_NODE_ID_NEUMANN ) {
-		    //ibsimu.message( 1 ) << "Neumann\n";
-		    add_neumann_node( i, j, k, x );
+	// One-time build of the linear (geometry-only) part: matrix
+	// stencil coefficients, Dirichlet-neighbour rhs contributions
+	// and the constant space-charge rhs term. None of this depends
+	// on the current solution guess X, only on the mesh, boundary
+	// conditions and scharge, all of which are fixed between here
+	// and the next preprocess()/reset_matrix() call -- so it is
+	// built once and cached, instead of being redone on every
+	// Newton iteration.
+	_fd_mat->clear();
+	_fd_vec->clear();
+
+	// Reset per-row entry buffers (see header doc comment on
+	// _row_entries for why these exist instead of writing straight
+	// into _fd_mat from the parallel loop below). Reserve enough
+	// capacity for the largest possible stencil (3D: 6 neighbours + 1
+	// combined centre term = 7) so no row needs to reallocate while
+	// another thread is concurrently working on a different row.
+	if( _row_entries.size() != _dof )
+	    _row_entries.resize( _dof );
+	for( uint32_t a = 0; a < _dof; a++ ) {
+	    _row_entries[a].clear();
+	    _row_entries[a].reserve( 7 );
+	}
+
+	// Parallel over grid nodes: every node is handled by exactly
+	// one thread, which only ever writes to that node's own
+	// _row_entries[a] slot and its own _fd_vec(a) entry (a is
+	// unique per node), so there is no cross-row data race. This
+	// does mean any user-supplied Boundary::value() callback
+	// reachable from add_vacuum_node()/add_near_solid_node()/
+	// add_neumann_node() must itself be safe to call concurrently
+	// from multiple threads -- this parallel loop calls it with no
+	// locking.
+#pragma omp parallel for num_threads(nthreads) collapse(3) schedule(dynamic,64)
+	for( uint32_t k = 0; k < _geom.size(2); k++ ) {
+	    for( uint32_t j = 0; j < _geom.size(1); j++ ) {
+		for( uint32_t i = 0; i < _geom.size(0); i++ ) {
+
+		    Vec3D x( _geom.origo(0) + _geom.h()*i,
+			     _geom.origo(1) + _geom.h()*j,
+			     _geom.origo(2) + _geom.h()*k );
+
+		    uint32_t a = (k*_geom.size(1)+j)*_geom.size(0)+i;
+		    uint32_t mesh = _geom.mesh(a);
+		    uint32_t node_id = mesh & SMESH_NODE_ID_MASK;
+		    bool fixed = mesh & SMESH_NODE_FIXED;
+
+		    if( fixed ) {
+			//ibsimu.message( 1 ) << "Fixed\n";
+			continue;
+		    } else if( node_id == SMESH_NODE_ID_PURE_VACUUM ) {
+			//ibsimu.message( 1 ) << "Vacuum\n";
+			add_vacuum_node( i, j, k, x );
+		    } else if( node_id == SMESH_NODE_ID_NEAR_SOLID ) {
+			//ibsimu.message( 1 ) << "Near solid\n";
+			add_near_solid_node( i, j, k, x );
+		    } else if( node_id == SMESH_NODE_ID_NEUMANN ) {
+			//ibsimu.message( 1 ) << "Neumann\n";
+			add_neumann_node( i, j, k, x );
+		    }
 		}
 	    }
-        }
+	}
+
+	// Compact the per-row buffers into _fd_mat via construct_add(), in
+	// ascending row order, exactly as construct_add() requires. This
+	// pass is pure data movement (no stencil math, no plasma
+	// evaluation) over already-computed entries, so it stays cheap
+	// even though it runs single-threaded.
+	for( uint32_t a = 0; a < _dof; a++ ) {
+	    const std::vector<std::pair<int32_t,double> > &row = _row_entries[a];
+	    for( size_t n = 0; n < row.size(); n++ )
+		_fd_mat->construct_add( a, row[n].first, row[n].second );
+	}
+
+	// Order matrix
+	_fd_mat->order_ascending();
+
+	// Snapshot the constant rhs so later calls can restore it
+	// instead of rebuilding it from scratch.
+	if( _fd_vec_base )
+	    delete _fd_vec_base;
+	_fd_vec_base = new Vector( *_fd_vec );
+
+	// Snapshot the pure-linear diagonal J0(a,a) so get_resjac() can
+	// re-derive the Jacobian diagonal fresh each Newton iteration
+	// (J0(a,a) - D(a)) instead of repeatedly subtracting from
+	// whatever the now-persistent _fd_mat's diagonal currently holds.
+	_fd_mat_diag0.resize( _dof );
+	for( uint32_t a = 0; a < _dof; a++ )
+	    _fd_mat_diag0[a] = _fd_mat->get( a, a );
+
+	_linear_built = true;
+
+    } else {
+
+	// Matrix and constant rhs part are unchanged since the last
+	// build (same mesh, boundary conditions and scharge) -- just
+	// restore the cached constant rhs instead of rebuilding it.
+	*_fd_vec = *_fd_vec_base;
     }
 
-    // Order matrix
-    _fd_mat->order_ascending();
+    // Nonlinear update: add the epot-dependent plasma rhs term and
+    // diagonal derivative for every free node. This is the only part
+    // of matrix/rhs construction that actually depends on X (via
+    // _sol), so it is the only part that has to run every Newton
+    // iteration. Skipped entirely when the solver isn't using a
+    // plasma model, and cheap even when it does run since it does none
+    // of the stencil/boundary bookkeeping the linear build does -- just
+    // a mesh scan plus, for plasma-active nodes, the actual nonlinear
+    // evaluation (pexp_newton/nsimp_newton/shield_newton).
+    if( _plasma == PLASMA_PEXP || _plasma == PLASMA_NSIMP || _plasma == PLASMA_SHIELD ) {
+#pragma omp parallel for num_threads(nthreads) collapse(3) schedule(dynamic,64)
+	for( uint32_t k = 0; k < _geom.size(2); k++ ) {
+	    for( uint32_t j = 0; j < _geom.size(1); j++ ) {
+		for( uint32_t i = 0; i < _geom.size(0); i++ ) {
+
+		    uint32_t a_full = (k*_geom.size(1)+j)*_geom.size(0)+i;
+		    uint32_t mesh = _geom.mesh(a_full);
+		    if( mesh & SMESH_NODE_FIXED )
+			continue;
+
+		    Vec3D x( _geom.origo(0) + _geom.h()*i,
+			     _geom.origo(1) + _geom.h()*j,
+			     _geom.origo(2) + _geom.h()*k );
+
+		    uint32_t a = _n2d(a_full) & N2D_INDEX_MASK;
+		    update_nonlinear_node( a, i, j, k, x );
+		}
+	    }
+	}
+    }
 }
 
 
@@ -913,13 +996,25 @@ void EpotMatrixSolver::get_resjac( const CRowMatrix **J, const Vector **R, const
     _sol = &X;
     build_mat_vec();
 
+    // _fd_mat is now a cached, persistent matrix (see build_mat_vec()):
+    // whatever the *previous* get_resjac() call left in its diagonal is
+    // the Jacobian diagonal J0(a,a) - D_prev(a), not the pure linear
+    // J0(a,a). Restore the pure linear diagonal before using _fd_mat as
+    // J0 for the w = J0*X multiply below, otherwise w would silently
+    // pick up the previous iteration's nonlinear correction.
+    for( uint32_t a = 0; a < _dof; a++ )
+	_fd_mat->set(a,a) = _fd_mat_diag0[a];
+
     // Linear part
     Vector w = (*_fd_mat) * X;
 
     for( uint32_t a = 0; a < _dof; a++ ) {
 
 	(*_fd_vec)(a) = w(a) - (*_fd_vec)(a);
-	_fd_mat->set(a,a) -= (*_d_vec)(a);
+	// Set (not subtract from) the diagonal: it must be re-derived
+	// fresh from the pure-linear J0(a,a) each call, not adjusted
+	// relative to whatever a previous iteration left there.
+	_fd_mat->set(a,a) = _fd_mat_diag0[a] - (*_d_vec)(a);
     }
 
     *J = _fd_mat;

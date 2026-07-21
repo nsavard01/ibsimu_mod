@@ -72,7 +72,15 @@ class DXFSolid : public Solid {
     Vec3D                (*_func)(const Vec3D &);
     MyDXFEntities         *_entities;
     MyDXFEntitySelection  *_selection;
-    
+
+    bool                  _has_bbox;  /*!< \brief Is _bbox_min/_bbox_max valid? */
+    Vec3D                 _bbox_min;  /*!< \brief 2D (x,y set, z unused) extent of the
+					*   dxf loop in the file's own drawing
+					*   coordinates, cached at construction
+					*   time since no dependency on the
+					*   MyDXFFile is kept afterwards. */
+    Vec3D                 _bbox_max;
+
 public:
 
     /*! \brief Constructor for making a solid from a DXF-file layer.
@@ -105,6 +113,19 @@ public:
      *  solid.
      */
     virtual bool inside( const Vec3D &x ) const;
+
+    /*! \brief Return a conservative world-space bounding box.
+     *
+     *  Only supported for the built-in 2D->3D mappings (unity(),
+     *  rotx(), roty(), rotz()); a custom mapping set with
+     *  define_2x3_mapping() can map any input to "guaranteed inside"
+     *  via NaN, so no bound can be inferred for it and this returns
+     *  false. unity() also leaves one local axis unbounded (the dxf
+     *  drawing is extruded along it); the resulting world box still
+     *  restricts whichever world axes that local axis does not mix
+     *  into (see Solid::bbox_from_local_box()).
+     */
+    virtual bool get_bbox( Vec3D &min, Vec3D &max ) const;
 
     /*! \brief Print debugging information to stream \a os.
      */

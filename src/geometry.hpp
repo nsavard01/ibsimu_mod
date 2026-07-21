@@ -45,7 +45,6 @@
 
 
 #include <stdint.h>
-#include <pthread.h>
 #include <vector>
 #include <iostream>
 #include "file.hpp"
@@ -178,12 +177,6 @@ public:
  */
 class Geometry : public Mesh
 {
-    struct BuildMeshData {
-	pthread_t  thread;
-	uint32_t   index;
-	Geometry  *geom;
-    };
-
     uint32_t                   _n;         /*!< \brief Number of solids */
     std::vector<const Solid*>  _sdata;     /*!< \brief Array of solid definitions, size \a _n */
     std::vector<Bound>         _bound;     /*!< \brief Array of boundary conditions, size \a _n+6 */
@@ -191,10 +184,6 @@ class Geometry : public Mesh
     bool                       _built;     /*!< \brief Is solid mesh array built? */
     uint32_t                  *_smesh;     /*!< \brief Solid mesh array. */
     std::vector<uint8_t>       _nearsolid; /*!< \brief Near solid data. */
-
-    pthread_mutex_t            _mutex;     /*!< \brief Mutex for parallel mesh build. */
-    pthread_cond_t             _cond;      /*!< \brief Condition for parallel mesh build. */
-    uint32_t                   _done;      /*!< \brief State variable for parallel mesh build. */
 
     double                     _surface_eps; /*!< \brief Vertec matching tolerance. */
     VTriangleSurface           _surface;   /*!< \brief Triangulated surface. */
@@ -235,18 +224,39 @@ class Geometry : public Mesh
 
 
     void build_mesh_parallel_near_solid( uint32_t ind, int32_t i, int32_t j, int32_t k );
-    void build_mesh_parallel_prepare_near_solid( uint32_t &near_solid_index, 
+    void build_mesh_parallel_prepare_near_solid( uint32_t &near_solid_index,
 						 int32_t i, int32_t j, int32_t k );
     void build_mesh_parallel_prepare_3d( void );
     void build_mesh_parallel_prepare_2d( void );
     void build_mesh_parallel_prepare_1d( void );
 
-    void build_mesh_parallel_thread_3d( BuildMeshData *bmd );
-    void build_mesh_parallel_thread_2d( BuildMeshData *bmd );
-    void build_mesh_parallel_thread_1d( void );
-    void build_mesh_parallel_thread( BuildMeshData *bmd );
+    /*! \brief Narrow [imin,imax] (inclusive) along one mesh axis to
+     *  the node range that can overlap world-space bounds [bmin,bmax],
+     *  clamped to the existing mesh axis. Leaves imin/imax untouched
+     *  (full axis) if bmin/bmax indicate the axis is unrestricted --
+     *  see Solid::bbox_from_local_box() for that convention. If the
+     *  bounds don't overlap the mesh at all along this axis, sets
+     *  imin/imax so the range is empty (imin > imax).
+     */
+    void restrict_axis_range( double bmin, double bmax, double origo, int32_t size,
+			      int32_t &imin, int32_t &imax ) const;
 
-    static void *build_mesh_parallel_entry( void *data );
+    /*! \brief Compute the inclusive node index range [imin,imax] x
+     *  [jmin,jmax] x [kmin,kmax] that a solid's bounding box can
+     *  possibly touch, defaulting to the whole mesh on any axis (or
+     *  entirely) where Solid::get_bbox() doesn't provide a usable
+     *  bound. Used to skip calling solid->inside() on mesh nodes that
+     *  provably cannot be inside the solid.
+     */
+    void solid_node_range( const Solid *solid,
+			   int32_t &imin, int32_t &imax,
+			   int32_t &jmin, int32_t &jmax,
+			   int32_t &kmin, int32_t &kmax ) const;
+
+    void build_mesh_parallel_thread_3d( void );
+    void build_mesh_parallel_thread_2d( void );
+    void build_mesh_parallel_thread_1d( void );
+
     void build_mesh_parallel( void );
 
     static const int32_t mc_faces[15*256];

@@ -57,12 +57,49 @@
 class Solid {
 
 protected:
-    
+
     Transformation         _T;
 
     /*! \brief Constructor.
      */
     Solid();
+
+    /*! \brief Sentinel magnitude used by bbox_from_local_box() (and by
+     *  get_bbox() implementations) to flag a world-space axis along
+     *  which no finite bound could be established. Callers of
+     *  get_bbox() must treat any returned axis whose magnitude is
+     *  \f$ \ge 10^{10} \f$ as unrestricted -- not as a literal
+     *  coordinate limit.
+     */
+    static const double BBOX_HUGE;
+
+    /*! \brief Turn a solid-local-space (pre-\a _T) axis-aligned box
+     *  into a conservative world-space axis-aligned box.
+     *
+     *  \a lo and \a hi are corners of a box in the solid's native
+     *  coordinate frame, i.e. the frame in which inside() tests
+     *  actually happen after \a _T has been applied to the query
+     *  point (world = _T.inverse() * local). Components of \a lo/\a
+     *  hi may be +-BBOX_HUGE to mean "unbounded along this local
+     *  axis" (do not pass +-infinity: multiplying an infinite
+     *  coordinate by an exactly-zero matrix entry, which happens
+     *  routinely for axis-aligned rotations, produces NaN; a large
+     *  finite sentinel does not).
+     *
+     *  All 8 corners of the local box are mapped to world space with
+     *  _T.inverse() and the axis-aligned bounding box of the result
+     *  is returned in \a wmin/\a wmax. Because arbitrary rotations in
+     *  \a _T can mix a genuinely unbounded local axis into any world
+     *  axis, each world axis found to exceed a sanity threshold is
+     *  reset to +-BBOX_HUGE to flag it as unrestricted rather than
+     *  returning a meaningless huge number as if it were real.
+     *
+     *  Returns \a false if every world axis ended up unrestricted
+     *  (i.e. the box is useless and the caller should fall back to
+     *  scanning the whole mesh), \a true if at least one axis carries
+     *  a usable finite bound.
+     */
+    bool bbox_from_local_box( const Vec3D &lo, const Vec3D &hi, Vec3D &wmin, Vec3D &wmax ) const;
 
 public:
 
@@ -73,6 +110,24 @@ public:
     /*! \brief Return if point x is inside solid.
      */
     virtual bool inside( const Vec3D &x ) const = 0;
+
+    /*! \brief Return a conservative world-space axis-aligned bounding
+     *  box for the solid in \a min and \a max.
+     *
+     *  Returns \a false if no useful bound is known (the default),
+     *  in which case \a min/\a max are left untouched and the solid
+     *  must be assumed to possibly occupy the entire simulation
+     *  domain. A \a true return guarantees every point actually
+     *  inside the solid satisfies \a min <= x <= \a max
+     *  component-wise, but does not guarantee the reverse -- points
+     *  inside the box need not be inside the solid. Some axes of a
+     *  box returned as \a true may still be individually unrestricted;
+     *  see bbox_from_local_box().
+     */
+    virtual bool get_bbox( Vec3D &min, Vec3D &max ) const {
+	(void)min; (void)max;
+	return( false );
+    }
 
     /*! \brief Set transformation to unity.
      *
