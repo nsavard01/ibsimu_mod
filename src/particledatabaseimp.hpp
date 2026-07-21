@@ -681,14 +681,13 @@ public:
 	}
 
 	// Make solvers
-	pthread_mutex_t                      scharge_mutex = PTHREAD_MUTEX_INITIALIZER;
 	std::vector<ParticleIterator<PP> *>  iterators;
 	for( uint32_t a = 0; a < ibsimu.get_thread_count(); a++ ) {
 
-	    iterators.push_back( new ParticleIterator<PP>( PARTICLE_ITERATOR_ADAPTIVE, _epsabs, _epsrel, 
-							   _intrp, _scharge_dep, _maxsteps, _maxt, 
-							   _save_points, _trajdiv, _mirror, &scharge, 
-							   &scharge_mutex, &efield, &bfield, &_geom ) );
+	    iterators.push_back( new ParticleIterator<PP>( PARTICLE_ITERATOR_ADAPTIVE, _epsabs, _epsrel,
+							   _intrp, _scharge_dep, _maxsteps, _maxt,
+							   _save_points, _trajdiv, _mirror, &scharge,
+							   &efield, &bfield, &_geom ) );
 	    iterators[a]->set_trajectory_handler_callback( _thand_cb );
 	    iterators[a]->set_trajectory_end_callback( _tend_cb, _pdb );
 	    iterators[a]->set_trajectory_surface_collision_callback( _tsur_cb );

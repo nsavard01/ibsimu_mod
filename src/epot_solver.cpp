@@ -46,6 +46,8 @@
 #include "error.hpp"
 #include "compmath.hpp"
 #include "constants.hpp"
+#include <omp.h>
+#include <atomic>
 
 
 
@@ -275,14 +277,29 @@ void EpotSolver::preprocess( MeshScalarField &epot )
 
 
     // Set forced vacuum nodes and dirichlet nodes to correct
-    // potential. Mark fixed vacuum nodes with a tag.
-    Vec3D x;
+    // potential. Mark fixed vacuum nodes with a tag. Every node only
+    // reads/writes its own (i,j,k) slot of _geom.mesh()/epot(), with no
+    // dependency on any other node, so this is embarrassingly parallel.
+    // The one requirement this imposes: _force_pot_func/_force_pot_func2/
+    // _init_plasma_func (user-supplied callbacks) and
+    // Boundary::value() must be safe to call concurrently from multiple
+    // threads, since this loop calls them with no locking.
+    // node_id should always be one of the three cases handled below --
+    // the final "else" is a defensive, should-never-happen case. It used
+    // to just throw directly, which is fine in a serial loop but is
+    // undefined behavior (typically std::terminate) if it escapes an
+    // OpenMP parallel region uncaught. So it's turned into a shared
+    // flag instead, checked (and thrown from, serially) after the
+    // parallel loop ends.
+    std::atomic<bool> bad_node( false );
+    int nthreads = (int)ibsimu.get_thread_count();
+#pragma omp parallel for num_threads(nthreads) collapse(3) schedule(dynamic,64)
     for( uint32_t k = 0; k < _geom.size(2); k++ ) {
-	x[2] = _geom.origo(2) + _geom.h()*k;
 	for( uint32_t j = 0; j < _geom.size(1); j++ ) {
-	    x[1] = _geom.origo(1) + _geom.h()*j;
 	    for( uint32_t i = 0; i < _geom.size(0); i++ ) {
-		x[0] = _geom.origo(0) + _geom.h()*i;
+		Vec3D x( _geom.origo(0) + _geom.h()*i,
+			 _geom.origo(1) + _geom.h()*j,
+			 _geom.origo(2) + _geom.h()*k );
 
 		uint32_t mesh = _geom.mesh(i,j,k);
 		uint32_t node_id = mesh & SMESH_NODE_ID_MASK;
@@ -340,18 +357,27 @@ void EpotSolver::preprocess( MeshScalarField &epot )
 
 		} else {
 
-		    throw( ErrorUnimplemented( ERROR_LOCATION ) );		    
+		    bad_node = true;
 
 		}
 	    }
 	}
     }
+
+    if( bad_node )
+	throw( ErrorUnimplemented( ERROR_LOCATION ) );
 }
 
 
 void EpotSolver::postprocess( void )
 {
-    // Remove fixed vacuum tags
+    // Remove fixed vacuum tags. Every node only touches its own
+    // _geom.mesh(i,j,k) slot (pure bitmask logic, no callbacks, no
+    // cross-node reads), so this is a safe, no-caveat parallel loop --
+    // the gain is smaller than preprocess()'s since there's no callback
+    // work here, but it's essentially free.
+    int nthreads = (int)ibsimu.get_thread_count();
+#pragma omp parallel for num_threads(nthreads) collapse(3) schedule(dynamic,64)
     for( uint32_t k = 0; k < _geom.size(2); k++ ) {
 	for( uint32_t j = 0; j < _geom.size(1); j++ ) {
 	    for( uint32_t i = 0; i < _geom.size(0); i++ ) {
@@ -529,13 +555,19 @@ uint8_t EpotSolver::boundary_index_general( uint32_t i, uint32_t j, uint32_t k )
 
 MeshScalarField *EpotSolver::evaluate_scharge( const ScalarField &__scharge ) const
 {
-    // If scharge not defined in same points as geometry, evaluate scharge at nodes
+    // If scharge not defined in same points as geometry, evaluate scharge at nodes.
+    // Every node is independent (writes only to its own (i,j,k) slot, no
+    // read of any neighbour), so this is embarrassingly parallel -- the
+    // only requirement is that __scharge's operator() is safe to call
+    // concurrently from multiple threads, since it gets no locking here.
     MeshScalarField *scharge = new MeshScalarField( _geom );
+    int nthreads = (int)ibsimu.get_thread_count();
+#pragma omp parallel for num_threads(nthreads) collapse(3) schedule(dynamic,64)
     for( uint32_t k = 0; k < _geom.size(2); k++ ) {
-	double z = k*_geom.h()+_geom.origo(2);
 	for( uint32_t j = 0; j < _geom.size(1); j++ ) {
-	    double y = j*_geom.h()+_geom.origo(1);
 	    for( uint32_t i = 0; i < _geom.size(0); i++ ) {
+		double z = k*_geom.h()+_geom.origo(2);
+		double y = j*_geom.h()+_geom.origo(1);
 		double x = i*_geom.h()+_geom.origo(0);
 		(*scharge)(i,j,k) = __scharge( Vec3D(x,y,z) );
 	    }

@@ -531,7 +531,18 @@ double max_abs( const Vector &vec )
 {
     // idamax returns the 1-based index of the element with the largest
     // absolute value; MKL parallelises this automatically.
-#ifdef USE_BLAS
+    //
+    // This used to check USE_BLAS, a macro from the old ATLAS/ACML-era
+    // config.hpp that is never defined by the actual active build
+    // config (config.h, USE_MKL) -- so despite the comment above, this
+    // always fell through to the serial loop below even with MKL
+    // enabled, unlike every sibling reduction in this file (dot_prod,
+    // norm1, norm2, ssqr), which all correctly check USE_MKL. This is
+    // called every Newton iteration in EpotBiCGSTABSolver::subsolve()
+    // (max_abs(*R), max_abs(dX)), so on a large grid it was doing a
+    // serial O(dof) scan where MKL's cblas_idamax was available and
+    // already being used for every other reduction in the same loop.
+#ifdef USE_MKL
     if( vec._n == 0 )
 	return( 0.0 );
     int idx = cblas_idamax( vec._n, vec._val, 1 );   // Fortran 1-based

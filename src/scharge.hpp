@@ -44,7 +44,6 @@
 #define SCHARGE_HPP 1
 
 
-#include <pthread.h>
 #include "scalarfield.hpp"
 #include "particles.hpp"
 #include "cfifo.hpp"
@@ -71,7 +70,7 @@ void scharge_finalize_pic( MeshScalarField &scharge );
  *  and \a x2 are at the mesh intersection points, through which
  *  particle trajectory has passed.
  */
-void scharge_add_from_trajectory_pic( MeshScalarField &scharge, pthread_mutex_t *mutex, 
+void scharge_add_from_trajectory_pic( MeshScalarField &scharge,
 				      double I, const ParticleP2D &x1, const ParticleP2D &x2 );
 
 
@@ -81,7 +80,7 @@ void scharge_add_from_trajectory_pic( MeshScalarField &scharge, pthread_mutex_t 
  *  Same as for scharge_add_from_trajectory(). Now I is real current
  *  (A).
  */
-void scharge_add_from_trajectory_pic( MeshScalarField &scharge, pthread_mutex_t *mutex, 
+void scharge_add_from_trajectory_pic( MeshScalarField &scharge,
 				      double I, const ParticlePCyl &x1, const ParticlePCyl &x2 );
 
 
@@ -91,20 +90,20 @@ void scharge_add_from_trajectory_pic( MeshScalarField &scharge, pthread_mutex_t 
  *  Same as for scharge_add_from_trajectory(). Now I is real current
  *  (A).
  */
-void scharge_add_from_trajectory_pic( MeshScalarField &scharge, pthread_mutex_t *mutex, 
+void scharge_add_from_trajectory_pic( MeshScalarField &scharge,
 				      double I, const ParticleP3D &x1, const ParticleP3D &x2 );
 
 
 
 void scharge_finalize_linear( MeshScalarField &scharge );
 
-void scharge_add_from_trajectory_linear( MeshScalarField &scharge, pthread_mutex_t *mutex, 
+void scharge_add_from_trajectory_linear( MeshScalarField &scharge,
 					 double I, int dir, const CFiFo<ParticleP2D,4> &cdpast, const int i[3] );
 
-void scharge_add_from_trajectory_linear( MeshScalarField &scharge, pthread_mutex_t *mutex, 
+void scharge_add_from_trajectory_linear( MeshScalarField &scharge,
 					 double I, int dir, const CFiFo<ParticleP3D,4> &cdpast, const int i[3] );
 
-void scharge_add_from_trajectory_linear( MeshScalarField &scharge, pthread_mutex_t *mutex, 
+void scharge_add_from_trajectory_linear( MeshScalarField &scharge,
 					 double I, int dir, const CFiFo<ParticlePCyl,4> &cdpast, const int i[3] );
 
 

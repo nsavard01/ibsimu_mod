@@ -69,8 +69,9 @@
  *  of the result of the operation is known. This is is done to avoid
  *  excess copying and use of temporary variables during calculation.
  *
- *  Uses BLAS if preprocessor directive USE_BLAS is defined, see
- *  config.hpp.
+ *  Uses MKL's BLAS if preprocessor directive USE_MKL is defined, see
+ *  config.h. (USE_BLAS/config.hpp below refers to an older ATLAS/ACML
+ *  configuration scheme that the active build no longer uses.)
  */
 class Vector {
     int       _n;    //!< Number of elements.

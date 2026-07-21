@@ -48,7 +48,7 @@
 #include <iostream>
 #include <algorithm>
 #include <iomanip>
-#include <gsl/gsl_odeiv.h>
+#include <gsl/gsl_odeiv2.h>
 #include <gsl/gsl_poly.h>
 #include "geometry.hpp"
 #include "mat3d.hpp"
@@ -279,10 +279,10 @@ public:
  */
 template <class PP> class ParticleIterator {
 
-    gsl_odeiv_system           _system;        /**< \brief GSL ODE integrator system. */
-    gsl_odeiv_step            *_step;          /**< \brief GSL ODE integrator stepper. */
-    gsl_odeiv_control         *_control;       /**< \brief GSL ODE integrator constrol. */
-    gsl_odeiv_evolve          *_evolve;        /**< \brief GSL ODE integrator integrator. */
+    gsl_odeiv2_system           _system;        /**< \brief GSL ODE integrator system. */
+    gsl_odeiv2_step            *_step;          /**< \brief GSL ODE integrator stepper. */
+    gsl_odeiv2_control         *_control;       /**< \brief GSL ODE integrator constrol. */
+    gsl_odeiv2_evolve          *_evolve;        /**< \brief GSL ODE integrator integrator. */
 
     particle_iterator_type_e   _type;          /**< \brief Iteratory type. */
 
@@ -304,7 +304,6 @@ template <class PP> class ParticleIterator {
     TrajectorySurfaceCollisionCallback *_tsur_cb;   /*!< \brief Trajectory surface collision callback. */
     const TrajectoryEndCallback *_bsup_cb;     /*!< \brief B-field plasma suppression callback. */
     ParticleDataBase          *_pdb;           /*!< \brief Particle database pointer for adding secondary particles. */
-    pthread_mutex_t           *_scharge_mutex; /*!< \brief Space charge mutex. */
 
     PP                         _xi;            /*!< \brief Previous mesh intersection coordinates 
 					        *   or starting point. */
@@ -619,8 +618,8 @@ template <class PP> class ParticleIterator {
 	x2[2*a+2] *= -1.0;
 	
 	// Coordinates changed, reset integrator
-	gsl_odeiv_step_reset( _step );
-	gsl_odeiv_evolve_reset( _evolve );
+	gsl_odeiv2_step_reset( _step );
+	gsl_odeiv2_evolve_reset( _evolve );
 
 	DEBUG_DEC_INDENT();
     }
@@ -900,7 +899,7 @@ template <class PP> class ParticleIterator {
 	    // Update space charge for mesh volume i
 	    if( _scharge_dep == SCHARGE_DEPOSITION_LINEAR && _pidata._scharge ) {
 		_cdpast.push( _coldata[a]._x );
-		scharge_add_from_trajectory_linear( *_pidata._scharge, _scharge_mutex, particle.IQ(),
+		scharge_add_from_trajectory_linear( *_pidata._scharge, particle.IQ(),
 						    _coldata[a]._dir, _cdpast, i );
 	    }
 
@@ -909,7 +908,7 @@ template <class PP> class ParticleIterator {
 	    handle_trajectory_advance( particle, a, i, x2 );
 
 	    if( _scharge_dep == SCHARGE_DEPOSITION_PIC && _pidata._scharge ) {
-		scharge_add_from_trajectory_pic( *_pidata._scharge, _scharge_mutex, particle.IQ(), 
+		scharge_add_from_trajectory_pic( *_pidata._scharge, particle.IQ(),
 						 _xi, _coldata[a]._x );
 	    }
 
@@ -998,8 +997,8 @@ template <class PP> class ParticleIterator {
 	
 	// Next step not a continuation of previous one, reset
 	// integrator
-	gsl_odeiv_step_reset( _step );
-	gsl_odeiv_evolve_reset( _evolve );
+	gsl_odeiv2_step_reset( _step );
+	gsl_odeiv2_evolve_reset( _evolve );
 
 	// Continue iteration at mirrored point
 	x2 = x3;
@@ -1128,7 +1127,6 @@ public:
      *  trajectory saved.
      *  \param mirror %Particle mirroring on surfaces
      *  \param scharge Space charge field to save to
-     *  \param scharge_mutex Space charge write mutex
      *  \param efield Electric field in the geometry
      *  \param bfield Magnetic field in the geometry
      *  \param geom %Geometry definition
@@ -1139,17 +1137,16 @@ public:
      *  vector is used to calculate the particle number from the
      *  particle memory location.
      */
-    ParticleIterator( particle_iterator_type_e type, double epsabs, double epsrel, 
-		      trajectory_interpolation_e intrp, scharge_deposition_e scharge_dep, 
+    ParticleIterator( particle_iterator_type_e type, double epsabs, double epsrel,
+		      trajectory_interpolation_e intrp, scharge_deposition_e scharge_dep,
 		      uint32_t maxsteps, double maxt, bool save_points,
-		      uint32_t trajdiv, bool mirror[6], MeshScalarField *scharge, 
-		      pthread_mutex_t *scharge_mutex,
-		      const VectorField *efield, const VectorField *bfield, 
-		      const Geometry *geom ) 
-	: _type(type), _intrp(intrp), _scharge_dep(scharge_dep), _epsabs(epsabs), _epsrel(epsrel), 
-	  _maxsteps(maxsteps), _maxt(maxt), _save_points(save_points), _trajdiv(trajdiv), 
-	  _surface_collision(false), _pidata(scharge,efield,bfield,geom), 
-	  _thand_cb(0), _tend_cb(0), _tsur_cb(0), _bsup_cb(0), _pdb(0), _scharge_mutex(scharge_mutex), 
+		      uint32_t trajdiv, bool mirror[6], MeshScalarField *scharge,
+		      const VectorField *efield, const VectorField *bfield,
+		      const Geometry *geom )
+	: _type(type), _intrp(intrp), _scharge_dep(scharge_dep), _epsabs(epsabs), _epsrel(epsrel),
+	  _maxsteps(maxsteps), _maxt(maxt), _save_points(save_points), _trajdiv(trajdiv),
+	  _surface_collision(false), _pidata(scharge,efield,bfield,geom),
+	  _thand_cb(0), _tend_cb(0), _tsur_cb(0), _bsup_cb(0), _pdb(0),
 	  _stat(geom->number_of_boundaries()) {
 	
 	// Initialize mirroring
@@ -1179,19 +1176,19 @@ public:
 	    scale_abs[4] = 1.0;
 
 	// Initialize ODE solver
-	_step    = gsl_odeiv_step_alloc( gsl_odeiv_step_rkck, _system.dimension );
-	//_control = gsl_odeiv_control_standard_new( _epsabs, _epsrel, 1.0, 1.0 );
-	_control = gsl_odeiv_control_scaled_new( _epsabs, _epsrel, 1.0, 1.0, scale_abs, PP::size()-1 );
-	_evolve  = gsl_odeiv_evolve_alloc( _system.dimension );
+	_step    = gsl_odeiv2_step_alloc( gsl_odeiv2_step_rkck, _system.dimension );
+	//_control = gsl_odeiv2_control_standard_new( _epsabs, _epsrel, 1.0, 1.0 );
+	_control = gsl_odeiv2_control_scaled_new( _epsabs, _epsrel, 1.0, 1.0, scale_abs, PP::size()-1 );
+	_evolve  = gsl_odeiv2_evolve_alloc( _system.dimension );
     }
 
 
     /*! \brief Destructor.
      */
     ~ParticleIterator() {
-	gsl_odeiv_evolve_free( _evolve );
-	gsl_odeiv_control_free( _control );
-	gsl_odeiv_step_free( _step );
+	gsl_odeiv2_evolve_free( _evolve );
+	gsl_odeiv2_control_free( _control );
+	gsl_odeiv2_step_free( _step );
     }
 
 
@@ -1289,8 +1286,8 @@ public:
 	}
 
 	// Reset integrator
-	gsl_odeiv_step_reset( _step );
-	gsl_odeiv_evolve_reset( _evolve );
+	gsl_odeiv2_step_reset( _step );
+	gsl_odeiv2_evolve_reset( _evolve );
 	
 	// Make initial guess for step size
 	double dxdt[PP::size()-1];
@@ -1319,7 +1316,7 @@ public:
 			   "  dt = " << dt << " (proposed)\n" );
 
 	    while( true ) {
-		int retval = gsl_odeiv_evolve_apply( _evolve, _control, _step, &_system, 
+		int retval = gsl_odeiv2_evolve_apply( _evolve, _control, _step, &_system, 
 						     &x2[0], _maxt, &dt, &x2[1] );
 		if( retval == IBSIMU_DERIV_ERROR ) {
 		    DEBUG_MESSAGE( "Step rejected\n" <<
@@ -1335,7 +1332,7 @@ public:
 		} else if( retval == GSL_SUCCESS ) {
 		    break;
 		} else {
-		    throw( Error( ERROR_LOCATION, "gsl_odeiv_evolve_apply failed" ) );
+		    throw( Error( ERROR_LOCATION, "gsl_odeiv2_evolve_apply failed" ) );
 		}
 	    }
 	    

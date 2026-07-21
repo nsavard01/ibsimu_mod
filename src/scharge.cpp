@@ -41,6 +41,8 @@
  */
 
 #include <limits>
+#include <cstdint>
+#include <cstring>
 
 #include "trajectory.hpp"
 #include "scharge.hpp"
@@ -48,6 +50,54 @@
 
 
 //#define DEBUG_SCHARGE 1
+
+
+namespace {
+
+/* Portable atomic "+=" for a single double in the shared scharge mesh.
+ *
+ * This used to be a single global pthread_mutex_t shared by every
+ * particle-solving thread, locked around each deposit (typically 4-8
+ * cell updates). That serializes every space-charge write across the
+ * whole simulation, regardless of whether two threads are actually
+ * touching the same cell -- a real contention point at higher thread
+ * counts. Per-cell atomic add only blocks two threads that hit the
+ * exact same cell at the exact same time.
+ *
+ * std::atomic<double>::fetch_add() isn't available until C++20, and
+ * there's no hardware atomic floating-point add instruction to fall
+ * back on, so this is done as a compare-and-swap retry loop over the
+ * underlying bit pattern instead -- the standard pre-C++20 technique.
+ * Uses GCC/Clang's __atomic builtins directly on the raw memory
+ * (rather than reinterpreting as std::atomic<uint64_t>, which would be
+ * a stricter-aliasing violation), which is consistent with this
+ * codebase already assuming a GCC/Clang toolchain elsewhere (OpenMP
+ * pragmas, MKL). Relies on 8-byte doubles being naturally aligned and
+ * lock-free on the target platform (true for any conventionally
+ * allocated double array on x86-64/aarch64 Linux).
+ */
+inline void atomic_add_double( double &target, double val )
+{
+    static_assert( sizeof(double) == sizeof(uint64_t), "unexpected double size" );
+
+    uint64_t *bits = reinterpret_cast<uint64_t *>( &target );
+    uint64_t old_bits = __atomic_load_n( bits, __ATOMIC_RELAXED );
+
+    while( true ) {
+	double old_val, new_val;
+	memcpy( &old_val, &old_bits, sizeof(double) );
+	new_val = old_val + val;
+	uint64_t new_bits;
+	memcpy( &new_bits, &new_val, sizeof(double) );
+
+	if( __atomic_compare_exchange_n( bits, &old_bits, new_bits, true,
+					 __ATOMIC_RELAXED, __ATOMIC_RELAXED ) )
+	    break;
+	// old_bits was refreshed with the current value on failure; retry.
+    }
+}
+
+}
 
 
 #ifdef DEBUG_SCHARGE
@@ -168,7 +218,7 @@ void scharge_finalize_linear( MeshScalarField &scharge )
 }
 
 	
-void scharge_add_from_trajectory_pic( MeshScalarField &scharge, pthread_mutex_t *mutex, 
+void scharge_add_from_trajectory_pic( MeshScalarField &scharge,
 				      double I, const ParticleP2D &x1, const ParticleP2D &x2 )
 {
     TrajectoryRep1D traj[2];
@@ -206,18 +256,16 @@ void scharge_add_from_trajectory_pic( MeshScalarField &scharge, pthread_mutex_t 
 
     double Q = I*dt;
     int p = scharge.size(0)*i[1] + i[0];
-    pthread_mutex_lock( mutex );
-    scharge( p )                   += (1.0-t[0])*(1.0-t[1])*Q;
-    scharge( p+scharge.size(0) )   += (1.0-t[0])*t[1]*Q;
-    scharge( p+1 )                 += t[0]*(1.0-t[1])*Q;
-    scharge( p+1+scharge.size(0) ) += t[0]*t[1]*Q;
-    pthread_mutex_unlock( mutex );
+    atomic_add_double( scharge( p ),                   (1.0-t[0])*(1.0-t[1])*Q );
+    atomic_add_double( scharge( p+scharge.size(0) ),   (1.0-t[0])*t[1]*Q );
+    atomic_add_double( scharge( p+1 ),                 t[0]*(1.0-t[1])*Q );
+    atomic_add_double( scharge( p+1+scharge.size(0) ), t[0]*t[1]*Q );
 
     DEBUG_DEC_INDENT();
 }
 
 
-void scharge_add_from_trajectory_pic( MeshScalarField &scharge, pthread_mutex_t *mutex, 
+void scharge_add_from_trajectory_pic( MeshScalarField &scharge,
 				      double I, const ParticlePCyl &x1, const ParticlePCyl &x2 )
 {
     TrajectoryRep1D traj[2];
@@ -257,16 +305,14 @@ void scharge_add_from_trajectory_pic( MeshScalarField &scharge, pthread_mutex_t 
 
     double Q = I*dt;
     int p = scharge.size(0)*i[1] + i[0];
-    pthread_mutex_lock( mutex );
-    scharge( p )                   += (1.0-t[0])*(1.0-t[1])*Q;
-    scharge( p+scharge.size(0) )   += (1.0-t[0])*t[1]*Q;
-    scharge( p+1 )                 += t[0]*(1.0-t[1])*Q;
-    scharge( p+1+scharge.size(0) ) += t[0]*t[1]*Q;    
-    pthread_mutex_unlock( mutex );
+    atomic_add_double( scharge( p ),                   (1.0-t[0])*(1.0-t[1])*Q );
+    atomic_add_double( scharge( p+scharge.size(0) ),   (1.0-t[0])*t[1]*Q );
+    atomic_add_double( scharge( p+1 ),                 t[0]*(1.0-t[1])*Q );
+    atomic_add_double( scharge( p+1+scharge.size(0) ), t[0]*t[1]*Q );
 }
 
 
-void scharge_add_from_trajectory_pic( MeshScalarField &scharge, pthread_mutex_t *mutex, 
+void scharge_add_from_trajectory_pic( MeshScalarField &scharge,
 				      double I, const ParticleP3D &x1, const ParticleP3D &x2 )
 {
     TrajectoryRep1D traj[3];
@@ -296,18 +342,16 @@ void scharge_add_from_trajectory_pic( MeshScalarField &scharge, pthread_mutex_t 
     double Q = I*dt;
     int p = scharge.size(0)*scharge.size(1)*i[2] + scharge.size(0)*i[1] + i[0];
 
-    pthread_mutex_lock( mutex );
-    scharge( p )                   += (1.0-t[0])*(1.0-t[1])*(1.0-t[2])*Q;
-    scharge( p+scharge.size(0) )   += (1.0-t[0])*t[1]*(1.0-t[2])*Q;
-    scharge( p+1 )                 += t[0]*(1.0-t[1])*(1.0-t[2])*Q;
-    scharge( p+1+scharge.size(0) ) += t[0]*t[1]*(1.0-t[2])*Q;
+    atomic_add_double( scharge( p ),                   (1.0-t[0])*(1.0-t[1])*(1.0-t[2])*Q );
+    atomic_add_double( scharge( p+scharge.size(0) ),   (1.0-t[0])*t[1]*(1.0-t[2])*Q );
+    atomic_add_double( scharge( p+1 ),                 t[0]*(1.0-t[1])*(1.0-t[2])*Q );
+    atomic_add_double( scharge( p+1+scharge.size(0) ), t[0]*t[1]*(1.0-t[2])*Q );
 
     p += scharge.size(0)*scharge.size(1);
-    scharge( p )                   += (1.0-t[0])*(1.0-t[1])*t[2]*Q;
-    scharge( p+scharge.size(0) )   += (1.0-t[0])*t[1]*t[2]*Q;
-    scharge( p+1 )                 += t[0]*(1.0-t[1])*t[2]*Q;
-    scharge( p+1+scharge.size(0) ) += t[0]*t[1]*t[2]*Q;
-    pthread_mutex_unlock( mutex );
+    atomic_add_double( scharge( p ),                   (1.0-t[0])*(1.0-t[1])*t[2]*Q );
+    atomic_add_double( scharge( p+scharge.size(0) ),   (1.0-t[0])*t[1]*t[2]*Q );
+    atomic_add_double( scharge( p+1 ),                 t[0]*(1.0-t[1])*t[2]*Q );
+    atomic_add_double( scharge( p+1+scharge.size(0) ), t[0]*t[1]*t[2]*Q );
 }
 
 
@@ -393,7 +437,7 @@ double closest_point( ParticleP3D &intrp, const double x[3],
 }
 
 
-void scharge_add_from_trajectory_linear( MeshScalarField &scharge, pthread_mutex_t *mutex, 
+void scharge_add_from_trajectory_linear( MeshScalarField &scharge,
 					 double I, int dir, const CFiFo<ParticleP2D,4> &cdpast, const int i[3] )
 {
 #ifdef DEBUG_SCHARGE
@@ -465,9 +509,7 @@ void scharge_add_from_trajectory_linear( MeshScalarField &scharge, pthread_mutex
 	    continue;
 	double v = sqrt( p_closest[2]*p_closest[2] + p_closest[4]*p_closest[4] );
 	double Q = I*(scharge.h()-d_closest)/(scharge.h()*v);
-	pthread_mutex_lock( mutex );
-	scharge( ni[b][0], ni[b][1] ) += Q;
-	pthread_mutex_unlock( mutex );	
+	atomic_add_double( scharge( ni[b][0], ni[b][1] ), Q );
 #ifdef DEBUG_SCHARGE
 	std::cout << "v = " << v << "\n";
 	std::cout << "Q = " << Q << "\n";
@@ -476,7 +518,7 @@ void scharge_add_from_trajectory_linear( MeshScalarField &scharge, pthread_mutex
 }
 
 
-void scharge_add_from_trajectory_linear( MeshScalarField &scharge, pthread_mutex_t *mutex, 
+void scharge_add_from_trajectory_linear( MeshScalarField &scharge,
 					 double I, int dir, const CFiFo<ParticleP3D,4> &cdpast, const int i[3] )
 {
 #ifdef DEBUG_SCHARGE
@@ -630,9 +672,7 @@ void scharge_add_from_trajectory_linear( MeshScalarField &scharge, pthread_mutex
 			 p_closest[4]*p_closest[4] + 
 			 p_closest[6]*p_closest[6] );
 	double Q = I*(scharge.h()-d_closest)/(scharge.h()*v);
-	pthread_mutex_lock( mutex );
-	scharge( ni[b][0], ni[b][1], ni[b][2] ) += Q;
-	pthread_mutex_unlock( mutex );	
+	atomic_add_double( scharge( ni[b][0], ni[b][1], ni[b][2] ), Q );
 #ifdef DEBUG_SCHARGE
 	std::cout << "v = " << v << "\n";
 	std::cout << "Q = " << Q << "\n";
@@ -641,7 +681,7 @@ void scharge_add_from_trajectory_linear( MeshScalarField &scharge, pthread_mutex
 }
 
 
-void scharge_add_from_trajectory_linear( MeshScalarField &scharge, pthread_mutex_t *mutex, 
+void scharge_add_from_trajectory_linear( MeshScalarField &scharge,
 					 double I, int dir, const CFiFo<ParticlePCyl,4> &cdpast, const int i[3] )
 {
     throw( Error( ERROR_LOCATION, "unsupported geometry mode" ) );
