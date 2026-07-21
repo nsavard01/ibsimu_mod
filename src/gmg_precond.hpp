@@ -286,6 +286,24 @@ private:
     // prepare() and reused across calls (avoids per-call heap churn).
     mutable std::vector< std::vector<double> > _x, _b, _r;
 
+    // Cached state for the cheap level0->level1 Galerkin update (see
+    // build_delta_update_tables()/construct() in gmg_precond.cpp for the
+    // full derivation). Only level 0's diagonal ever changes between
+    // construct() calls (the off-diagonal/geometric part is fixed for
+    // the lifetime of this preconditioner, inherited from
+    // EpotMatrixSolver's linear/nonlinear split), so the resulting
+    // change to level 1's Galerkin-coarsened operator is exactly
+    // R0*diag(delta)*P0 -- a cheap, precomputed scatter-accumulate,
+    // rather than redoing the general (and, for the finest hop,
+    // dominant-cost) sparse-sparse Galerkin product every iteration.
+    std::vector<double>  _lvl0_diag_ref;  // level 0 diagonal as of prepare(), indexed by fine row m
+    std::vector<double>  _lvl1_lin_val;   // level 1 operator values with delta==0, i.e. as built by galerkin_coarsen() in prepare(); same layout as _level[1].val
+    std::vector<int32_t> _delta_src;      // fine row m for each precomputed triple
+    std::vector<int32_t> _delta_dst;      // matching index into _level[1].val
+    std::vector<double>  _delta_coef;     // contribution is _delta_coef[k] * (current diag[m] - _lvl0_diag_ref[m])
+
+    void build_delta_update_tables( void );
+
     void build_level0( const CRowMatrix &A );
     void refresh_level0_values( const CRowMatrix &A );
     void color_graph( Level &lev ) const;

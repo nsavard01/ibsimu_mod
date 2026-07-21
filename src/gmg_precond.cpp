@@ -20,10 +20,37 @@
 #include <algorithm>
 #include <unordered_map>
 #include <cmath>
+#include <cstring>
+#include <cstdint>
 #include <omp.h>
 #include "gmg_precond.hpp"
 #include "ibsimu.hpp"
 #include "error.hpp"
+
+
+/* Portable CAS-loop atomic add for double (std::atomic<double> has no
+ * fetch_add() until C++20). Duplicated from the identical helper in
+ * scharge.cpp rather than shared, to keep this file dependency-free --
+ * same rationale as color_graph() being duplicated from
+ * RBSOR_Precond rather than shared with it.
+ */
+namespace {
+inline void atomic_add_double( double &target, double val )
+{
+    static_assert( sizeof(double) == sizeof(uint64_t), "unexpected double size" );
+    uint64_t *addr = reinterpret_cast<uint64_t *>( &target );
+    uint64_t old_bits = __atomic_load_n( addr, __ATOMIC_RELAXED );
+    for( ;; ) {
+        double old_val, new_val;
+        std::memcpy( &old_val, &old_bits, sizeof(double) );
+        new_val = old_val + val;
+        uint64_t new_bits;
+        std::memcpy( &new_bits, &new_val, sizeof(double) );
+        if( __atomic_compare_exchange_n( addr, &old_bits, new_bits, true, __ATOMIC_RELAXED, __ATOMIC_RELAXED ) )
+            break;
+    }
+}
+}
 
 
 /* *****************************************************************************
@@ -85,6 +112,11 @@ void GMG_Precond::clear( void )
     _x.clear();
     _b.clear();
     _r.clear();
+    _lvl0_diag_ref.clear();
+    _lvl1_lin_val.clear();
+    _delta_src.clear();
+    _delta_dst.clear();
+    _delta_coef.clear();
 }
 
 
@@ -482,6 +514,130 @@ void GMG_Precond::find_diagonals( Level &lev ) const
 }
 
 
+/* Precompute the scatter tables used by construct() to apply the
+ * level0->level1 Galerkin update cheaply. Only level 0's diagonal
+ * changes between construct() calls (see the class-level comment on
+ * the corresponding members in gmg_precond.hpp), so writing
+ * A0 = A0_ref + diag(delta) (A0_ref being whatever level 0 looked like
+ * when this was last called from prepare(), delta the change since
+ * then) gives, via the Galerkin definition A1 = R0*A0*P0:
+ *
+ *   A1 = R0*A0_ref*P0 + R0*diag(delta)*P0
+ *      = A1_ref                + R0*diag(delta)*P0
+ *
+ * A1_ref is exactly the level-1 operator galerkin_coarsen() already
+ * built in prepare() (cached below as _lvl1_lin_val). For the second
+ * term, using R0 = c*P0^T (c = 1/2^dim, see build_transfer_operators()):
+ *
+ *   R0*diag(delta)*P0 = c * P0^T * diag(delta) * P0
+ *
+ * so its (I,J) entry is c * sum_m delta[m]*P0[m,I]*P0[m,J] -- a sum
+ * over fine rows m, each contributing a small (<= (2^dim)^2) dense
+ * outer product of its own P-row with itself. This function walks
+ * every fine row once and, for every (I,J) pair its P-row touches,
+ * looks up that entry's position in level 1's (fixed-pattern) CSR
+ * storage, recording the (fine row, level1.val index, coefficient)
+ * triple. construct() then just scatter-accumulates
+ * delta[m]*coefficient into level1.val at those indices every call --
+ * O(fine.n * average-stencil^2) cheap array writes instead of a
+ * general hash-map-based sparse-sparse product over the largest
+ * matrix in the hierarchy, every single Newton iteration.
+ *
+ * The lookup below assumes every (I,J) pair produced this way already
+ * exists in level 1's pattern; that holds because A1_ref's own
+ * pattern is the union of contributions from every nonzero of A0_ref
+ * (off-diagonal *and* diagonal), and A0_ref's diagonal is a fully
+ * generic (essentially never exactly zero) physical value at every
+ * free node, so the diagonal-only pattern is already a subset of
+ * A1_ref's pattern. If some pathological entry is ever missing anyway
+ * (e.g. a genuinely zero reference diagonal at some node), the
+ * contribution is just dropped rather than throwing: this is a
+ * preconditioner, so the very worst case is a slightly less accurate
+ * M^-1, never an incorrect BiCGSTAB/Newton result.
+ */
+void GMG_Precond::build_delta_update_tables( void )
+{
+    _lvl0_diag_ref.clear();
+    _lvl1_lin_val.clear();
+    _delta_src.clear();
+    _delta_dst.clear();
+    _delta_coef.clear();
+
+    if( _level.size() < 2 )
+        return; // no coarser level exists to update this way
+
+    const Level &lev0 = _level[0];
+    const Level &lev1 = _level[1];
+
+    _lvl0_diag_ref.assign( lev0.n, 0.0 );
+    for( int m = 0; m < lev0.n; m++ ) {
+        int di = lev0.diag_idx[m];
+        if( di >= 0 )
+            _lvl0_diag_ref[m] = lev0.val[di];
+    }
+
+    _lvl1_lin_val = lev1.val;
+
+    double c = 1.0;
+    for( uint32_t d = 0; d < _dim; d++ )
+        c *= 0.5;
+
+    int nfine = (int)lev1.p_ptr.size()-1;
+
+    int nthr = omp_get_max_threads();
+    std::vector< std::vector<int32_t> > src_buf( nthr );
+    std::vector< std::vector<int32_t> > dst_buf( nthr );
+    std::vector< std::vector<double> >  coef_buf( nthr );
+
+    #pragma omp parallel
+    {
+        int tid = omp_get_thread_num();
+        std::vector<int32_t> &src  = src_buf[tid];
+        std::vector<int32_t> &dst  = dst_buf[tid];
+        std::vector<double>  &coef = coef_buf[tid];
+
+        #pragma omp for schedule(dynamic,256)
+        for( int m = 0; m < nfine; m++ ) {
+            int p0 = lev1.p_ptr[m], p1 = lev1.p_ptr[m+1];
+            for( int a = p0; a < p1; a++ ) {
+                int Ia = lev1.p_col[a];
+                double wa = lev1.p_val[a];
+                for( int b = p0; b < p1; b++ ) {
+                    int Ib = lev1.p_col[b];
+                    double wb = lev1.p_val[b];
+
+                    int found = -1;
+                    for( int p = lev1.ptr[Ia]; p < lev1.ptr[Ia+1]; p++ ) {
+                        if( lev1.col[p] == Ib ) {
+                            found = p;
+                            break;
+                        }
+                    }
+                    if( found < 0 )
+                        continue; // see function comment -- defensive, should not happen
+
+                    src.push_back( m );
+                    dst.push_back( found );
+                    coef.push_back( c*wa*wb );
+                }
+            }
+        }
+    }
+
+    size_t total = 0;
+    for( int t = 0; t < nthr; t++ )
+        total += src_buf[t].size();
+    _delta_src.reserve( total );
+    _delta_dst.reserve( total );
+    _delta_coef.reserve( total );
+    for( int t = 0; t < nthr; t++ ) {
+        _delta_src.insert( _delta_src.end(), src_buf[t].begin(), src_buf[t].end() );
+        _delta_dst.insert( _delta_dst.end(), dst_buf[t].begin(), dst_buf[t].end() );
+        _delta_coef.insert( _delta_coef.end(), coef_buf[t].begin(), coef_buf[t].end() );
+    }
+}
+
+
 void GMG_Precond::prepare( const CRowMatrix &A )
 {
     if( A.rows() != A.columns() )
@@ -553,6 +709,8 @@ void GMG_Precond::prepare( const CRowMatrix &A )
         _level.push_back( std::move(coarse) );
     }
 
+    build_delta_update_tables();
+
     // Scratch buffers, one pair per level, sized once and reused by
     // every call to solve().
     _x.assign( _level.size(), std::vector<double>() );
@@ -611,7 +769,34 @@ void GMG_Precond::construct( const CRowMatrix &A )
     refresh_level0_values( A );
     find_diagonals( _level[0] );
 
-    for( size_t l = 1; l < _level.size(); l++ ) {
+    if( _level.size() >= 2 ) {
+        // Cheap incremental update of level 1's Galerkin operator --
+        // see build_delta_update_tables() for the derivation. This
+        // replaces what used to be a full general sparse-sparse
+        // Galerkin product here (the single most expensive one in the
+        // hierarchy, since level 0 is by far the largest level) with
+        // an O(nnz) reset + scatter-accumulate.
+        Level &lev1 = _level[1];
+        lev1.val = _lvl1_lin_val;
+
+        const Level &lev0 = _level[0];
+        size_t ntriples = _delta_src.size();
+
+        #pragma omp parallel for schedule(static)
+        for( size_t k = 0; k < ntriples; k++ ) {
+            int m = _delta_src[k];
+            int di = lev0.diag_idx[m];
+            double curdiag = (di >= 0 ? lev0.val[di] : 0.0);
+            double delta = curdiag - _lvl0_diag_ref[m];
+            if( delta == 0.0 )
+                continue;
+            atomic_add_double( lev1.val[ _delta_dst[k] ], delta*_delta_coef[k] );
+        }
+
+        find_diagonals( lev1 );
+    }
+
+    for( size_t l = 2; l < _level.size(); l++ ) {
         galerkin_coarsen( _level[l-1], _level[l] );
         find_diagonals( _level[l] );
     }
