@@ -66,6 +66,17 @@
  *  to the unit outward normal (out of solid into the vacuum) of the
  *  surface is preset \f[ - \frac{\partial \phi}{\partial \vec{n}} = -
  *  \sum_i n_i \frac{\partial \phi}{\partial x_i} = q_0. \f]
+ *
+ *  Dielectric (solids only, n >= 7) is different in kind from the
+ *  other two: it is not a boundary *value* at all, so \a value() is
+ *  repurposed to carry the solid's relative permittivity \f$
+ *  \epsilon_r \f$ instead of a potential. The solid's interior is not
+ *  eliminated from the linear system the way a Dirichlet solid's is --
+ *  it remains a free region of the mesh satisfying Laplace's equation,
+ *  and the permittivity only enters the discretization at the
+ *  boundary between differing materials (see EpotMatrixSolver). Must
+ *  be a constant value (is_constant() == true); a spatially-varying
+ *  permittivity within a single solid is not supported.
  */
 class Bound 
 {
@@ -140,6 +151,33 @@ public:
 
 #define SMESH_BOUNDARY_NUMBER_MASK     0x000000FF // limit to 0-255
 #define SMESH_NEAR_SOLID_INDEX_MASK    0x1FFFFFFF // limit to 0-2^29 (5.4e8)
+
+
+/*! \brief True if raw smesh value \a node is physically solid material
+ *  -- impenetrable to particles and part of the visible/triangulated
+ *  surface -- regardless of whether the potential solver eliminates it
+ *  (a Dirichlet conductor) or keeps it as a free node satisfying
+ *  Laplace's equation (a dielectric, see BOUND_DIELECTRIC in
+ *  types.hpp).
+ *
+ *  This is deliberately a *different* question from is_solid()/
+ *  is_near_solid(): those exist for the potential solver's mesh
+ *  classification and must stay Dirichlet-only (a dielectric's
+ *  interior is intentionally not eliminated, and its vacuum-facing
+ *  neighbours must stay ordinary PURE_VACUUM nodes rather than being
+ *  reclassified near-solid -- see EpotMatrixSolver::add_vacuum_node()).
+ *  Surface triangulation (mc_case(), surface_cell_face_case_2d(),
+ *  surface_inside_solid_number()) and particle collision detection
+ *  (ParticleIterator::get_solid()/is_solid()) ask a geometric question
+ *  instead -- "is there solid material here a particle should be
+ *  absorbed by / a surface should be drawn at" -- which dielectrics
+ *  must answer the same way conductors do.
+ */
+#define SMESH_NODE_IS_SOLID_MATERIAL(node) \
+    ( ( ((node) & SMESH_NODE_ID_MASK) == SMESH_NODE_ID_DIRICHLET && \
+	((node) & SMESH_BOUNDARY_NUMBER_MASK) >= 7 ) || \
+      ( ((node) & SMESH_NODE_ID_MASK) == SMESH_NODE_ID_PURE_VACUUM && \
+	((node) & SMESH_NEAR_SOLID_INDEX_MASK) >= 7 ) )
 
 
 /*! \brief %Geometry defining class.

@@ -238,6 +238,67 @@ private:
      */
     void update_nonlinear_node( uint32_t a, uint32_t i, uint32_t j, uint32_t k, const Vec3D &x );
 
+    /*! \brief Return the relative permittivity of whatever mesh node
+     *  \a mesh_value describes.
+     *
+     *  Returns 1.0 (vacuum) unless the node is tagged
+     *  SMESH_NODE_ID_PURE_VACUUM with a nonzero solid number in its
+     *  lower bits, i.e. it is inside a dielectric solid (see
+     *  Geometry::build_mesh_parallel_thread_3d() for how such nodes
+     *  get tagged this way instead of as Dirichlet) -- in which case
+     *  the solid's Bound (BOUND_DIELECTRIC) supplies epsilon_r. Any
+     *  other node type (near-solid, Neumann, Dirichlet) is, by
+     *  construction, never inside a dielectric in the current
+     *  (grid-aligned dielectric surface) implementation, so it is
+     *  always treated as vacuum here -- correct because a real vacuum
+     *  node adjacent to a genuine conductor is always reclassified
+     *  near-solid rather than staying pure vacuum, and a Dirichlet
+     *  boundary's fixed value does not depend on permittivity anyway.
+     */
+    double node_epsilon_r( uint32_t mesh_value ) const;
+
+    /*! \brief Effective relative permittivity to use for a face
+     *  linking a free node (of permittivity \a eps_self) to whatever
+     *  \a mesh_value describes.
+     *
+     *  If the neighbour is itself a plain/dielectric node
+     *  (SMESH_NODE_ID_PURE_VACUUM[_FIX]), its own permittivity from
+     *  node_epsilon_r() is used, same as any interior face. If the
+     *  neighbour is Dirichlet (a fixed-voltage conductor, or a
+     *  simulation box edge), there is no material information to be
+     *  had from that node -- a Dirichlet node's lower bits identify
+     *  *which conductor/edge* it is, not a permittivity -- so \a
+     *  eps_self is used instead, i.e. the medium \a self sits in is
+     *  assumed to extend right up to the fixed-voltage surface with no
+     *  other material intervening. This is what makes a dielectric
+     *  flush against a conductor (the "ceramic sitting on a biased
+     *  electrode" case) work correctly: using 1.0 (vacuum) here
+     *  unconditionally, as an earlier version of this function did,
+     *  silently gave the wrong answer whenever a dielectric touched a
+     *  conductor -- caught by the 1D two-media capacitor verification
+     *  test, not by inspection. Any other neighbour type (near-solid,
+     *  Neumann, fine-boundary) falls back to vacuum, consistent with
+     *  node_epsilon_r() -- see its doc comment for why that is safe in
+     *  the current grid-aligned-dielectric implementation.
+     */
+    double neighbor_epsilon_r( uint32_t mesh_value, double eps_self ) const;
+
+    /*! \brief Effective face permittivity between two adjacent cells
+     *  of relative permittivity \a eps_a and \a eps_b, i.e. the
+     *  harmonic mean 2*eps_a*eps_b/(eps_a+eps_b).
+     *
+     *  This is the standard finite-volume treatment for a coefficient
+     *  discontinuity: it is what falls out of modelling the two
+     *  half-cells adjacent to the shared face as two permittivities in
+     *  series. Reduces to eps_a (=eps_b) when both sides match, so
+     *  using it unconditionally on every face -- not just ones that
+     *  cross a material boundary -- changes nothing for a
+     *  uniform-permittivity region (including plain vacuum, eps=1
+     *  throughout, which reproduces every coefficient in
+     *  add_vacuum_node() exactly as before dielectric support existed).
+     */
+    static double face_epsilon( double eps_a, double eps_b );
+
     void add_vacuum_node( uint32_t i, uint32_t j, uint32_t k, const Vec3D &x );
     void add_near_solid_node_1d( uint32_t i, const Vec3D &x );
     void add_near_solid_node_2d( uint32_t i, uint32_t j, const Vec3D &x );

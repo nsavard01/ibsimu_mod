@@ -300,8 +300,20 @@ void Geometry::set_boundary( uint32_t n, const Bound &b )
     if( n <= 0 || n > _n+6 )
 	throw( Error( ERROR_LOCATION, "illegal solid number " + to_string(n) ) );
 
-    if( n >= 7 && b.type() != BOUND_DIRICHLET )
+    // Solids (n >= 7) may be Dirichlet (a conductor at a fixed
+    // potential) or, since ceramics/dielectric support was added,
+    // Dielectric (a solid with a relative permittivity, whose interior
+    // is not eliminated -- see BOUND_DIELECTRIC's doc comment in
+    // types.hpp). Only the six simulation box boundaries (n <= 6) may
+    // be Neumann.
+    if( n >= 7 && b.type() == BOUND_NEUMANN )
 	throw( Error( ERROR_LOCATION, "trying to set solid " + to_string(n) + " as Neumann boundary" ) );
+    if( n <= 6 && b.type() == BOUND_DIELECTRIC )
+	throw( Error( ERROR_LOCATION, "simulation box boundary " + to_string(n) + " can not be dielectric" ) );
+
+    if( n >= 7 && b.type() == BOUND_DIELECTRIC && !b.is_constant() )
+	throw( Error( ERROR_LOCATION, "dielectric solid " + to_string(n) + " requires a constant "
+		      "relative permittivity value, not a spatially varying functor" ) );
 
     _bound[n-1] = b;
 }
@@ -1248,7 +1260,21 @@ void Geometry::build_mesh_parallel_thread_3d( void )
 	for( ssize_t a = (ssize_t)_sdata.size()-1; a >= 0; a-- ) {
 
 	    const Solid *solid = _sdata[a];
-	    uint32_t nid = SMESH_NODE_ID_DIRICHLET | (uint32_t)(a+7);
+
+	    // Dielectric solids keep their interior as an ordinary free
+	    // mesh region (tagged like vacuum, just carrying the solid
+	    // number in the lower bits for material lookup) instead of
+	    // being eliminated as Dirichlet: the interior satisfies
+	    // Laplace's equation with the same stencil as vacuum (a
+	    // uniform permittivity cancels out of the homogeneous
+	    // equation), and EpotMatrixSolver::preprocess() only
+	    // eliminates nodes whose SMESH_NODE_FIXED bit is set, which
+	    // SMESH_NODE_ID_PURE_VACUUM does not have. See
+	    // add_vacuum_node() for where the permittivity actually
+	    // enters, at material boundaries.
+	    uint32_t nid = (_bound[a+6].type() == BOUND_DIELECTRIC ?
+			    SMESH_NODE_ID_PURE_VACUUM : SMESH_NODE_ID_DIRICHLET) |
+		(uint32_t)(a+7);
 
 	    // Restrict the sweep to the node range the solid's bbox
 	    // can possibly touch (falls back to the whole mesh when
@@ -1309,7 +1335,12 @@ void Geometry::build_mesh_parallel_thread_2d( void )
 	for( ssize_t a = (ssize_t)_sdata.size()-1; a >= 0; a-- ) {
 
 	    const Solid *solid = _sdata[a];
-	    uint32_t nid = SMESH_NODE_ID_DIRICHLET | (uint32_t)(a+7);
+
+	    // See the identical branch in build_mesh_parallel_thread_3d()
+	    // for the rationale.
+	    uint32_t nid = (_bound[a+6].type() == BOUND_DIELECTRIC ?
+			    SMESH_NODE_ID_PURE_VACUUM : SMESH_NODE_ID_DIRICHLET) |
+		(uint32_t)(a+7);
 
 	    int32_t imin, imax, jmin, jmax, kmin, kmax;
 	    solid_node_range( solid, imin, imax, jmin, jmax, kmin, kmax );
@@ -1354,10 +1385,16 @@ void Geometry::build_mesh_parallel_thread_1d( void )
     for( int32_t i = 0; i < _size[0]; i++ ) {
 	double x = i*_h+_origo[0];
 	uint32_t nid = inside( Vec3D(x) );
-	if( nid )
-	    mesh(i) = SMESH_NODE_ID_DIRICHLET | nid;
-	else
+	if( nid ) {
+	    // See build_mesh_parallel_thread_3d() for the dielectric
+	    // rationale.
+	    if( _bound[nid-1].type() == BOUND_DIELECTRIC )
+		mesh(i) = SMESH_NODE_ID_PURE_VACUUM | nid;
+	    else
+		mesh(i) = SMESH_NODE_ID_DIRICHLET | nid;
+	} else {
 	    mesh(i) = 0;
+	}
     }
 
     // Mark rest of mesh nodes and prepare for building near solid data
@@ -1743,26 +1780,22 @@ uint8_t Geometry::mc_case( int32_t i, int32_t j, int32_t k ) const
 
     // Node 1 (i,j,k)
     node = _smesh[ptr];
-    if( (node & SMESH_NODE_ID_MASK) == SMESH_NODE_ID_DIRICHLET &&
-	(node & SMESH_BOUNDARY_NUMBER_MASK) >= 7 )
+    if( SMESH_NODE_IS_SOLID_MATERIAL(node) )
 	res += MC_V1;
 
     // Node 2 (i+1,j,k)
     node = _smesh[ptr+1];
-    if( (node & SMESH_NODE_ID_MASK) == SMESH_NODE_ID_DIRICHLET &&
-	(node & SMESH_BOUNDARY_NUMBER_MASK) >= 7 )
+    if( SMESH_NODE_IS_SOLID_MATERIAL(node) )
 	res += MC_V2;
 
     // Node 3 (i+1,j+1,k)
     node = _smesh[ptr+1+_size[0]];
-    if( (node & SMESH_NODE_ID_MASK) == SMESH_NODE_ID_DIRICHLET &&
-	(node & SMESH_BOUNDARY_NUMBER_MASK) >= 7 )
+    if( SMESH_NODE_IS_SOLID_MATERIAL(node) )
 	res += MC_V3;
 
     // Node 4 (i,j+1,k)
     node = _smesh[ptr+_size[0]];
-    if( (node & SMESH_NODE_ID_MASK) == SMESH_NODE_ID_DIRICHLET &&
-	(node & SMESH_BOUNDARY_NUMBER_MASK) >= 7 )
+    if( SMESH_NODE_IS_SOLID_MATERIAL(node) )
 	res += MC_V4;
 
     // Second z-level
@@ -1770,26 +1803,22 @@ uint8_t Geometry::mc_case( int32_t i, int32_t j, int32_t k ) const
 
     // Node 5 (i,j,k+1)
     node = _smesh[ptr];
-    if( (node & SMESH_NODE_ID_MASK) == SMESH_NODE_ID_DIRICHLET &&
-	(node & SMESH_BOUNDARY_NUMBER_MASK) >= 7 )
+    if( SMESH_NODE_IS_SOLID_MATERIAL(node) )
 	res += MC_V5;
 
     // Node 6 (i+1,j,k+1)
     node = _smesh[ptr+1];
-    if( (node & SMESH_NODE_ID_MASK) == SMESH_NODE_ID_DIRICHLET &&
-	(node & SMESH_BOUNDARY_NUMBER_MASK) >= 7 )
+    if( SMESH_NODE_IS_SOLID_MATERIAL(node) )
 	res += MC_V6;
 
     // Node 7 (i+1,j+1,k+1)
     node = _smesh[ptr+1+_size[0]];
-    if( (node & SMESH_NODE_ID_MASK) == SMESH_NODE_ID_DIRICHLET &&
-	(node & SMESH_BOUNDARY_NUMBER_MASK) >= 7 )
+    if( SMESH_NODE_IS_SOLID_MATERIAL(node) )
 	res += MC_V7;
 
     // Node 8 (i,j+1,k+1)
     node = _smesh[ptr+_size[0]];
-    if( (node & SMESH_NODE_ID_MASK) == SMESH_NODE_ID_DIRICHLET &&
-	(node & SMESH_BOUNDARY_NUMBER_MASK) >= 7 )
+    if( SMESH_NODE_IS_SOLID_MATERIAL(node) )
 	res += MC_V8;
 
 #ifdef MC_DEBUG
@@ -2058,29 +2087,25 @@ uint8_t Geometry::surface_cell_face_case_2d( const int32_t i[3], const int32_t v
 
     // Node 1 (x,y)
     node = mesh( (j[2]*_size[1] + j[1])*_size[0] + j[0] );
-    if( (node & SMESH_NODE_ID_MASK) == SMESH_NODE_ID_DIRICHLET &&
-	(node & SMESH_BOUNDARY_NUMBER_MASK) >= 7 )
+    if( SMESH_NODE_IS_SOLID_MATERIAL(node) )
 	res += 1;
 
     // Node 2 (x+1,y)
     j[vb[0]]++;
     node = mesh( (j[2]*_size[1] + j[1])*_size[0] + j[0] );
-    if( (node & SMESH_NODE_ID_MASK) == SMESH_NODE_ID_DIRICHLET &&
-	(node & SMESH_BOUNDARY_NUMBER_MASK) >= 7 )
+    if( SMESH_NODE_IS_SOLID_MATERIAL(node) )
 	res += 2;
 
     // Node 3 (x+1,y+1)
     j[vb[1]]++;
     node = mesh( (j[2]*_size[1] + j[1])*_size[0] + j[0] );
-    if( (node & SMESH_NODE_ID_MASK) == SMESH_NODE_ID_DIRICHLET &&
-	(node & SMESH_BOUNDARY_NUMBER_MASK) >= 7 )
+    if( SMESH_NODE_IS_SOLID_MATERIAL(node) )
 	res += 4;
 
     // Node 4 (x,y+1)
     j[vb[0]]--;
     node = mesh( (j[2]*_size[1] + j[1])*_size[0] + j[0] );
-    if( (node & SMESH_NODE_ID_MASK) == SMESH_NODE_ID_DIRICHLET &&
-	(node & SMESH_BOUNDARY_NUMBER_MASK) >= 7 )
+    if( SMESH_NODE_IS_SOLID_MATERIAL(node) )
 	res += 8;
 
     return( res );
@@ -2414,34 +2439,27 @@ uint32_t Geometry::surface_inside_solid_number( int32_t i, int32_t j,int32_t k )
 {
     uint32_t ptr = (k*_size[1] + j)*_size[0] + i;
     uint32_t node = _smesh[ptr];
-    if( (node & SMESH_NODE_ID_MASK) == SMESH_NODE_ID_DIRICHLET &&
-	(node & SMESH_BOUNDARY_NUMBER_MASK) >= 7 )
-	return( node & SMESH_BOUNDARY_NUMBER_MASK );    
+    if( SMESH_NODE_IS_SOLID_MATERIAL(node) )
+	return( node & SMESH_BOUNDARY_NUMBER_MASK );
     node = _smesh[ptr+1];
-    if( (node & SMESH_NODE_ID_MASK) == SMESH_NODE_ID_DIRICHLET &&
-	(node & SMESH_BOUNDARY_NUMBER_MASK) >= 7 )
+    if( SMESH_NODE_IS_SOLID_MATERIAL(node) )
 	return( node & SMESH_BOUNDARY_NUMBER_MASK );
     node = _smesh[ptr+_size[0]];
-    if( (node & SMESH_NODE_ID_MASK) == SMESH_NODE_ID_DIRICHLET &&
-	(node & SMESH_BOUNDARY_NUMBER_MASK) >= 7 )
+    if( SMESH_NODE_IS_SOLID_MATERIAL(node) )
 	return( node & SMESH_BOUNDARY_NUMBER_MASK );
     node = _smesh[ptr+_size[0]+1];
-    if( (node & SMESH_NODE_ID_MASK) == SMESH_NODE_ID_DIRICHLET &&
-	(node & SMESH_BOUNDARY_NUMBER_MASK) >= 7 )
+    if( SMESH_NODE_IS_SOLID_MATERIAL(node) )
 	return( node & SMESH_BOUNDARY_NUMBER_MASK );
 
     ptr += _size[1]*_size[0];
     node = _smesh[ptr];
-    if( (node & SMESH_NODE_ID_MASK) == SMESH_NODE_ID_DIRICHLET &&
-	(node & SMESH_BOUNDARY_NUMBER_MASK) >= 7 )
-	return( node & SMESH_BOUNDARY_NUMBER_MASK );    
+    if( SMESH_NODE_IS_SOLID_MATERIAL(node) )
+	return( node & SMESH_BOUNDARY_NUMBER_MASK );
     node = _smesh[ptr+1];
-    if( (node & SMESH_NODE_ID_MASK) == SMESH_NODE_ID_DIRICHLET &&
-	(node & SMESH_BOUNDARY_NUMBER_MASK) >= 7 )
+    if( SMESH_NODE_IS_SOLID_MATERIAL(node) )
 	return( node & SMESH_BOUNDARY_NUMBER_MASK );
     node = _smesh[ptr+_size[0]];
-    if( (node & SMESH_NODE_ID_MASK) == SMESH_NODE_ID_DIRICHLET &&
-	(node & SMESH_BOUNDARY_NUMBER_MASK) >= 7 )
+    if( SMESH_NODE_IS_SOLID_MATERIAL(node) )
 	return( node & SMESH_BOUNDARY_NUMBER_MASK );
     node = _smesh[ptr+_size[0]+1];
     return( node & SMESH_BOUNDARY_NUMBER_MASK );

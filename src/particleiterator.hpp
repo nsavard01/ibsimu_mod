@@ -333,53 +333,41 @@ template <class PP> class ParticleIterator {
 	uint32_t node;
 	if( PP::dim() == 2 ) {
 	    node = _pidata._geom->mesh( i, j );
-	    if( (node & SMESH_NODE_ID_MASK) == SMESH_NODE_ID_DIRICHLET &&
-		(node & SMESH_BOUNDARY_NUMBER_MASK) >= 7 )
+	    if( SMESH_NODE_IS_SOLID_MATERIAL(node) )
 		return( node & SMESH_BOUNDARY_NUMBER_MASK );
 	    node = _pidata._geom->mesh( i+1, j );
-	    if( (node & SMESH_NODE_ID_MASK) == SMESH_NODE_ID_DIRICHLET &&
-		(node & SMESH_BOUNDARY_NUMBER_MASK) >= 7 )
+	    if( SMESH_NODE_IS_SOLID_MATERIAL(node) )
 		return( node & SMESH_BOUNDARY_NUMBER_MASK );
 	    node = _pidata._geom->mesh( i, j+1 );
-	    if( (node & SMESH_NODE_ID_MASK) == SMESH_NODE_ID_DIRICHLET &&
-		(node & SMESH_BOUNDARY_NUMBER_MASK) >= 7 )
+	    if( SMESH_NODE_IS_SOLID_MATERIAL(node) )
 		return( node & SMESH_BOUNDARY_NUMBER_MASK );
 	    node = _pidata._geom->mesh( i+1, j+1 );
-	    if( (node & SMESH_NODE_ID_MASK) == SMESH_NODE_ID_DIRICHLET &&
-		(node & SMESH_BOUNDARY_NUMBER_MASK) >= 7 )
+	    if( SMESH_NODE_IS_SOLID_MATERIAL(node) )
 		return( node & SMESH_BOUNDARY_NUMBER_MASK );
 	} else {
 	    node = _pidata._geom->mesh( i, j, k );
-	    if( (node & SMESH_NODE_ID_MASK) == SMESH_NODE_ID_DIRICHLET &&
-		(node & SMESH_BOUNDARY_NUMBER_MASK) >= 7 )
+	    if( SMESH_NODE_IS_SOLID_MATERIAL(node) )
 		return( node & SMESH_BOUNDARY_NUMBER_MASK );
 	    node = _pidata._geom->mesh( i+1, j, k );
-	    if( (node & SMESH_NODE_ID_MASK) == SMESH_NODE_ID_DIRICHLET &&
-		(node & SMESH_BOUNDARY_NUMBER_MASK) >= 7 )
+	    if( SMESH_NODE_IS_SOLID_MATERIAL(node) )
 		return( node & SMESH_BOUNDARY_NUMBER_MASK );
 	    node = _pidata._geom->mesh( i, j+1, k );
-	    if( (node & SMESH_NODE_ID_MASK) == SMESH_NODE_ID_DIRICHLET &&
-		(node & SMESH_BOUNDARY_NUMBER_MASK) >= 7 )
+	    if( SMESH_NODE_IS_SOLID_MATERIAL(node) )
 		return( node & SMESH_BOUNDARY_NUMBER_MASK );
 	    node = _pidata._geom->mesh( i+1, j+1, k );
-	    if( (node & SMESH_NODE_ID_MASK) == SMESH_NODE_ID_DIRICHLET &&
-		(node & SMESH_BOUNDARY_NUMBER_MASK) >= 7 )
+	    if( SMESH_NODE_IS_SOLID_MATERIAL(node) )
 		return( node & SMESH_BOUNDARY_NUMBER_MASK );
 	    node = _pidata._geom->mesh( i, j, k+1 );
-	    if( (node & SMESH_NODE_ID_MASK) == SMESH_NODE_ID_DIRICHLET &&
-		(node & SMESH_BOUNDARY_NUMBER_MASK) >= 7 )
+	    if( SMESH_NODE_IS_SOLID_MATERIAL(node) )
 		return( node & SMESH_BOUNDARY_NUMBER_MASK );
 	    node = _pidata._geom->mesh( i+1, j, k+1 );
-	    if( (node & SMESH_NODE_ID_MASK) == SMESH_NODE_ID_DIRICHLET &&
-		(node & SMESH_BOUNDARY_NUMBER_MASK) >= 7 )
+	    if( SMESH_NODE_IS_SOLID_MATERIAL(node) )
 		return( node & SMESH_BOUNDARY_NUMBER_MASK );
 	    node = _pidata._geom->mesh( i, j+1, k+1 );
-	    if( (node & SMESH_NODE_ID_MASK) == SMESH_NODE_ID_DIRICHLET &&
-		(node & SMESH_BOUNDARY_NUMBER_MASK) >= 7 )
+	    if( SMESH_NODE_IS_SOLID_MATERIAL(node) )
 		return( node & SMESH_BOUNDARY_NUMBER_MASK );
 	    node = _pidata._geom->mesh( i+1, j+1, k+1 );
-	    if( (node & SMESH_NODE_ID_MASK) == SMESH_NODE_ID_DIRICHLET &&
-		(node & SMESH_BOUNDARY_NUMBER_MASK) >= 7 )
+	    if( SMESH_NODE_IS_SOLID_MATERIAL(node) )
 		return( node & SMESH_BOUNDARY_NUMBER_MASK );
 	}
 	return( 0 );
@@ -640,20 +628,14 @@ template <class PP> class ParticleIterator {
      */
     bool is_solid( int i, int j ) {
 	uint32_t node = _pidata._geom->mesh_check( i, j );
-	if( (node & SMESH_NODE_ID_MASK) == SMESH_NODE_ID_DIRICHLET &&
-	    (node & SMESH_BOUNDARY_NUMBER_MASK) >= 7 )
-	    return( true );
-	return( false );
+	return( SMESH_NODE_IS_SOLID_MATERIAL(node) );
     }
 
     /*! \brief Return if node (i,j,k) is a solid node
      */
     bool is_solid( int i, int j, int k ) {
 	uint32_t node = _pidata._geom->mesh_check( i, j, k );
-	if( (node & SMESH_NODE_ID_MASK) == SMESH_NODE_ID_DIRICHLET &&
-	    (node & SMESH_BOUNDARY_NUMBER_MASK) >= 7 )
-	    return( true );
-	return( false );
+	return( SMESH_NODE_IS_SOLID_MATERIAL(node) );
     }
 
     /*! \brief Handle particle mesh intersection.

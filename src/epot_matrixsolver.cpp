@@ -208,49 +208,121 @@ void EpotMatrixSolver::update_nonlinear_node( uint32_t a, uint32_t i, uint32_t j
 }
 
 
+/* See the doc comment on node_epsilon_r() in the header. */
+double EpotMatrixSolver::node_epsilon_r( uint32_t mesh_value ) const
+{
+    uint32_t node_id = mesh_value & SMESH_NODE_ID_MASK;
+    if( node_id != SMESH_NODE_ID_PURE_VACUUM && node_id != SMESH_NODE_ID_PURE_VACUUM_FIX )
+	return( 1.0 ); // near-solid/Neumann/Dirichlet/fine-boundary: never inside a dielectric here
+    uint32_t solid_number = mesh_value & SMESH_NEAR_SOLID_INDEX_MASK;
+    if( solid_number == 0 )
+	return( 1.0 ); // plain vacuum
+    return( _geom.get_boundary( solid_number ).value() );
+}
+
+
+double EpotMatrixSolver::face_epsilon( double eps_a, double eps_b )
+{
+    return( 2.0*eps_a*eps_b/(eps_a+eps_b) );
+}
+
+
+/* See the doc comment on neighbor_epsilon_r() in the header. */
+double EpotMatrixSolver::neighbor_epsilon_r( uint32_t mesh_value, double eps_self ) const
+{
+    uint32_t node_id = mesh_value & SMESH_NODE_ID_MASK;
+    if( node_id == SMESH_NODE_ID_PURE_VACUUM || node_id == SMESH_NODE_ID_PURE_VACUUM_FIX )
+	return( node_epsilon_r( mesh_value ) );
+    if( node_id == SMESH_NODE_ID_DIRICHLET )
+	return( eps_self ); // no material info available at a fixed node; assume self's own medium
+    return( 1.0 ); // near-solid/Neumann/fine-boundary: vacuum, by construction here
+}
+
+
 void EpotMatrixSolver::add_vacuum_node( uint32_t i, uint32_t j, uint32_t k, const Vec3D &x )
 {
     (void)x; // no longer used here -- see update_nonlinear_node()
     uint32_t a = _n2d(i,j,k) & N2D_INDEX_MASK;
 
+    // Relative permittivity of this node and, per direction, of its
+    // neighbour. Both are 1.0 (vacuum) unless a dielectric solid is
+    // involved (see node_epsilon_r()), in which case face_epsilon()'s
+    // harmonic mean gives the standard finite-volume flux-matching
+    // coefficient for that face. When every eps involved is 1.0 (no
+    // dielectric anywhere near this node -- the common case, and the
+    // only case before dielectric support existed) every face_epsilon()
+    // call below reduces to exactly 1.0, reproducing the original
+    // fixed 1.0/-2.0/-4.0/-6.0 stencil unchanged. This is only correct
+    // for grid-aligned dielectric surfaces: the two adjacent mesh
+    // nodes are assumed to sit exactly one full cell width h apart on
+    // either side of a flat material interface (no sub-cell/near-solid
+    // fractional-distance handling yet -- see class documentation).
+    double eps_self = node_epsilon_r( _geom.mesh(i,j,k) );
+    double cof = 0.0;
+
     switch( _geom.geom_mode() ) {
-    case MODE_1D:
-        set_link( a, _n2d(i-1,j,k), 1.0 );
-        set_link( a, _n2d(i,j,k), -2.0 );
-        set_link( a, _n2d(i+1,j,k), 1.0 );
-        break;
-    case MODE_2D:
-        set_link( a, _n2d(i,j-1,k), 1.0 );
-        set_link( a, _n2d(i-1,j,k), 1.0 );
-        set_link( a, _n2d(i,j,k), -4.0 );
-        set_link( a, _n2d(i+1,j,k), 1.0 );
-        set_link( a, _n2d(i,j+1,k), 1.0 );
-        break;
-    case MODE_CYL:
-        set_link( a, _n2d(i,j-1,k), 1.0-0.5/j );
-        set_link( a, _n2d(i-1,j,k), 1.0 );
-        set_link( a, _n2d(i,j,k), -4.0 );
-        set_link( a, _n2d(i+1,j,k), 1.0 );
-        set_link( a, _n2d(i,j+1,k), 1.0+0.5/j );
-        break;
-    case MODE_3D:
-        set_link( a, _n2d(i,j,k-1), 1.0 );
-        set_link( a, _n2d(i,j-1,k), 1.0 );
-        set_link( a, _n2d(i-1,j,k), 1.0 );
-        set_link( a, _n2d(i,j,k), -6.0 );
-        set_link( a, _n2d(i+1,j,k), 1.0 );
-        set_link( a, _n2d(i,j+1,k), 1.0 );
-        set_link( a, _n2d(i,j,k+1), 1.0 );
-        break;
+    case MODE_1D: {
+        double wm = face_epsilon( eps_self, neighbor_epsilon_r(_geom.mesh(i-1,j,k), eps_self) );
+        double wp = face_epsilon( eps_self, neighbor_epsilon_r(_geom.mesh(i+1,j,k), eps_self) );
+        set_link( a, _n2d(i-1,j,k), wm );
+        set_link( a, _n2d(i+1,j,k), wp );
+        cof = wm+wp;
+        break; }
+    case MODE_2D: {
+        double wxm = face_epsilon( eps_self, neighbor_epsilon_r(_geom.mesh(i-1,j,k), eps_self) );
+        double wxp = face_epsilon( eps_self, neighbor_epsilon_r(_geom.mesh(i+1,j,k), eps_self) );
+        double wym = face_epsilon( eps_self, neighbor_epsilon_r(_geom.mesh(i,j-1,k), eps_self) );
+        double wyp = face_epsilon( eps_self, neighbor_epsilon_r(_geom.mesh(i,j+1,k), eps_self) );
+        set_link( a, _n2d(i,j-1,k), wym );
+        set_link( a, _n2d(i-1,j,k), wxm );
+        set_link( a, _n2d(i+1,j,k), wxp );
+        set_link( a, _n2d(i,j+1,k), wyp );
+        cof = wxm+wxp+wym+wyp;
+        break; }
+    case MODE_CYL: {
+        double wxm = face_epsilon( eps_self, neighbor_epsilon_r(_geom.mesh(i-1,j,k), eps_self) );
+        double wxp = face_epsilon( eps_self, neighbor_epsilon_r(_geom.mesh(i+1,j,k), eps_self) );
+        double wym = (1.0-0.5/j)*face_epsilon( eps_self, neighbor_epsilon_r(_geom.mesh(i,j-1,k), eps_self) );
+        double wyp = (1.0+0.5/j)*face_epsilon( eps_self, neighbor_epsilon_r(_geom.mesh(i,j+1,k), eps_self) );
+        set_link( a, _n2d(i,j-1,k), wym );
+        set_link( a, _n2d(i-1,j,k), wxm );
+        set_link( a, _n2d(i+1,j,k), wxp );
+        set_link( a, _n2d(i,j+1,k), wyp );
+        cof = wxm+wxp+wym+wyp;
+        break; }
+    case MODE_3D: {
+        double wxm = face_epsilon( eps_self, neighbor_epsilon_r(_geom.mesh(i-1,j,k), eps_self) );
+        double wxp = face_epsilon( eps_self, neighbor_epsilon_r(_geom.mesh(i+1,j,k), eps_self) );
+        double wym = face_epsilon( eps_self, neighbor_epsilon_r(_geom.mesh(i,j-1,k), eps_self) );
+        double wyp = face_epsilon( eps_self, neighbor_epsilon_r(_geom.mesh(i,j+1,k), eps_self) );
+        double wzm = face_epsilon( eps_self, neighbor_epsilon_r(_geom.mesh(i,j,k-1), eps_self) );
+        double wzp = face_epsilon( eps_self, neighbor_epsilon_r(_geom.mesh(i,j,k+1), eps_self) );
+        set_link( a, _n2d(i,j,k-1), wzm );
+        set_link( a, _n2d(i,j-1,k), wym );
+        set_link( a, _n2d(i-1,j,k), wxm );
+        set_link( a, _n2d(i+1,j,k), wxp );
+        set_link( a, _n2d(i,j+1,k), wyp );
+        set_link( a, _n2d(i,j,k+1), wzp );
+        cof = wxm+wxp+wym+wyp+wzm+wzp;
+        break; }
     }
+
+    set_link( a, _n2d(i,j,k), -cof );
 
     // Nonlinear (plasma) contribution to rhs/diagonal is epot-dependent
     // and is added separately, once per Newton iteration, by
     // update_nonlinear_node() -- see build_mat_vec(). Everything in
-    // this function is geometry-only and gets cached after the first
-    // build.
+    // this function is geometry-only (now including permittivity,
+    // which is a fixed material property) and gets cached after the
+    // first build.
 
-    // Right hand side
+    // Right hand side. Left as-is (no epsilon_r factor) even inside a
+    // dielectric: this is the flux-conservative form of
+    // div(eps*grad(phi)) = -rho/eps0, so the permittivity belongs
+    // entirely on the coefficients above, not the rhs -- and rho
+    // (scharge) should be exactly zero inside a solid dielectric's
+    // bulk in any case, since particles are absorbed at solid surfaces
+    // rather than depositing charge past them.
     if( _plasma != PLASMA_SHIELD )
 	(*_fd_vec)(a) += -(*_scharge)(i,j,k)*_geom.h()*_geom.h()/EPSILON0;
 }

@@ -122,7 +122,21 @@ typedef field_type_e field_diag_type_e;
  */
 enum bound_e {
     BOUND_DIRICHLET = 0, /*!< \brief Dirichlet boundary condition */
-    BOUND_NEUMANN        /*!< \brief Neumann (or natural) boundary condition */
+    BOUND_NEUMANN,       /*!< \brief Neumann (or natural) boundary condition */
+    BOUND_DIELECTRIC     /*!< \brief Dielectric solid, only valid for solids
+			   *   (n >= 7), never for the six simulation box
+			   *   boundaries. Unlike BOUND_DIRICHLET, the
+			   *   solid's interior is *not* eliminated from the
+			   *   linear system -- it remains an ordinary free
+			   *   region satisfying Laplace's equation (the
+			   *   permittivity is uniform inside a single solid,
+			   *   so it cancels out of the homogeneous interior
+			   *   equation and the ordinary vacuum stencil
+			   *   applies unchanged there). Bound::value() is
+			   *   repurposed for this type to carry the solid's
+			   *   relative permittivity epsilon_r instead of a
+			   *   fixed potential; see Bound's class comment.
+			   */
 };
 
 
