@@ -258,8 +258,40 @@ double EpotMatrixSolver::vacuum_face_coefficient( int32_t i, int32_t j, int32_t 
 						   double eps_self ) const
 {
     uint32_t node_id = neighbor_mesh & SMESH_NODE_ID_MASK;
-    if( node_id == SMESH_NODE_ID_DIRICHLET )
-	return( eps_self ); // no material info at a fixed node; assume self's own medium
+    if( node_id == SMESH_NODE_ID_DIRICHLET ) {
+	uint32_t boundary_number = neighbor_mesh & SMESH_BOUNDARY_NUMBER_MASK;
+	if( boundary_number < 7 )
+	    // Simulation box edge, not a user-defined solid -- its
+	    // position is exactly the mesh's own coordinate system (no
+	    // Solid::inside() to bisect against, and no ambiguity: a
+	    // dielectric node next to it is, by construction, always
+	    // exactly one full cell away -- see
+	    // Geometry::override_dielectric_box_boundary_3d()). Assume
+	    // self's own medium extends right up to it, as before.
+	    return( eps_self );
+
+	// A real solid electrode (n>=7): unlike the box edge, this can
+	// sit at any sub-cell distance from self, e.g. an STL electrode
+	// touching an STL dielectric. Bisect against that solid's own
+	// geometry to find the true distance, rather than assuming
+	// flush contact (alpha=1, eps_self unweighted, as an earlier
+	// version of this function did). self (dielectric or vacuum) is
+	// always geometrically outside the conductor solid, so -- unlike
+	// the dielectric-vs-dielectric case below -- this never needs
+	// the reversed/complemented bisection.
+	//
+	// Physically: beyond the conductor surface is a known constant
+	// (its fixed voltage), not another variable material, so the
+	// flux from self to it is a single resistor of length
+	// alpha*h through self's own medium: eps_self/alpha. This
+	// reduces to the old eps_self exactly at alpha=1 (conductor a
+	// full cell away), and grows without bound as alpha->0 (the
+	// conductor sitting arbitrarily close), consistent with how the
+	// existing near-solid conductor formulas also blow up in that
+	// limit.
+	double alpha = _geom.solid_face_frac( i, j, k, boundary_number, sign, coord );
+	return( eps_self / alpha );
+    }
 
     // The neighbour's material_number() alone is not enough here: a
     // Neumann (or near-solid/fine-boundary) neighbour's own tag may
@@ -463,7 +495,10 @@ void EpotMatrixSolver::add_near_solid_node_2d( uint32_t i, uint32_t j, const Vec
 	ptr++;
     }
 
-    // Factors for X axis
+    // Factors for X axis. See add_near_solid_node_3d() for the
+    // rationale of the sflag-gated third branch and its known
+    // limitation (conductor and dielectric on opposite sides of the
+    // same axis, not accounted for here).
     if( bindex & EPOT_SOLVER_BXMIN ) {
 	cof += 2.0/(beta*beta);
 	set_link( a, _n2d(i+1,j), 2.0/(beta*beta) );
@@ -472,10 +507,16 @@ void EpotMatrixSolver::add_near_solid_node_2d( uint32_t i, uint32_t j, const Vec
 	cof += 2.0/(alpha*alpha);
 	set_link( a, _n2d(i-1,j), 2.0/(alpha*alpha) );
 	(*_fd_vec)(a) += 2.0*_geom.h()*_geom.get_boundary(2).value(x) / alpha;
-    } else {
+    } else if( sflag & 0x03 ) {
 	cof += 2.0/(alpha*beta);
 	set_link( a, _n2d(i-1,j), 2.0/((alpha+beta)*alpha) );
 	set_link( a, _n2d(i+1,j), 2.0/((alpha+beta)*beta) );
+    } else {
+	double wm = vacuum_face_coefficient( i,j,0, i-1,j,0, -1,0, _geom.mesh(i-1,j), 0, 1.0 );
+	double wp = vacuum_face_coefficient( i,j,0, i+1,j,0, +1,0, _geom.mesh(i+1,j), 0, 1.0 );
+	set_link( a, _n2d(i-1,j), wm );
+	set_link( a, _n2d(i+1,j), wp );
+	cof += wm+wp;
     }
 
     // Ymin direction
@@ -501,10 +542,16 @@ void EpotMatrixSolver::add_near_solid_node_2d( uint32_t i, uint32_t j, const Vec
 	cof += 2.0/(alpha*alpha);
 	set_link( a, _n2d(i,j-1), 2.0/(alpha*alpha) );
 	(*_fd_vec)(a) += 2.0*_geom.h()*_geom.get_boundary(4).value(x) / alpha;
-    } else {
+    } else if( sflag & 0x0c ) {
 	cof += 2.0/(alpha*beta);
 	set_link( a, _n2d(i,j-1), 2.0/((alpha+beta)*alpha) );
 	set_link( a, _n2d(i,j+1), 2.0/((alpha+beta)*beta) );
+    } else {
+	double wm = vacuum_face_coefficient( i,j,0, i,j-1,0, -1,1, _geom.mesh(i,j-1), 0, 1.0 );
+	double wp = vacuum_face_coefficient( i,j,0, i,j+1,0, +1,1, _geom.mesh(i,j+1), 0, 1.0 );
+	set_link( a, _n2d(i,j-1), wm );
+	set_link( a, _n2d(i,j+1), wp );
+	cof += wm+wp;
     }
 
     // Middle node
@@ -537,7 +584,9 @@ void EpotMatrixSolver::add_near_solid_node_cyl( uint32_t i, uint32_t j, const Ve
 	ptr++;
     }
 
-    // Factors for X axis
+    // Factors for X axis. See add_near_solid_node_3d() for the
+    // rationale of the sflag-gated third branch and its known
+    // limitation.
     if( bindex & EPOT_SOLVER_BXMIN ) {
 	cof += 2.0/(beta*beta);
 	set_link( a, _n2d(i+1,j), 2.0/(beta*beta) );
@@ -546,10 +595,16 @@ void EpotMatrixSolver::add_near_solid_node_cyl( uint32_t i, uint32_t j, const Ve
 	cof += 2.0/(alpha*alpha);
 	set_link( a, _n2d(i-1,j), 2.0/(alpha*alpha) );
 	(*_fd_vec)(a) += 2.0*_geom.h()*_geom.get_boundary(2).value(x) / alpha;
-    } else {
+    } else if( sflag & 0x03 ) {
 	cof += 2.0/(alpha*beta);
 	set_link( a, _n2d(i-1,j), 2.0/((alpha+beta)*alpha) );
 	set_link( a, _n2d(i+1,j), 2.0/((alpha+beta)*beta) );
+    } else {
+	double wm = vacuum_face_coefficient( i,j,0, i-1,j,0, -1,0, _geom.mesh(i-1,j), 0, 1.0 );
+	double wp = vacuum_face_coefficient( i,j,0, i+1,j,0, +1,0, _geom.mesh(i+1,j), 0, 1.0 );
+	set_link( a, _n2d(i-1,j), wm );
+	set_link( a, _n2d(i+1,j), wp );
+	cof += wm+wp;
     }
 
     // Ymin direction
@@ -566,7 +621,16 @@ void EpotMatrixSolver::add_near_solid_node_cyl( uint32_t i, uint32_t j, const Ve
 	ptr++;
     }
 
-    // Factors for Y axis
+    // Factors for Y axis (radial, with cylindrical curvature terms
+    // baked directly into the on-axis "4.0"/regular 1/j-dependent
+    // coefficients below -- unlike every other axis in this file,
+    // these are NOT a simple flat Shortley-Weller form, so they are
+    // NOT extended with a dielectric-aware fallback here. KNOWN
+    // LIMITATION: a conductor-near-solid node whose radial neighbour
+    // is a dielectric (rather than plain vacuum), with neither radial
+    // side near a conductor, still silently assumes vacuum on that
+    // face. Re-deriving these formulas for a dielectric radial
+    // neighbour has not been done.
     if( bindex & EPOT_SOLVER_BYMIN ) {
 	// On-axis
 	cof += 4.0;
@@ -621,10 +685,41 @@ void EpotMatrixSolver::add_near_solid_node_3d( uint32_t i, uint32_t j, uint32_t 
 	cof += 2.0/(alpha*alpha);
 	set_link( a, _n2d(i-1,j,k), 2.0/(alpha*alpha) );
 	(*_fd_vec)(a) += 2.0*_geom.h()*_geom.get_boundary(2).value(x) / alpha;
-    } else {
+    } else if( sflag & 0x03 ) {
+	// Near a conductor on (at least) one side of this axis -- keep
+	// the existing Taylor-difference Shortley-Weller treatment,
+	// which assumes eps=1 throughout (correct: this function only
+	// ever runs for a genuinely vacuum self node, never a
+	// dielectric-interior one). KNOWN LIMITATION: if the *other*
+	// side of this same axis (the one without a near-solid
+	// fractional distance here) is actually a dielectric rather
+	// than plain vacuum -- a vacuum node simultaneously near a
+	// conductor on one axis direction and a dielectric on the
+	// opposite direction of that *same* axis, i.e. a true
+	// conductor/dielectric/vacuum triple point -- its permittivity
+	// is not accounted for here; that would need a hybrid
+	// Taylor+flux derivation this function does not yet implement.
+	// See vacuum_face_coefficient()'s doc comment for the (already
+	// handled) simpler case of a conductor and a dielectric on
+	// *different* axes of the same node.
 	cof += 2.0/(alpha*beta);
 	set_link( a, _n2d(i-1,j,k), 2.0/((alpha+beta)*alpha) );
 	set_link( a, _n2d(i+1,j,k), 2.0/((alpha+beta)*beta) );
+    } else {
+	// Neither side of this axis is near a conductor (alpha=beta=1,
+	// both defaulted, no _nearsolid data cached for either) -- this
+	// near-solid node (near a conductor on a *different* axis) can
+	// still be directly adjacent to a dielectric along *this* axis,
+	// so use the same per-face dielectric-aware treatment as
+	// add_vacuum_node()/add_neumann_node() rather than assuming
+	// plain vacuum unconditionally. self_material=0, eps_self=1.0
+	// always here (this function never runs for a dielectric-
+	// interior self node).
+	double wm = vacuum_face_coefficient( i,j,k, i-1,j,k, -1,0, _geom.mesh(i-1,j,k), 0, 1.0 );
+	double wp = vacuum_face_coefficient( i,j,k, i+1,j,k, +1,0, _geom.mesh(i+1,j,k), 0, 1.0 );
+	set_link( a, _n2d(i-1,j,k), wm );
+	set_link( a, _n2d(i+1,j,k), wp );
+	cof += wm+wp;
     }
 
     // Ymin direction
@@ -650,10 +745,19 @@ void EpotMatrixSolver::add_near_solid_node_3d( uint32_t i, uint32_t j, uint32_t 
 	cof += 2.0/(alpha*alpha);
 	set_link( a, _n2d(i,j-1,k), 2.0/(alpha*alpha) );
 	(*_fd_vec)(a) += 2.0*_geom.h()*_geom.get_boundary(4).value(x) / alpha;
-    } else {
+    } else if( sflag & 0x0c ) {
+	// See the X-axis branch above for the rationale and the known
+	// limitation (conductor and dielectric on opposite sides of the
+	// *same* axis).
 	cof += 2.0/(alpha*beta);
 	set_link( a, _n2d(i,j-1,k), 2.0/((alpha+beta)*alpha) );
 	set_link( a, _n2d(i,j+1,k), 2.0/((alpha+beta)*beta) );
+    } else {
+	double wm = vacuum_face_coefficient( i,j,k, i,j-1,k, -1,1, _geom.mesh(i,j-1,k), 0, 1.0 );
+	double wp = vacuum_face_coefficient( i,j,k, i,j+1,k, +1,1, _geom.mesh(i,j+1,k), 0, 1.0 );
+	set_link( a, _n2d(i,j-1,k), wm );
+	set_link( a, _n2d(i,j+1,k), wp );
+	cof += wm+wp;
     }
 
     // Zmin direction
@@ -679,10 +783,17 @@ void EpotMatrixSolver::add_near_solid_node_3d( uint32_t i, uint32_t j, uint32_t 
 	cof += 2.0/(alpha*alpha);
 	set_link( a, _n2d(i,j,k-1), 2.0/(alpha*alpha) );
 	(*_fd_vec)(a) += 2.0*_geom.h()*_geom.get_boundary(6).value(x) / alpha;
-    } else {
+    } else if( sflag & 0x30 ) {
+	// See the X-axis branch above.
 	cof += 2.0/(alpha*beta);
 	set_link( a, _n2d(i,j,k-1), 2.0/((alpha+beta)*alpha) );
 	set_link( a, _n2d(i,j,k+1), 2.0/((alpha+beta)*beta) );
+    } else {
+	double wm = vacuum_face_coefficient( i,j,k, i,j,k-1, -1,2, _geom.mesh(i,j,k-1), 0, 1.0 );
+	double wp = vacuum_face_coefficient( i,j,k, i,j,k+1, +1,2, _geom.mesh(i,j,k+1), 0, 1.0 );
+	set_link( a, _n2d(i,j,k-1), wm );
+	set_link( a, _n2d(i,j,k+1), wp );
+	cof += wm+wp;
     }
 
     // Middle node

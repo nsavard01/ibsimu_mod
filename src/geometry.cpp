@@ -1174,20 +1174,30 @@ void Geometry::build_mesh_parallel_prepare_1d( void )
  * the box's actual Dirichlet/Neumann condition, which is both
  * physically wrong right at that surface and a mesh-edge read past
  * the domain in add_vacuum_node().
+ *
+ * This now runs *before* build_mesh_parallel_prepare_3d(), and its job
+ * is reduced to resetting a qualifying node back to "unclaimed"
+ * (mesh(i,j,k) = 0) rather than directly deciding its final box-edge
+ * tag. An earlier version of this function ran *after* prepare_3d() and
+ * assigned the Dirichlet/Neumann tag itself, duplicating prepare_3d()'s
+ * own decision tree -- which silently broke the one case that tree is
+ * actually needed for: if a *real conductor* solid happens to be
+ * immediately adjacent to this same box-edge node (e.g. two STL solids
+ * meeting right at the simulation box boundary), prepare_3d()'s
+ * is_near_solid() check must run for it, exactly like it would for an
+ * ordinary vacuum node there, so it gets tagged NEAR_SOLID (with a
+ * proper cached entry) instead of a plain box-edge tag. The direct-assign
+ * version bypassed is_near_solid() entirely, leaving such a node neither
+ * NEAR_SOLID-tagged nor dielectric-tagged -- solid_dist() would then
+ * throw "not a near solid node" the first time surface triangulation
+ * crossed that edge (seen on a real 5-solid STL geometry where a
+ * dielectric and a conductor solid both reached the same box edge cell).
+ * Resetting to 0 and letting prepare_3d()'s already-correct, already
+ * order-matched decision tree run instead fixes this for free, with no
+ * duplicated logic.
  */
 void Geometry::override_dielectric_box_boundary_3d( void )
 {
-    // Deliberately mirrors build_mesh_parallel_prepare_3d()'s own
-    // box-edge decision tree exactly (all six Dirichlet-type checks
-    // first, in axis order, then all six Neumann-type checks, same
-    // order) -- not just "whichever face is handled last in some loop
-    // wins" -- so a dielectric-claimed boundary/edge/corner cell
-    // resolves to *exactly* the same classification a non-dielectric
-    // vacuum cell in that position would have gotten. An earlier
-    // version of this function got this wrong (checked one face's
-    // Dirichlet-or-Neumann in isolation, in a per-face loop), which
-    // would have misclassified shared edge/corner cells relative to
-    // the ordinary vacuum case.
     for( int32_t k = 0; k < _size[2]; k++ ) {
 	for( int32_t j = 0; j < _size[1]; j++ ) {
 	    for( int32_t i = 0; i < _size[0]; i++ ) {
@@ -1197,30 +1207,10 @@ void Geometry::override_dielectric_box_boundary_3d( void )
 		    (node & SMESH_NEAR_SOLID_INDEX_MASK) == 0 )
 		    continue; // not a dielectric node here -- nothing to fix
 
-		if( i == 0 && get_boundary(1).type() == BOUND_DIRICHLET )
-		    mesh(i,j,k) = SMESH_NODE_ID_DIRICHLET | 1;
-		else if( i == _size[0]-1 && get_boundary(2).type() == BOUND_DIRICHLET )
-		    mesh(i,j,k) = SMESH_NODE_ID_DIRICHLET | 2;
-		else if( j == 0 && get_boundary(3).type() == BOUND_DIRICHLET )
-		    mesh(i,j,k) = SMESH_NODE_ID_DIRICHLET | 3;
-		else if( j == _size[1]-1 && get_boundary(4).type() == BOUND_DIRICHLET )
-		    mesh(i,j,k) = SMESH_NODE_ID_DIRICHLET | 4;
-		else if( k == 0 && get_boundary(5).type() == BOUND_DIRICHLET )
-		    mesh(i,j,k) = SMESH_NODE_ID_DIRICHLET | 5;
-		else if( k == _size[2]-1 && get_boundary(6).type() == BOUND_DIRICHLET )
-		    mesh(i,j,k) = SMESH_NODE_ID_DIRICHLET | 6;
-		else if( i == 0 )
-		    mesh(i,j,k) = SMESH_NODE_ID_NEUMANN | 1;
-		else if( i == _size[0]-1 )
-		    mesh(i,j,k) = SMESH_NODE_ID_NEUMANN | 2;
-		else if( j == 0 )
-		    mesh(i,j,k) = SMESH_NODE_ID_NEUMANN | 3;
-		else if( j == _size[1]-1 )
-		    mesh(i,j,k) = SMESH_NODE_ID_NEUMANN | 4;
-		else if( k == 0 )
-		    mesh(i,j,k) = SMESH_NODE_ID_NEUMANN | 5;
-		else if( k == _size[2]-1 )
-		    mesh(i,j,k) = SMESH_NODE_ID_NEUMANN | 6;
+		if( i == 0 || i == _size[0]-1 ||
+		    j == 0 || j == _size[1]-1 ||
+		    k == 0 || k == _size[2]-1 )
+		    mesh(i,j,k) = 0; // let prepare_3d() reclassify it from scratch
 		// else: not on any box edge -- genuinely interior
 		// dielectric node, left untouched.
 	    }
@@ -1229,9 +1219,9 @@ void Geometry::override_dielectric_box_boundary_3d( void )
 }
 
 
-/* See override_dielectric_box_boundary_3d() -- same rationale, and same
- * "mirror build_mesh_parallel_prepare_2d()'s decision tree exactly"
- * requirement, 2d/CYL.
+/* See override_dielectric_box_boundary_3d() -- same rationale and same
+ * "reset to 0, let prepare_2d() reclassify (is_near_solid() first)"
+ * fix, 2d/CYL.
  */
 void Geometry::override_dielectric_box_boundary_2d( void )
 {
@@ -1243,47 +1233,28 @@ void Geometry::override_dielectric_box_boundary_2d( void )
 		(node & SMESH_NEAR_SOLID_INDEX_MASK) == 0 )
 		continue;
 
-	    if( i == 0 && get_boundary(1).type() == BOUND_DIRICHLET )
-		mesh(i,j) = SMESH_NODE_ID_DIRICHLET | 1;
-	    else if( i == _size[0]-1 && get_boundary(2).type() == BOUND_DIRICHLET )
-		mesh(i,j) = SMESH_NODE_ID_DIRICHLET | 2;
-	    else if( j == 0 && get_boundary(3).type() == BOUND_DIRICHLET )
-		mesh(i,j) = SMESH_NODE_ID_DIRICHLET | 3;
-	    else if( j == _size[1]-1 && get_boundary(4).type() == BOUND_DIRICHLET )
-		mesh(i,j) = SMESH_NODE_ID_DIRICHLET | 4;
-	    else if( i == 0 )
-		mesh(i,j) = SMESH_NODE_ID_NEUMANN | 1;
-	    else if( i == _size[0]-1 )
-		mesh(i,j) = SMESH_NODE_ID_NEUMANN | 2;
-	    else if( j == 0 )
-		mesh(i,j) = SMESH_NODE_ID_NEUMANN | 3;
-	    else if( j == _size[1]-1 )
-		mesh(i,j) = SMESH_NODE_ID_NEUMANN | 4;
+	    if( i == 0 || i == _size[0]-1 || j == 0 || j == _size[1]-1 )
+		mesh(i,j) = 0; // let prepare_2d() reclassify it from scratch
 	}
     }
 }
 
 
-/* See override_dielectric_box_boundary_3d() -- same rationale, 1d. */
+/* See override_dielectric_box_boundary_3d() -- same rationale and same
+ * "reset to 0, let prepare_1d() reclassify (is_near_solid() first)"
+ * fix, 1d.
+ */
 void Geometry::override_dielectric_box_boundary_1d( void )
 {
     uint32_t node = mesh(0);
     if( (node & SMESH_NODE_ID_MASK) == SMESH_NODE_ID_PURE_VACUUM &&
-	(node & SMESH_NEAR_SOLID_INDEX_MASK) != 0 ) {
-	if( get_boundary(1).type() == BOUND_DIRICHLET )
-	    mesh(0) = SMESH_NODE_ID_DIRICHLET | 1;
-	else
-	    mesh(0) = SMESH_NODE_ID_NEUMANN | 1;
-    }
+	(node & SMESH_NEAR_SOLID_INDEX_MASK) != 0 )
+	mesh(0) = 0;
 
     node = mesh(_size[0]-1);
     if( (node & SMESH_NODE_ID_MASK) == SMESH_NODE_ID_PURE_VACUUM &&
-	(node & SMESH_NEAR_SOLID_INDEX_MASK) != 0 ) {
-	if( get_boundary(2).type() == BOUND_DIRICHLET )
-	    mesh(_size[0]-1) = SMESH_NODE_ID_DIRICHLET | 2;
-	else
-	    mesh(_size[0]-1) = SMESH_NODE_ID_NEUMANN | 2;
-    }
+	(node & SMESH_NEAR_SOLID_INDEX_MASK) != 0 )
+	mesh(_size[0]-1) = 0;
 }
 
 
@@ -1428,12 +1399,16 @@ void Geometry::build_mesh_parallel_thread_3d( void )
 	}
     }
 
+    // Fix up any dielectric solid that reaches the box edge -- see the
+    // doc comment on override_dielectric_box_boundary_3d(). Must run
+    // *before* build_mesh_parallel_prepare_3d(): it only resets such a
+    // node back to "unclaimed", and relies on prepare_3d()'s own
+    // decision tree (is_near_solid() checked first, then box edges,
+    // then vacuum) to reclassify it exactly like an ordinary free node.
+    override_dielectric_box_boundary_3d();
+
     // Serial part: mark box boundaries/vacuum and prepare near solid data
     build_mesh_parallel_prepare_3d();
-
-    // Fix up any dielectric solid that reaches the box edge -- see the
-    // doc comment on override_dielectric_box_boundary_3d().
-    override_dielectric_box_boundary_3d();
 
     // Parallel: Build near solid data
 #pragma omp parallel for num_threads(nthreads) collapse(3) schedule(dynamic,64)
@@ -1493,13 +1468,15 @@ void Geometry::build_mesh_parallel_thread_2d( void )
 	}
     }
 
-    // Serial part: mark box boundaries/vacuum and prepare near solid data
-    build_mesh_parallel_prepare_2d();
-
     // Fix up any dielectric solid that reaches the box edge -- see the
     // doc comment on override_dielectric_box_boundary_3d() (same
-    // rationale, 2d/CYL).
+    // rationale, 2d/CYL). Must run *before* build_mesh_parallel_prepare_2d()
+    // -- see the comment at the equivalent call in
+    // build_mesh_parallel_thread_3d().
     override_dielectric_box_boundary_2d();
+
+    // Serial part: mark box boundaries/vacuum and prepare near solid data
+    build_mesh_parallel_prepare_2d();
 
     // Parallel: Build near solid data
 #pragma omp parallel for num_threads(nthreads) collapse(2) schedule(dynamic,64)
@@ -1535,13 +1512,15 @@ void Geometry::build_mesh_parallel_thread_1d( void )
 	}
     }
 
-    // Mark rest of mesh nodes and prepare for building near solid data
-    build_mesh_parallel_prepare_1d();
-
     // Fix up any dielectric solid that reaches the box edge -- see the
     // doc comment on override_dielectric_box_boundary_3d() (same
-    // rationale, 1d).
+    // rationale, 1d). Must run *before* build_mesh_parallel_prepare_1d()
+    // -- see the comment at the equivalent call in
+    // build_mesh_parallel_thread_3d().
     override_dielectric_box_boundary_1d();
+
+    // Mark rest of mesh nodes and prepare for building near solid data
+    build_mesh_parallel_prepare_1d();
 
     // Build near solid data
     for( int32_t i = 0; i < _size[0]; i++ ) {
@@ -2715,28 +2694,106 @@ int32_t Geometry::surface_trianglec( int32_t i, int32_t j, int32_t k ) const
 }
 
 
+namespace {
+    /* Solid number a raw smesh value belongs to if it is dielectric
+     * interior (SMESH_NODE_ID_PURE_VACUUM[_FIX] with a nonzero solid
+     * number in its lower bits -- see
+     * Geometry::build_mesh_parallel_thread_3d()), else 0. Local
+     * counterpart of EpotMatrixSolver::material_number() -- duplicated
+     * rather than shared since the two classes don't otherwise depend
+     * on each other, but must stay in sync with the same mesh tagging
+     * convention.
+     */
+    uint32_t dielectric_material_number( uint32_t mesh_value )
+    {
+	uint32_t node_id = mesh_value & SMESH_NODE_ID_MASK;
+	if( node_id != SMESH_NODE_ID_PURE_VACUUM && node_id != SMESH_NODE_ID_PURE_VACUUM_FIX )
+	    return( 0 );
+	return( mesh_value & SMESH_NEAR_SOLID_INDEX_MASK );
+    }
+}
+
+
 uint8_t Geometry::solid_dist( uint32_t i, uint32_t j, uint32_t k, uint32_t dir ) const
 {
     uint32_t snode = _smesh[i + j*_size[0] + k*_size[0]*_size[1]];
-    if( (snode & SMESH_NODE_ID_MASK) != SMESH_NODE_ID_NEAR_SOLID )
-	throw( Error( ERROR_LOCATION, "not a near solid node" ) );
 
-    const uint8_t *nptr = &_nearsolid[snode & SMESH_NEAR_SOLID_INDEX_MASK];
-    uint8_t neighbours = nptr[0];
-    nptr++;
-    uint32_t a = 0;
-    while( a < dir ) {
-	if( neighbours & 0x01 )
-	    nptr++;
-	neighbours = neighbours >> 1;
-	a++;
+    if( (snode & SMESH_NODE_ID_MASK) == SMESH_NODE_ID_NEAR_SOLID ) {
+	const uint8_t *nptr = &_nearsolid[snode & SMESH_NEAR_SOLID_INDEX_MASK];
+	uint8_t neighbours = nptr[0];
+	nptr++;
+	uint32_t a = 0;
+	while( a < dir ) {
+	    if( neighbours & 0x01 )
+		nptr++;
+	    neighbours = neighbours >> 1;
+	    a++;
+	}
+	if( (neighbours & 0x01) != 0x00 )
+	    return( *nptr );
+
+	// Cached near-solid data exists for this node (it has a real
+	// conductor neighbour in some *other* direction -- that's why
+	// it's tagged NEAR_SOLID at all), but not for this particular
+	// direction. add_near_solid_entry()/build_mesh_parallel_prepare_
+	// near_solid() cache *every* direction that has a conductor
+	// neighbour (is_solid()), so a missing bit here means whatever
+	// mc_case() saw as "solid material" this way cannot be a
+	// conductor -- it must be a dielectric surface along a
+	// different axis than whichever conductor got this node
+	// classified NEAR_SOLID in the first place (that relationship
+	// is never cached in _nearsolid, same as for a node that isn't
+	// NEAR_SOLID-tagged at all -- see below). Fall through to the
+	// same on-demand bisection used for that case, rather than
+	// throwing.
     }
-    if( (neighbours & 0x01) == 0x00 )
-	throw( Error( ERROR_LOCATION, (const std::string)"no near neighbour in selected direction"
-		      ", dir = " + to_string(dir) 
-		      + ", neighbours = " + to_string((int)_nearsolid[snode & SMESH_NEAR_SOLID_INDEX_MASK]) ) );
 
-    return( *nptr );
+    // Not a cached near-solid *direction* (either this node isn't
+    // NEAR_SOLID-tagged at all, or it is but not for this axis -- see
+    // above). This is expected next to a dielectric surface: a
+    // dielectric solid's interior stays plain SMESH_NODE_ID_PURE_VACUUM
+    // (see build_mesh_parallel_thread_3d()), never reclassified
+    // SMESH_NODE_ID_NEAR_SOLID the way a conductor's boundary layer is,
+    // so no fractional distance is cached in _nearsolid for it -- yet
+    // surface_trianglec()/mc_case() (via SMESH_NODE_IS_SOLID_MATERIAL)
+    // now correctly triangulate a dielectric surface too, and need this
+    // distance to place the vertex. Resolve it on demand instead of
+    // from the cache, by bisecting against whichever side (this node or
+    // its neighbour in direction dir) is dielectric material -- same
+    // approach as EpotMatrixSolver::vacuum_face_coefficient() uses for
+    // the matrix coefficients, see that function's doc comment for why
+    // the bisection has to run from whichever side is geometrically
+    // outside the target solid.
+    int32_t ni = i, nj = j, nk = k;
+    int sign = 0, coord = 0;
+    switch( dir ) {
+    case 0: ni = (int32_t)i - 1; sign = -1; coord = 0; break;
+    case 1: ni = (int32_t)i + 1; sign = +1; coord = 0; break;
+    case 2: nj = (int32_t)j - 1; sign = -1; coord = 1; break;
+    case 3: nj = (int32_t)j + 1; sign = +1; coord = 1; break;
+    case 4: nk = (int32_t)k - 1; sign = -1; coord = 2; break;
+    case 5: nk = (int32_t)k + 1; sign = +1; coord = 2; break;
+    default: throw( Error( ERROR_LOCATION, "invalid direction" ) );
+    }
+
+    uint32_t self_mat = dielectric_material_number( snode );
+    uint32_t nb_snode = _smesh[ni + nj*_size[0] + nk*_size[0]*_size[1]];
+    uint32_t nb_mat = dielectric_material_number( nb_snode );
+
+    if( self_mat == 0 && nb_mat == 0 )
+	throw( Error( ERROR_LOCATION, "not a near solid node" ) ); // genuinely neither side is a dielectric
+
+    uint32_t bisect_solid = ( self_mat != 0 ) ? self_mat : nb_mat;
+    double alpha; // fraction in (0,1], bracket_ndist()'s 1-255 byte divided by 255
+    if( bisect_solid == self_mat )
+	alpha = 1.0 - bracket_ndist( ni, nj, nk, bisect_solid, -sign, coord )/255.0;
+    else
+	alpha = bracket_ndist( i, j, k, bisect_solid, sign, coord )/255.0;
+
+    int32_t byte = (int32_t)( alpha*255.0 + 0.5 );
+    if( byte < 1 ) byte = 1;
+    if( byte > 255 ) byte = 255;
+    return( (uint8_t)byte );
 }
 
 

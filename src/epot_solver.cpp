@@ -246,6 +246,41 @@ void EpotSolver::nsimp_newton( double &rhs, double &drhs, double epot ) const
 }
 
 
+namespace {
+    /* A dielectric solid's interior is tagged the same way as plain
+     * vacuum (SMESH_NODE_ID_PURE_VACUUM[_FIX], material number in the
+     * lower bits -- see Geometry::build_mesh_parallel_thread_3d()), so
+     * the raw tag is enough to recognise it *unless* it reaches a
+     * simulation box wall: Geometry::override_dielectric_box_boundary_3d()
+     * resets such a node and lets it be reclassified by the ordinary
+     * box-edge decision tree, which retags it SMESH_NODE_ID_NEUMANN or
+     * SMESH_NODE_ID_DIRICHLET -- discarding the material number, even
+     * though the node is still physically dielectric material. That's
+     * the right call for the matrix discretisation itself (the box's
+     * own condition, not the dielectric's bulk equation, applies right
+     * at that surface -- see the doc comment on that function), but it
+     * means the raw tag alone can no longer answer "is this dielectric"
+     * for a Neumann-tagged node. This recovers the answer geometrically
+     * when the fast path (raw tag) can't, mirroring
+     * EpotMatrixSolver::self_material_at()'s slow path -- duplicated
+     * rather than shared since this class doesn't depend on that one
+     * (which is the derived class).
+     */
+    bool is_dielectric_at( const Geometry &geom, uint32_t mesh_value, const Vec3D &x )
+    {
+	uint32_t node_id = mesh_value & SMESH_NODE_ID_MASK;
+	if( ( node_id == SMESH_NODE_ID_PURE_VACUUM || node_id == SMESH_NODE_ID_PURE_VACUUM_FIX ) &&
+	    ( mesh_value & SMESH_NEAR_SOLID_INDEX_MASK ) >= 7 )
+	    return( true ); // fast path -- tag already says dielectric-interior directly
+
+	uint32_t solid_number = geom.inside( x );
+	if( solid_number < 7 )
+	    return( false ); // plain vacuum (or, shouldn't happen, outside the box)
+	return( geom.get_boundary( solid_number ).type() == BOUND_DIELECTRIC );
+    }
+}
+
+
 void EpotSolver::preprocess( MeshScalarField &epot )
 {
     if( _plasma == PLASMA_PEXP ) {
@@ -303,27 +338,64 @@ void EpotSolver::preprocess( MeshScalarField &epot )
 
 		uint32_t mesh = _geom.mesh(i,j,k);
 		uint32_t node_id = mesh & SMESH_NODE_ID_MASK;
+
 		if( node_id == SMESH_NODE_ID_NEAR_SOLID ||
 		    node_id == SMESH_NODE_ID_PURE_VACUUM ) {
 
-		    // Vacuum
+		    // Vacuum -- but this can *also* be genuinely dielectric
+		    // material, in two different ways: directly (raw
+		    // SMESH_NODE_ID_PURE_VACUUM[_FIX] tag with a solid
+		    // number >=7 in the lower bits -- see
+		    // Geometry::build_mesh_parallel_thread_3d() -- because
+		    // it satisfies the same homogeneous Laplace stencil
+		    // shape as vacuum, just with a position-dependent
+		    // permittivity applied by add_vacuum_node()/
+		    // vacuum_face_coefficient()), or more subtly, tagged
+		    // SMESH_NODE_ID_NEAR_SOLID instead: a dielectric that
+		    // reaches a simulation box edge gets reset and
+		    // reclassified by the ordinary box-edge decision tree
+		    // (Geometry::override_dielectric_box_boundary_3d()), and
+		    // if a *real conductor* also happens to be adjacent to
+		    // that same node along a different axis, that tree
+		    // tags it NEAR_SOLID -- discarding the material number,
+		    // so it looks exactly like an ordinary near-conductor
+		    // vacuum node by raw tag alone. Either way it is
+		    // emphatically not a region a plasma or a forced
+		    // potential can occupy: unlike real vacuum, it is a
+		    // fixed physical medium and must always stay a
+		    // genuinely free node. is_dielectric_at() (see its doc
+		    // comment above) catches both cases -- fast raw-tag
+		    // path for the first, geometric fallback for the
+		    // second -- and is deliberately checked *after* the
+		    // cheaper force_pot_func/force_pot_func2/init_plasma_func
+		    // predicates below, so the (potentially expensive,
+		    // STL-backed) geometry query only runs on nodes where
+		    // forcing would otherwise actually apply. Missing the
+		    // NEAR_SOLID case here is exactly what let a dielectric
+		    // squeezed between a box wall and a grounded electrode
+		    // stay pinned to the plasma potential right at that
+		    // corner, even after the box-edge Neumann case was
+		    // fixed.
 		    double val;
-		    if( _force_pot_func2 && 
-			comp_isfinite( (val = (*_force_pot_func2)( x ))) ) {
+		    if( _force_pot_func2 &&
+			comp_isfinite( (val = (*_force_pot_func2)( x ))) &&
+			!is_dielectric_at( _geom, mesh, x ) ) {
 
 			// Mark as fixed vacuum
 			_geom.mesh(i,j,k) |= SMESH_NODE_FIXED;
 			epot(i,j,k) = val;
 
-		    } else if( _force_pot_func && (*_force_pot_func)( x ) ) {
+		    } else if( _force_pot_func && (*_force_pot_func)( x ) &&
+			       !is_dielectric_at( _geom, mesh, x ) ) {
 
 			// Mark as fixed vacuum
 			_geom.mesh(i,j,k) |= SMESH_NODE_FIXED;
 			epot(i,j,k) = _force_pot;
 
 		    } else if( (_plasma == PLASMA_PEXP_INITIAL ||
-				_plasma == PLASMA_NSIMP_INITIAL) && 
-			       _init_plasma_func && (*_init_plasma_func)( x ) ) {
+				_plasma == PLASMA_NSIMP_INITIAL) &&
+			       _init_plasma_func && (*_init_plasma_func)( x ) &&
+			       !is_dielectric_at( _geom, mesh, x ) ) {
 
 			// Mark as fixed vacuum
 			_geom.mesh(i,j,k) |= SMESH_NODE_FIXED;
@@ -333,20 +405,41 @@ void EpotSolver::preprocess( MeshScalarField &epot )
 
 		} else if( node_id == SMESH_NODE_ID_NEUMANN ) {
 
+		    // A dielectric reaching this Neumann box wall had its
+		    // material number discarded when its tag was
+		    // reclassified (see the doc comment on
+		    // is_dielectric_at() above) -- it must still be
+		    // excluded from forcing, exactly like the dielectric-
+		    // interior case above, even though the raw tag alone
+		    // can't tell us that anymore. Without this check, a
+		    // dielectric slab reaching the mirror/Neumann side
+		    // walls would get pinned to the plasma's initial
+		    // potential right at that edge (while the rest of the
+		    // slab solved correctly), instead of behaving like an
+		    // ordinary permittivity-weighted mirror node the way
+		    // add_neumann_node() already treats it. is_dielectric_at()
+		    // does a real geometric query (Geometry::inside()), so
+		    // it's deliberately checked *after* the cheaper
+		    // force_pot_func/init_plasma_func predicates, not on
+		    // every Neumann node unconditionally -- only nodes where
+		    // forcing would otherwise actually apply pay for it.
 		    if( _force_pot_func && (*_force_pot_func)( x ) ) {
 
-			// Mark as fixed vacuum
-			_geom.mesh(i,j,k) = SMESH_NODE_ID_PURE_VACUUM_FIX;
-			epot(i,j,k) = _force_pot;
+			if( !is_dielectric_at( _geom, mesh, x ) ) {
+			    // Mark as fixed vacuum
+			    _geom.mesh(i,j,k) = SMESH_NODE_ID_PURE_VACUUM_FIX;
+			    epot(i,j,k) = _force_pot;
+			}
 
 		    } else if( (_plasma == PLASMA_PEXP_INITIAL ||
-				_plasma == PLASMA_NSIMP_INITIAL) && 
+				_plasma == PLASMA_NSIMP_INITIAL) &&
 			       _init_plasma_func && (*_init_plasma_func)( x ) ) {
 
-			// Mark as fixed vacuum
-			_geom.mesh(i,j,k) = SMESH_NODE_ID_PURE_VACUUM_FIX;
-			epot(i,j,k) = _Up;
-
+			if( !is_dielectric_at( _geom, mesh, x ) ) {
+			    // Mark as fixed vacuum
+			    _geom.mesh(i,j,k) = SMESH_NODE_ID_PURE_VACUUM_FIX;
+			    epot(i,j,k) = _Up;
+			}
 		    }
 
 		} else if( node_id == SMESH_NODE_ID_DIRICHLET ) {

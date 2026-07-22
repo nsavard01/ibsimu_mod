@@ -297,17 +297,33 @@ private:
      *
      *  Three cases:
      *
-     *  - Neighbour is Dirichlet (a fixed-voltage conductor, or a
-     *    simulation box edge): there is no material information at a
-     *    fixed node -- its lower bits identify *which* conductor/edge,
-     *    not a permittivity -- so \a eps_self is used, i.e. the medium
-     *    \a self sits in is assumed to extend right up to the
-     *    fixed-voltage surface. This is what makes a dielectric flush
-     *    against a conductor (a ceramic sitting on a biased electrode)
-     *    work correctly. No sub-cell fractional-distance correction is
-     *    applied in this case yet for an arbitrarily-positioned
-     *    conductor next to a dielectric -- a known, documented scope
-     *    limitation (see add_vacuum_node()'s class-level doc comment).
+     *  - Neighbour is Dirichlet and is the simulation box edge itself
+     *    (boundary number 1-6, not a user-defined solid): there is no
+     *    material information at a fixed node -- its lower bits
+     *    identify *which* edge, not a permittivity -- so \a eps_self is
+     *    used. This is exact, not an approximation: a dielectric node
+     *    next to the box edge is, by construction, always exactly one
+     *    full cell away from it (see
+     *    Geometry::override_dielectric_box_boundary_3d()), so there is
+     *    no sub-cell position to resolve.
+     *
+     *  - Neighbour is Dirichlet and is a real user-defined solid
+     *    (boundary/solid number >=7, e.g. an STL electrode): unlike the
+     *    box edge, this can sit at any sub-cell distance from \a self.
+     *    Bisected against that solid's own geometry
+     *    (Geometry::solid_face_frac()) to find the true distance alpha,
+     *    then eps_self/alpha -- a single resistor of length alpha*h
+     *    through self's own medium, since beyond the conductor surface
+     *    is a known constant (its fixed voltage), not another variable
+     *    material. Reduces to the old flush-contact assumption exactly
+     *    at alpha=1 (a full cell away). This is what makes a dielectric
+     *    touching a conductor at an arbitrary (e.g. STL-to-STL) position
+     *    work correctly, not just when the two happen to be flush.
+     *
+     *  - Neighbour's material (material_number() of \a neighbor_mesh,
+     *    treating near-solid/Neumann/fine-boundary as plain vacuum, 0)
+     *    matches \a self_material: same medium on both sides of this
+     *    face, no correction needed, coefficient is simply \a eps_self.
      *
      *  - Neighbour's material (material_number() of \a neighbor_mesh,
      *    treating near-solid/Neumann/fine-boundary as plain vacuum, 0)

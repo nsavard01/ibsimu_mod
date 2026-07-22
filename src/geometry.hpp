@@ -268,9 +268,11 @@ class Geometry : public Mesh
     void build_mesh_parallel_prepare_2d( void );
     void build_mesh_parallel_prepare_1d( void );
 
-    /*! \brief Re-apply the simulation box's own boundary condition to
-     *  any of the six (3d)/four (2d)/two (1d) boundary faces that a
-     *  dielectric solid's interior has claimed.
+    /*! \brief Reset any of the six (3d)/four (2d)/two (1d) boundary
+     *  faces that a dielectric solid's interior has claimed back to
+     *  "unclaimed", so the box's own boundary condition (or a real
+     *  conductor solid, if one happens to be adjacent right there) can
+     *  be applied to it correctly.
      *
      *  A dielectric solid's interior is tagged SMESH_NODE_ID_PURE_VACUUM
      *  (see build_mesh_parallel_thread_3d()), so if it happens to reach
@@ -282,14 +284,27 @@ class Geometry : public Mesh
      *  wrong (the box condition, not the dielectric's bulk equation,
      *  applies exactly at that surface) and a crash: add_vacuum_node()
      *  would read one mesh node past the domain edge trying to reach a
-     *  neighbour that doesn't exist. Called once, after
-     *  build_mesh_parallel_prepare_*(), this walks only the boundary
-     *  faces (cheap, O(surface area) not O(volume)) and overwrites any
-     *  face node still tagged as dielectric with the box's own
-     *  condition, in the same xmin/xmax/ymin/ymax/zmin/zmax priority
-     *  order the box-edge classification itself uses (so a shared edge/
-     *  corner cell resolves the same way it would without a dielectric
-     *  there). Interior dielectric nodes are untouched.
+     *  neighbour that doesn't exist.
+     *
+     *  Called once, *before* build_mesh_parallel_prepare_*(), this walks
+     *  only the boundary faces (cheap, O(surface area) not O(volume))
+     *  and resets any face node still tagged as dielectric back to
+     *  mesh==0, then leaves the actual reclassification to
+     *  build_mesh_parallel_prepare_*()'s own decision tree. That tree
+     *  already checks is_near_solid() before any box-edge condition, in
+     *  the correct xmin/xmax/ymin/ymax/zmin/zmax priority order, so a
+     *  reset node is reclassified exactly as an ordinary free node in
+     *  that position would be -- including the case where a *real
+     *  conductor* solid is also immediately adjacent to it, which must
+     *  become a properly cached NEAR_SOLID node, not a plain box-edge
+     *  tag. An earlier version of this function ran *after* prepare_*()
+     *  and duplicated its box-edge decision tree directly, which bypassed
+     *  is_near_solid() entirely and left such a node neither NEAR_SOLID-
+     *  tagged nor dielectric-tagged -- Geometry::solid_dist() would then
+     *  throw "not a near solid node" the first time surface
+     *  triangulation crossed that edge (hit on a real 5-solid STL
+     *  geometry where a dielectric and a conductor solid both reached
+     *  the same box-edge cell). Interior dielectric nodes are untouched.
      */
     void override_dielectric_box_boundary_3d( void );
     void override_dielectric_box_boundary_2d( void );
