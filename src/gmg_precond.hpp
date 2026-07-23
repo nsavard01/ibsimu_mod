@@ -205,12 +205,26 @@ public:
      *  referenced by exactly one entry -- prepare() checks this and
      *  throws if not.
      *
-     *  Must be called before the first construct()/prepare() call, or
-     *  again (together with clear()) if the mesh or the set of fixed
-     *  nodes changes. Not needed if the matrix assembler keeps one
-     *  row per mesh node (A.rows() == nx*ny*nz).
+     *  Safe (and expected) to call this again with an unchanged map --
+     *  e.g. a caller that doesn't itself track whether the fixed-node
+     *  set changed since the last solve, and so calls this once before
+     *  every solve just to be safe. If \a node_row is identical to
+     *  whatever was already prepared, this is a no-op: it does *not*
+     *  invalidate the hierarchy, so the next construct() takes the
+     *  cheap incremental-update path instead of a full prepare()
+     *  rebuild. Only a genuine change forces a rebuild. If the mesh or
+     *  the set of fixed nodes *does* change, call this (together with
+     *  clear(), if you want to force starting over rather than let the
+     *  next prepare() reuse scratch buffers) before the next
+     *  construct()/prepare() call. Not needed at all if the matrix
+     *  assembler keeps one row per mesh node (A.rows() == nx*ny*nz).
      */
-    void set_node_map( const std::vector<int32_t> &node_row ) { _node_map = node_row; _prepared = false; }
+    void set_node_map( const std::vector<int32_t> &node_row ) {
+	if( _prepared && node_row == _node_map )
+	    return; // unchanged since the last prepare() -- nothing to invalidate
+	_node_map = node_row;
+	_prepared = false;
+    }
 
     void set_ncycles( uint32_t ncyc ) { _ncycles = ncyc; }
     uint32_t levels( void ) const { return( (uint32_t)_level.size() ); }

@@ -45,6 +45,11 @@
 #include "constants.hpp"
 #include "ibsimu.hpp"
 #include <omp.h>
+#include <chrono>
+
+namespace {
+    using Clock = std::chrono::steady_clock;
+}
 
 
 EpotMatrixSolver::Node2DoF::Node2DoF() 
@@ -114,7 +119,8 @@ void EpotMatrixSolver::Node2DoF::debug_print( std::ostream &os ) const
 
 EpotMatrixSolver::EpotMatrixSolver( Geometry &geom )
     : EpotSolver(geom), _dof(0), _fd_mat(0), _fd_vec(0), _d_vec(0),
-      _linear_built(false), _fd_vec_base(0)
+      _linear_built(false), _fd_vec_base(0), _dielectric_mat_built(false),
+      _time_dielectric_cache(0.0), _time_linbuild(0.0), _time_nonlin(0.0)
 {
 
 }
@@ -178,8 +184,31 @@ void EpotMatrixSolver::update_nonlinear_node( uint32_t a, uint32_t i, uint32_t j
     if( _plasma != PLASMA_PEXP && _plasma != PLASMA_NSIMP && _plasma != PLASMA_SHIELD )
 	return;
 
-    bool inplasma = true;
-    if( _plasma_calc_func )
+    // A dielectric solid's interior is a fixed, chargeless medium --
+    // never actual plasma -- regardless of how close it sits to a real
+    // plasma region. This function is called for every free node
+    // (vacuum, near-solid, and dielectric interior alike, since a
+    // dielectric's own row is otherwise an ordinary free node -- see
+    // build_mesh_parallel_thread_3d()), so without this check the
+    // nonlinear electron/Boltzmann source term below gets added to a
+    // dielectric's own (correctly eps-weighted, charge-free) row too,
+    // pulling its potential toward the plasma equilibrium instead of
+    // solving the linear Laplace equation it should. This also catches
+    // a dielectric node reclassified NEAR_SOLID/NEUMANN at a box edge
+    // or next to a conductor, where the raw tag alone no longer says
+    // "dielectric" -- see self_material_at()'s doc comment.
+    //
+    // Read from the _dielectric_mat cache (populated once, ever -- see
+    // its doc comment) instead of calling self_material_at() directly
+    // here: this function runs every Newton iteration (and every
+    // step-size backtracking re-evaluation) for every free node, and
+    // self_material_at()'s fallback for anything but a directly-tagged
+    // dielectric node is a real Geometry::inside() query -- paying
+    // that on every node, every such call, is what caused the severe
+    // per-solve slowdown. _dielectric_mat is indexed by the full flat
+    // mesh index, not the dof row a.
+    bool inplasma = _dielectric_mat[(k*_geom.size(1)+j)*_geom.size(0)+i] == 0;
+    if( inplasma && _plasma_calc_func )
 	// Test if within plasma calculation region
 	inplasma = (*_plasma_calc_func)(x);
 
@@ -298,13 +327,17 @@ double EpotMatrixSolver::vacuum_face_coefficient( int32_t i, int32_t j, int32_t 
     // itself have been overridden away from a dielectric tag that
     // reached that node (see self_material_at()'s doc comment) -- e.g.
     // a Neumann side wall at a z-level that a dielectric slab varying
-    // along z actually occupies there. Recover it the same way
-    // self_material_at() does for the row itself, using the
-    // neighbour's real-world position, not just its mesh tag.
-    Vec3D nx( _geom.origo(0) + _geom.h()*ni,
-	      _geom.origo(1) + _geom.h()*nj,
-	      _geom.origo(2) + _geom.h()*nk );
-    uint32_t nb_material = self_material_at( neighbor_mesh, nx );
+    // along z actually occupies there. Recover it via the
+    // _dielectric_mat cache (populated once, ever, for the whole mesh
+    // -- see its doc comment) instead of calling self_material_at()
+    // directly: this function runs once per face of every
+    // vacuum/near-solid/Neumann node during the one-time-per-major-
+    // cycle linear build, so an on-demand Geometry::inside() fallback
+    // here (repeated for up to 6 faces per node) was the single
+    // largest remaining source of redundant per-cycle geometry
+    // queries once update_nonlinear_node()'s own copy was fixed.
+    uint32_t n_full = ((uint32_t)nk*_geom.size(1) + (uint32_t)nj)*_geom.size(0) + (uint32_t)ni;
+    uint32_t nb_material = _dielectric_mat[n_full];
     if( nb_material == self_material )
 	return( eps_self ); // same medium on both sides of this face -- no correction needed
 
@@ -453,7 +486,14 @@ void EpotMatrixSolver::add_near_solid_node_1d( uint32_t i, const Vec3D &x )
 	ptr++;
     }
 
-    // Factors for X axis
+    // Factors for X axis. See add_near_solid_node_3d() for the
+    // rationale of the conductor/dielectric same-axis triple-point
+    // handling -- unlike the 2d/cyl/3d variants, this function has no
+    // separate "neither side near a conductor" branch (impossible here:
+    // being in add_near_solid_node_1d at all means is_near_solid() was
+    // true, and X is the only axis, so sflag always has at least one
+    // bit set), so the triple-point check applies directly in the
+    // final else below.
     if( bindex & EPOT_SOLVER_BXMIN ) {
 	set_link( a, _n2d(i), -2.0/(beta*beta) );
 	set_link( a, _n2d(i+1), 2.0/(beta*beta) );
@@ -463,9 +503,24 @@ void EpotMatrixSolver::add_near_solid_node_1d( uint32_t i, const Vec3D &x )
 	set_link( a, _n2d(i-1), 2.0/(alpha*alpha) );
 	(*_fd_vec)(a) += 2.0*_geom.h()*_geom.get_boundary(2).value(x) / alpha;
     } else {
-	set_link( a, _n2d(i), -2.0/(alpha*beta) );
-	set_link( a, _n2d(i-1), 2.0/((alpha+beta)*alpha) );
-	set_link( a, _n2d(i+1), 2.0/((alpha+beta)*beta) );
+	bool xm_conductor = sflag & 0x01;
+	bool xp_conductor = sflag & 0x02;
+	bool xm_dielectric = !xm_conductor && dielectric_material_at(i-1,0,0) != 0;
+	bool xp_dielectric = !xp_conductor && dielectric_material_at(i+1,0,0) != 0;
+
+	if( xm_dielectric || xp_dielectric ) {
+	    double wm = xm_conductor ? 1.0/alpha :
+		vacuum_face_coefficient( i,0,0, i-1,0,0, -1,0, _geom.mesh(i-1), 0, 1.0 );
+	    double wp = xp_conductor ? 1.0/beta :
+		vacuum_face_coefficient( i,0,0, i+1,0,0, +1,0, _geom.mesh(i+1), 0, 1.0 );
+	    set_link( a, _n2d(i), -(wm+wp) );
+	    set_link( a, _n2d(i-1), wm );
+	    set_link( a, _n2d(i+1), wp );
+	} else {
+	    set_link( a, _n2d(i), -2.0/(alpha*beta) );
+	    set_link( a, _n2d(i-1), 2.0/((alpha+beta)*alpha) );
+	    set_link( a, _n2d(i+1), 2.0/((alpha+beta)*beta) );
+	}
     }
 }
 
@@ -496,9 +551,8 @@ void EpotMatrixSolver::add_near_solid_node_2d( uint32_t i, uint32_t j, const Vec
     }
 
     // Factors for X axis. See add_near_solid_node_3d() for the
-    // rationale of the sflag-gated third branch and its known
-    // limitation (conductor and dielectric on opposite sides of the
-    // same axis, not accounted for here).
+    // rationale of the sflag-gated third branch, including the
+    // conductor/dielectric same-axis triple-point handling.
     if( bindex & EPOT_SOLVER_BXMIN ) {
 	cof += 2.0/(beta*beta);
 	set_link( a, _n2d(i+1,j), 2.0/(beta*beta) );
@@ -508,9 +562,24 @@ void EpotMatrixSolver::add_near_solid_node_2d( uint32_t i, uint32_t j, const Vec
 	set_link( a, _n2d(i-1,j), 2.0/(alpha*alpha) );
 	(*_fd_vec)(a) += 2.0*_geom.h()*_geom.get_boundary(2).value(x) / alpha;
     } else if( sflag & 0x03 ) {
-	cof += 2.0/(alpha*beta);
-	set_link( a, _n2d(i-1,j), 2.0/((alpha+beta)*alpha) );
-	set_link( a, _n2d(i+1,j), 2.0/((alpha+beta)*beta) );
+	bool xm_conductor = sflag & 0x01;
+	bool xp_conductor = sflag & 0x02;
+	bool xm_dielectric = !xm_conductor && dielectric_material_at(i-1,j,0) != 0;
+	bool xp_dielectric = !xp_conductor && dielectric_material_at(i+1,j,0) != 0;
+
+	if( xm_dielectric || xp_dielectric ) {
+	    double wm = xm_conductor ? 1.0/alpha :
+		vacuum_face_coefficient( i,j,0, i-1,j,0, -1,0, _geom.mesh(i-1,j), 0, 1.0 );
+	    double wp = xp_conductor ? 1.0/beta :
+		vacuum_face_coefficient( i,j,0, i+1,j,0, +1,0, _geom.mesh(i+1,j), 0, 1.0 );
+	    set_link( a, _n2d(i-1,j), wm );
+	    set_link( a, _n2d(i+1,j), wp );
+	    cof += wm+wp;
+	} else {
+	    cof += 2.0/(alpha*beta);
+	    set_link( a, _n2d(i-1,j), 2.0/((alpha+beta)*alpha) );
+	    set_link( a, _n2d(i+1,j), 2.0/((alpha+beta)*beta) );
+	}
     } else {
 	double wm = vacuum_face_coefficient( i,j,0, i-1,j,0, -1,0, _geom.mesh(i-1,j), 0, 1.0 );
 	double wp = vacuum_face_coefficient( i,j,0, i+1,j,0, +1,0, _geom.mesh(i+1,j), 0, 1.0 );
@@ -543,9 +612,24 @@ void EpotMatrixSolver::add_near_solid_node_2d( uint32_t i, uint32_t j, const Vec
 	set_link( a, _n2d(i,j-1), 2.0/(alpha*alpha) );
 	(*_fd_vec)(a) += 2.0*_geom.h()*_geom.get_boundary(4).value(x) / alpha;
     } else if( sflag & 0x0c ) {
-	cof += 2.0/(alpha*beta);
-	set_link( a, _n2d(i,j-1), 2.0/((alpha+beta)*alpha) );
-	set_link( a, _n2d(i,j+1), 2.0/((alpha+beta)*beta) );
+	bool ym_conductor = sflag & 0x04;
+	bool yp_conductor = sflag & 0x08;
+	bool ym_dielectric = !ym_conductor && dielectric_material_at(i,j-1,0) != 0;
+	bool yp_dielectric = !yp_conductor && dielectric_material_at(i,j+1,0) != 0;
+
+	if( ym_dielectric || yp_dielectric ) {
+	    double wm = ym_conductor ? 1.0/alpha :
+		vacuum_face_coefficient( i,j,0, i,j-1,0, -1,1, _geom.mesh(i,j-1), 0, 1.0 );
+	    double wp = yp_conductor ? 1.0/beta :
+		vacuum_face_coefficient( i,j,0, i,j+1,0, +1,1, _geom.mesh(i,j+1), 0, 1.0 );
+	    set_link( a, _n2d(i,j-1), wm );
+	    set_link( a, _n2d(i,j+1), wp );
+	    cof += wm+wp;
+	} else {
+	    cof += 2.0/(alpha*beta);
+	    set_link( a, _n2d(i,j-1), 2.0/((alpha+beta)*alpha) );
+	    set_link( a, _n2d(i,j+1), 2.0/((alpha+beta)*beta) );
+	}
     } else {
 	double wm = vacuum_face_coefficient( i,j,0, i,j-1,0, -1,1, _geom.mesh(i,j-1), 0, 1.0 );
 	double wp = vacuum_face_coefficient( i,j,0, i,j+1,0, +1,1, _geom.mesh(i,j+1), 0, 1.0 );
@@ -584,9 +668,11 @@ void EpotMatrixSolver::add_near_solid_node_cyl( uint32_t i, uint32_t j, const Ve
 	ptr++;
     }
 
-    // Factors for X axis. See add_near_solid_node_3d() for the
-    // rationale of the sflag-gated third branch and its known
-    // limitation.
+    // Factors for X axis (axial). See add_near_solid_node_3d() for the
+    // rationale of the sflag-gated third branch, including the
+    // conductor/dielectric same-axis triple-point handling. (Y, the
+    // radial axis below, is a separate, still-unresolved limitation --
+    // see its own comment.)
     if( bindex & EPOT_SOLVER_BXMIN ) {
 	cof += 2.0/(beta*beta);
 	set_link( a, _n2d(i+1,j), 2.0/(beta*beta) );
@@ -596,9 +682,24 @@ void EpotMatrixSolver::add_near_solid_node_cyl( uint32_t i, uint32_t j, const Ve
 	set_link( a, _n2d(i-1,j), 2.0/(alpha*alpha) );
 	(*_fd_vec)(a) += 2.0*_geom.h()*_geom.get_boundary(2).value(x) / alpha;
     } else if( sflag & 0x03 ) {
-	cof += 2.0/(alpha*beta);
-	set_link( a, _n2d(i-1,j), 2.0/((alpha+beta)*alpha) );
-	set_link( a, _n2d(i+1,j), 2.0/((alpha+beta)*beta) );
+	bool xm_conductor = sflag & 0x01;
+	bool xp_conductor = sflag & 0x02;
+	bool xm_dielectric = !xm_conductor && dielectric_material_at(i-1,j,0) != 0;
+	bool xp_dielectric = !xp_conductor && dielectric_material_at(i+1,j,0) != 0;
+
+	if( xm_dielectric || xp_dielectric ) {
+	    double wm = xm_conductor ? 1.0/alpha :
+		vacuum_face_coefficient( i,j,0, i-1,j,0, -1,0, _geom.mesh(i-1,j), 0, 1.0 );
+	    double wp = xp_conductor ? 1.0/beta :
+		vacuum_face_coefficient( i,j,0, i+1,j,0, +1,0, _geom.mesh(i+1,j), 0, 1.0 );
+	    set_link( a, _n2d(i-1,j), wm );
+	    set_link( a, _n2d(i+1,j), wp );
+	    cof += wm+wp;
+	} else {
+	    cof += 2.0/(alpha*beta);
+	    set_link( a, _n2d(i-1,j), 2.0/((alpha+beta)*alpha) );
+	    set_link( a, _n2d(i+1,j), 2.0/((alpha+beta)*beta) );
+	}
     } else {
 	double wm = vacuum_face_coefficient( i,j,0, i-1,j,0, -1,0, _geom.mesh(i-1,j), 0, 1.0 );
 	double wp = vacuum_face_coefficient( i,j,0, i+1,j,0, +1,0, _geom.mesh(i+1,j), 0, 1.0 );
@@ -686,25 +787,48 @@ void EpotMatrixSolver::add_near_solid_node_3d( uint32_t i, uint32_t j, uint32_t 
 	set_link( a, _n2d(i-1,j,k), 2.0/(alpha*alpha) );
 	(*_fd_vec)(a) += 2.0*_geom.h()*_geom.get_boundary(2).value(x) / alpha;
     } else if( sflag & 0x03 ) {
-	// Near a conductor on (at least) one side of this axis -- keep
-	// the existing Taylor-difference Shortley-Weller treatment,
-	// which assumes eps=1 throughout (correct: this function only
-	// ever runs for a genuinely vacuum self node, never a
-	// dielectric-interior one). KNOWN LIMITATION: if the *other*
-	// side of this same axis (the one without a near-solid
-	// fractional distance here) is actually a dielectric rather
-	// than plain vacuum -- a vacuum node simultaneously near a
-	// conductor on one axis direction and a dielectric on the
-	// opposite direction of that *same* axis, i.e. a true
-	// conductor/dielectric/vacuum triple point -- its permittivity
-	// is not accounted for here; that would need a hybrid
-	// Taylor+flux derivation this function does not yet implement.
-	// See vacuum_face_coefficient()'s doc comment for the (already
-	// handled) simpler case of a conductor and a dielectric on
-	// *different* axes of the same node.
-	cof += 2.0/(alpha*beta);
-	set_link( a, _n2d(i-1,j,k), 2.0/((alpha+beta)*alpha) );
-	set_link( a, _n2d(i+1,j,k), 2.0/((alpha+beta)*beta) );
+	// Near a conductor on (at least) one side of this axis. If a
+	// conductor is cached on *both* sides, self's own medium (vacuum,
+	// eps=1) genuinely spans between the two conductors with no
+	// material change anywhere on this axis, so the existing
+	// Taylor-difference Shortley-Weller treatment applies exactly.
+	// But is_solid() (and therefore this near-solid cache) never
+	// recognizes a dielectric -- only a conductor -- so if just *one*
+	// side is cached, the *other* side (defaulted to alpha/beta=1.0
+	// above) might actually be a dielectric-interior cell rather than
+	// plain vacuum: a true conductor/dielectric/vacuum triple point.
+	// The joint Taylor formula has no way to fold in a permittivity
+	// discontinuity (it assumes a well-defined second derivative
+	// through both neighbours; a material interface only guarantees
+	// flux continuity, i.e. a kink, not that). Detect that case via
+	// _dielectric_mat and, only then, recompose this axis from two
+	// independent per-face resistor conductances instead: the
+	// conductor side reuses its already-bisected cached fractional
+	// distance (eps_self/alpha or eps_self/beta, eps_self=1 here --
+	// exactly vacuum_face_coefficient()'s own Dirichlet-branch
+	// formula, just without re-bisecting), and the other side goes
+	// through vacuum_face_coefficient() itself, which bisects/weights
+	// correctly for the dielectric neighbour. When neither uncached
+	// side turns out to be a dielectric, this reduces to the ordinary
+	// case below and the existing Taylor formula is used unchanged.
+	bool xm_conductor = sflag & 0x01;
+	bool xp_conductor = sflag & 0x02;
+	bool xm_dielectric = !xm_conductor && dielectric_material_at(i-1,j,k) != 0;
+	bool xp_dielectric = !xp_conductor && dielectric_material_at(i+1,j,k) != 0;
+
+	if( xm_dielectric || xp_dielectric ) {
+	    double wm = xm_conductor ? 1.0/alpha :
+		vacuum_face_coefficient( i,j,k, i-1,j,k, -1,0, _geom.mesh(i-1,j,k), 0, 1.0 );
+	    double wp = xp_conductor ? 1.0/beta :
+		vacuum_face_coefficient( i,j,k, i+1,j,k, +1,0, _geom.mesh(i+1,j,k), 0, 1.0 );
+	    set_link( a, _n2d(i-1,j,k), wm );
+	    set_link( a, _n2d(i+1,j,k), wp );
+	    cof += wm+wp;
+	} else {
+	    cof += 2.0/(alpha*beta);
+	    set_link( a, _n2d(i-1,j,k), 2.0/((alpha+beta)*alpha) );
+	    set_link( a, _n2d(i+1,j,k), 2.0/((alpha+beta)*beta) );
+	}
     } else {
 	// Neither side of this axis is near a conductor (alpha=beta=1,
 	// both defaulted, no _nearsolid data cached for either) -- this
@@ -746,12 +870,26 @@ void EpotMatrixSolver::add_near_solid_node_3d( uint32_t i, uint32_t j, uint32_t 
 	set_link( a, _n2d(i,j-1,k), 2.0/(alpha*alpha) );
 	(*_fd_vec)(a) += 2.0*_geom.h()*_geom.get_boundary(4).value(x) / alpha;
     } else if( sflag & 0x0c ) {
-	// See the X-axis branch above for the rationale and the known
-	// limitation (conductor and dielectric on opposite sides of the
-	// *same* axis).
-	cof += 2.0/(alpha*beta);
-	set_link( a, _n2d(i,j-1,k), 2.0/((alpha+beta)*alpha) );
-	set_link( a, _n2d(i,j+1,k), 2.0/((alpha+beta)*beta) );
+	// See the X-axis branch above for the rationale (conductor and
+	// dielectric on opposite sides of the *same* axis).
+	bool ym_conductor = sflag & 0x04;
+	bool yp_conductor = sflag & 0x08;
+	bool ym_dielectric = !ym_conductor && dielectric_material_at(i,j-1,k) != 0;
+	bool yp_dielectric = !yp_conductor && dielectric_material_at(i,j+1,k) != 0;
+
+	if( ym_dielectric || yp_dielectric ) {
+	    double wm = ym_conductor ? 1.0/alpha :
+		vacuum_face_coefficient( i,j,k, i,j-1,k, -1,1, _geom.mesh(i,j-1,k), 0, 1.0 );
+	    double wp = yp_conductor ? 1.0/beta :
+		vacuum_face_coefficient( i,j,k, i,j+1,k, +1,1, _geom.mesh(i,j+1,k), 0, 1.0 );
+	    set_link( a, _n2d(i,j-1,k), wm );
+	    set_link( a, _n2d(i,j+1,k), wp );
+	    cof += wm+wp;
+	} else {
+	    cof += 2.0/(alpha*beta);
+	    set_link( a, _n2d(i,j-1,k), 2.0/((alpha+beta)*alpha) );
+	    set_link( a, _n2d(i,j+1,k), 2.0/((alpha+beta)*beta) );
+	}
     } else {
 	double wm = vacuum_face_coefficient( i,j,k, i,j-1,k, -1,1, _geom.mesh(i,j-1,k), 0, 1.0 );
 	double wp = vacuum_face_coefficient( i,j,k, i,j+1,k, +1,1, _geom.mesh(i,j+1,k), 0, 1.0 );
@@ -785,9 +923,24 @@ void EpotMatrixSolver::add_near_solid_node_3d( uint32_t i, uint32_t j, uint32_t 
 	(*_fd_vec)(a) += 2.0*_geom.h()*_geom.get_boundary(6).value(x) / alpha;
     } else if( sflag & 0x30 ) {
 	// See the X-axis branch above.
-	cof += 2.0/(alpha*beta);
-	set_link( a, _n2d(i,j,k-1), 2.0/((alpha+beta)*alpha) );
-	set_link( a, _n2d(i,j,k+1), 2.0/((alpha+beta)*beta) );
+	bool zm_conductor = sflag & 0x10;
+	bool zp_conductor = sflag & 0x20;
+	bool zm_dielectric = !zm_conductor && dielectric_material_at(i,j,k-1) != 0;
+	bool zp_dielectric = !zp_conductor && dielectric_material_at(i,j,k+1) != 0;
+
+	if( zm_dielectric || zp_dielectric ) {
+	    double wm = zm_conductor ? 1.0/alpha :
+		vacuum_face_coefficient( i,j,k, i,j,k-1, -1,2, _geom.mesh(i,j,k-1), 0, 1.0 );
+	    double wp = zp_conductor ? 1.0/beta :
+		vacuum_face_coefficient( i,j,k, i,j,k+1, +1,2, _geom.mesh(i,j,k+1), 0, 1.0 );
+	    set_link( a, _n2d(i,j,k-1), wm );
+	    set_link( a, _n2d(i,j,k+1), wp );
+	    cof += wm+wp;
+	} else {
+	    cof += 2.0/(alpha*beta);
+	    set_link( a, _n2d(i,j,k-1), 2.0/((alpha+beta)*alpha) );
+	    set_link( a, _n2d(i,j,k+1), 2.0/((alpha+beta)*beta) );
+	}
     } else {
 	double wm = vacuum_face_coefficient( i,j,k, i,j,k-1, -1,2, _geom.mesh(i,j,k-1), 0, 1.0 );
 	double wp = vacuum_face_coefficient( i,j,k, i,j,k+1, +1,2, _geom.mesh(i,j,k+1), 0, 1.0 );
@@ -1178,7 +1331,43 @@ void EpotMatrixSolver::build_mat_vec( void )
 
     int nthreads = (int)ibsimu.get_thread_count();
 
+    if( !_dielectric_mat_built ) {
+
+	auto time_t0 = Clock::now();
+
+	// One-time (ever, not per major cycle -- see _dielectric_mat's
+	// and _dielectric_mat_built's doc comments) precomputation of
+	// every mesh node's dielectric material, so update_nonlinear_node()
+	// and vacuum_face_coefficient() can both look it up in O(1)
+	// afterward instead of repeatedly re-running self_material_at()'s
+	// Geometry::inside() fallback -- for the entire mesh, up to 7
+	// times per node (once for self, once for each face's neighbour),
+	// every major cycle.
+	uint32_t meshsize = _geom.size(0)*_geom.size(1)*_geom.size(2);
+	_dielectric_mat.resize( meshsize );
+
+#pragma omp parallel for num_threads(nthreads) collapse(3) schedule(dynamic,64)
+	for( uint32_t k = 0; k < _geom.size(2); k++ ) {
+	    for( uint32_t j = 0; j < _geom.size(1); j++ ) {
+		for( uint32_t i = 0; i < _geom.size(0); i++ ) {
+
+		    Vec3D x( _geom.origo(0) + _geom.h()*i,
+			     _geom.origo(1) + _geom.h()*j,
+			     _geom.origo(2) + _geom.h()*k );
+
+		    uint32_t a = (k*_geom.size(1)+j)*_geom.size(0)+i;
+		    _dielectric_mat[a] = self_material_at( _geom.mesh(a), x );
+		}
+	    }
+	}
+
+	_dielectric_mat_built = true;
+	_time_dielectric_cache += std::chrono::duration<double>( Clock::now()-time_t0 ).count();
+    }
+
     if( !_linear_built ) {
+
+	auto time_t0 = Clock::now();
 
 	// One-time build of the linear (geometry-only) part: matrix
 	// stencil coefficients, Dirichlet-neighbour rhs contributions
@@ -1273,6 +1462,7 @@ void EpotMatrixSolver::build_mat_vec( void )
 	    _fd_mat_diag0[a] = _fd_mat->get( a, a );
 
 	_linear_built = true;
+	_time_linbuild += std::chrono::duration<double>( Clock::now()-time_t0 ).count();
 
     } else {
 
@@ -1292,6 +1482,9 @@ void EpotMatrixSolver::build_mat_vec( void )
     // a mesh scan plus, for plasma-active nodes, the actual nonlinear
     // evaluation (pexp_newton/nsimp_newton/shield_newton).
     if( _plasma == PLASMA_PEXP || _plasma == PLASMA_NSIMP || _plasma == PLASMA_SHIELD ) {
+
+	auto time_t0 = Clock::now();
+
 #pragma omp parallel for num_threads(nthreads) collapse(3) schedule(dynamic,64)
 	for( uint32_t k = 0; k < _geom.size(2); k++ ) {
 	    for( uint32_t j = 0; j < _geom.size(1); j++ ) {
@@ -1311,6 +1504,8 @@ void EpotMatrixSolver::build_mat_vec( void )
 		}
 	    }
 	}
+
+	_time_nonlin += std::chrono::duration<double>( Clock::now()-time_t0 ).count();
     }
 }
 

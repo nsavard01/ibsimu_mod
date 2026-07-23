@@ -397,8 +397,51 @@ public:
      *  Initial plasma volume is defined in the area given by callback
      *  functor \a init_plasma_func.
      */
-    void set_initial_plasma( double Up, 
+    void set_initial_plasma( double Up,
 			     CallbackFunctorB_V *init_plasma_func );
+
+    /*! \brief Seed \a scharge with a guessed space-charge density \a
+     *  rho throughout the region where \a plasma_region_func returns
+     *  true, leaving every other node untouched.
+     *
+     *  This is an alternative to set_initial_plasma(): instead of
+     *  force-fixing the potential in an assumed plasma region for one
+     *  linear bootstrap solve (PLASMA_PEXP_INITIAL/PLASMA_NSIMP_INITIAL)
+     *  and then switching to the real nonlinear model
+     *  (PLASMA_PEXP/PLASMA_NSIMP) once particles have flown -- which
+     *  changes which nodes are eliminated from the matrix between the
+     *  first major cycle and the rest, forcing
+     *  EpotBiCGSTABSolver/GMG_Precond to rebuild the whole preconditioner
+     *  hierarchy at that transition -- this lets set_pexp_plasma()/
+     *  set_nsimp_plasma() be called once, before the very first solve,
+     *  with \a scharge already carrying a physically reasonable initial
+     *  guess in the plasma volume. The degrees of freedom and matrix
+     *  sparsity pattern are then identical from the first major cycle
+     *  onward: every solve is the same nonlinear problem, just with
+     *  scharge itself updated (e.g. by blending in the particle-tracked
+     *  density each major cycle, as the caller already does), so
+     *  GMG_Precond's node map never changes and its expensive
+     *  prepare() step only ever needs to run once.
+     *
+     *  Mirrors the plain loop over Geometry's mesh nodes this replaces
+     *  (see test_no_plasma.cpp for the pattern this generalizes):
+     *  \a plasma_region_func is called once per mesh node with that
+     *  node's position, exactly like \a init_plasma_func above, and
+     *  \a scharge is otherwise assumed already sized to \a geom (i.e.
+     *  constructed from the same Geometry passed to this solver).
+     *
+     *  \a plasma_region_func only needs to describe the plasma's
+     *  geometric extent (e.g. "z < 0") -- solid nodes within that
+     *  region are always skipped regardless of what it returns, since a
+     *  dielectric node is an ordinary free row whose right hand side
+     *  directly includes \a rho (see add_vacuum_node()): seeding it
+     *  there would inject a spurious free-charge source term into a
+     *  medium that has no mobile charge at all. A conductor node is
+     *  eliminated from the matrix and would just be a silent no-op, but
+     *  is skipped too for clarity.
+     */
+    void set_initial_plasma_rho( MeshScalarField &scharge, double rho,
+				  CallbackFunctorB_V *plasma_region_func ) const;
 
     /*! \brief Define plasma calculation region.
      *

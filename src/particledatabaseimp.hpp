@@ -728,18 +728,35 @@ public:
 	    throw( err[0] );
 	}
 
-	// Collect statistics. Free all allocated memory.
+	// Collect statistics and per-thread sub-timing. Free all allocated
+	// memory. Each ParticleIterator instance lived on exactly one
+	// scheduler thread for its whole life, so its accumulators need no
+	// synchronization -- just sum them like the existing _stat totals.
+	double time_ode = 0.0, time_trajhandle = 0.0;
 	for( uint32_t a = 0; a < ibsimu.get_thread_count(); a++ ) {
 	    ParticleStatistics stat = iterators[a]->get_statistics();
 	    _stat += stat;
+	    time_ode        += iterators[a]->get_time_ode();
+	    time_trajhandle  += iterators[a]->get_time_trajhandle();
 	    delete iterators[a];
 	}
 
+	// Charge deposition finalization and solid-node cleanup are done
+	// once, serially, after all trajectories are done -- cheap enough
+	// to time directly with the heavier Timer class.
+	Timer t_scharge_finalize;
 	if( _scharge_dep == SCHARGE_DEPOSITION_LINEAR )
 	    scharge_finalize_linear( scharge );
 	else
 	    scharge_finalize_pic( scharge );
-	
+
+	// PIC/linear deposition has no notion of solids -- see
+	// scharge_clear_solid_nodes()'s doc comment. Strip out anything
+	// that leaked into a conductor or dielectric interior before this
+	// scharge map is handed to the potential solver.
+	scharge_clear_solid_nodes( scharge, _geom );
+	t_scharge_finalize.stop();
+
 	t.stop();
 	ibsimu.message( 1 ) << "Particle histories (" << _particles.size() << " total):\n";
 	ibsimu.message( 1 ) << "  flown = " << _stat.bound_collisions() << "\n";
@@ -751,8 +768,12 @@ public:
 				<< " " << PP::IQ_unit() << " (" << _stat.bound_collisions(a) << " particles)" << "\n";
 	}
 	ibsimu.message( 1 ) << "  total steps = " << _stat.sum_steps() << "\n";
-	ibsimu.message( 1 ) << "  steps per particle (ave) = " << 
+	ibsimu.message( 1 ) << "  steps per particle (ave) = " <<
 	    _stat.sum_steps()/(double)_particles.size() << "\n";
+	ibsimu.message( 1 ) << "Particle mover timing (summed over " << ibsimu.get_thread_count() << " threads):\n";
+	ibsimu.message( 1 ) << "  ODE stepping             : " << time_ode << " s\n";
+	ibsimu.message( 1 ) << "  Collision + scharge dep. : " << time_trajhandle << " s\n";
+	ibsimu.message( 1 ) << "  Scharge finalize+cleanup : " << t_scharge_finalize << "\n";
 	ibsimu.message( 1 ) << "time used = " << t << "\n";
 	ibsimu.dec_indent();
     }
@@ -767,20 +788,33 @@ public:
 
 	// Clear space charge
 	scharge.clear();
-	
-	// Go through particles
-	ParticleStepper<PP> ps( dt, _trajdiv, _mirror, &scharge, 
+
+	// Go through particles. This loop is serial (not scheduled across
+	// threads like iterate_trajectories()), so timing the whole thing
+	// as one block is cheap -- a single Timer start/stop, not per
+	// particle.
+	Timer t_step;
+	ParticleStepper<PP> ps( dt, _trajdiv, _mirror, &scharge,
 			    &efield, &bfield, &_geom );
 	for( uint32_t a = 0; a < _particles.size(); a++ ) {
 	    if( (*_particles[a])[0] == 0 )
 		ps.initialize( _particles[a], a );
 	    ps.step( _particles[a], a );
 	}
+	t_step.stop();
 
 	// Finalize charge
+	Timer t_scharge_finalize;
 	scharge_finalize_step_pic( scharge );
 
+	// See scharge_clear_solid_nodes()'s doc comment -- same PIC
+	// boundary-unawareness applies to the incremental step path too.
+	scharge_clear_solid_nodes( scharge, _geom );
+	t_scharge_finalize.stop();
+
 	t.stop();
+	ibsimu.message( 1 ) << "Particle stepping     : " << t_step << "\n";
+	ibsimu.message( 1 ) << "Scharge finalize+cleanup: " << t_scharge_finalize << "\n";
 	ibsimu.message( 1 ) << "time used = " << t << "\n";
 	ibsimu.dec_indent();
     }

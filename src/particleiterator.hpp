@@ -48,6 +48,7 @@
 #include <iostream>
 #include <algorithm>
 #include <iomanip>
+#include <chrono>
 #include <gsl/gsl_odeiv2.h>
 #include <gsl/gsl_poly.h>
 #include "geometry.hpp"
@@ -279,6 +280,8 @@ public:
  */
 template <class PP> class ParticleIterator {
 
+    typedef std::chrono::steady_clock Clock; /*!< \brief Lightweight clock for sub-timing accumulators. */
+
     gsl_odeiv2_system           _system;        /**< \brief GSL ODE integrator system. */
     gsl_odeiv2_step            *_step;          /**< \brief GSL ODE integrator stepper. */
     gsl_odeiv2_control         *_control;       /**< \brief GSL ODE integrator constrol. */
@@ -313,6 +316,18 @@ template <class PP> class ParticleIterator {
 
     ParticleStatistics         _stat;          /*!< \brief Particle statistics. */
 
+    /* Timing accumulators for particle mover sub-timing. Each
+     * ParticleIterator instance lives on exactly one thread for its
+     * whole lifetime (see Scheduler usage in
+     * ParticleDataBaseImp::iterate_trajectories()/step_particles()),
+     * so these are plain doubles with no synchronization -- they are
+     * summed across all per-thread instances by the caller after
+     * Scheduler::finish(), mirroring the existing _stat accumulation
+     * pattern. Reset to zero in the constructor only; not meant to be
+     * reset per trajectory (final totals are read once at the end of
+     * the whole iterate_trajectories()/step_particles() call). */
+    double                     _time_ode;        /*!< \brief Time spent in gsl_odeiv2_evolve_apply() (ODE stepping). */
+    double                     _time_trajhandle;  /*!< \brief Time spent in handle_trajectory() (collision detection + space charge deposition). */
 
     /*! \brief Save trajectory point \a x.
      *
@@ -967,8 +982,13 @@ template <class PP> class ParticleIterator {
 		       "  x3: " << x3 << "\n" );
 	
 	// Handle step with linear interpolation to avoid going to r<=0
-	if( !handle_trajectory( particle, x2, x3, true, false ) )
-	    return( false ); // Particle done
+	{
+	    Clock::time_point time_t0 = Clock::now();
+	    bool ok = handle_trajectory( particle, x2, x3, true, false );
+	    _time_trajhandle += std::chrono::duration<double>( Clock::now()-time_t0 ).count();
+	    if( !ok )
+		return( false ); // Particle done
+	}
 
 	// Save trajectory calculation points
 	save_trajectory_point( x2 );
@@ -1129,8 +1149,9 @@ public:
 	  _maxsteps(maxsteps), _maxt(maxt), _save_points(save_points), _trajdiv(trajdiv),
 	  _surface_collision(false), _pidata(scharge,efield,bfield,geom),
 	  _thand_cb(0), _tend_cb(0), _tsur_cb(0), _bsup_cb(0), _pdb(0),
-	  _stat(geom->number_of_boundaries()) {
-	
+	  _stat(geom->number_of_boundaries()),
+	  _time_ode(0.0), _time_trajhandle(0.0) {
+
 	// Initialize mirroring
 	_mirror[0] = mirror[0];
 	_mirror[1] = mirror[1];
@@ -1225,7 +1246,28 @@ public:
 	return( _stat );
     }
 
-    
+    /*! \brief Get accumulated time spent in ODE stepping (gsl_odeiv2_evolve_apply()).
+     *
+     *  Accumulated over all trajectories handled by this iterator
+     *  instance since construction. Caller sums across all per-thread
+     *  instances after Scheduler::finish().
+     */
+    double get_time_ode( void ) const {
+	return( _time_ode );
+    }
+
+    /*! \brief Get accumulated time spent in handle_trajectory() (collision
+     *  detection and space charge deposition combined).
+     *
+     *  Accumulated over all trajectories handled by this iterator
+     *  instance since construction. Caller sums across all per-thread
+     *  instances after Scheduler::finish().
+     */
+    double get_time_trajhandle( void ) const {
+	return( _time_trajhandle );
+    }
+
+
     /*! \brief Iterate a particle from start to end.
      *
      *  Iterate particle \a particle from start to end. This function
@@ -1297,25 +1339,29 @@ public:
 			   "  x  = " << x2 << "\n" <<
 			   "  dt = " << dt << " (proposed)\n" );
 
-	    while( true ) {
-		int retval = gsl_odeiv2_evolve_apply( _evolve, _control, _step, &_system, 
-						     &x2[0], _maxt, &dt, &x2[1] );
-		if( retval == IBSIMU_DERIV_ERROR ) {
-		    DEBUG_MESSAGE( "Step rejected\n" <<
-				   "  x2 = " << x2 << "\n" <<
-				   "  dt = " << dt << "\n" );
-		    x2[0] = x[0]; // Reset time (this shouldn't be necessary - there 
-		                  // is a bug in GSL-1.12, report has been sent)
-		    dt *= 0.5;
-		    if( dt == 0.0 )
-			throw( Error( ERROR_LOCATION, "too small step size" ) );
-		    //nstp++;
-		    continue;
-		} else if( retval == GSL_SUCCESS ) {
-		    break;
-		} else {
-		    throw( Error( ERROR_LOCATION, "gsl_odeiv2_evolve_apply failed" ) );
+	    {
+		Clock::time_point time_t0 = Clock::now();
+		while( true ) {
+		    int retval = gsl_odeiv2_evolve_apply( _evolve, _control, _step, &_system,
+							 &x2[0], _maxt, &dt, &x2[1] );
+		    if( retval == IBSIMU_DERIV_ERROR ) {
+			DEBUG_MESSAGE( "Step rejected\n" <<
+				       "  x2 = " << x2 << "\n" <<
+				       "  dt = " << dt << "\n" );
+			x2[0] = x[0]; // Reset time (this shouldn't be necessary - there
+				      // is a bug in GSL-1.12, report has been sent)
+			dt *= 0.5;
+			if( dt == 0.0 )
+			    throw( Error( ERROR_LOCATION, "too small step size" ) );
+			//nstp++;
+			continue;
+		    } else if( retval == GSL_SUCCESS ) {
+			break;
+		    } else {
+			throw( Error( ERROR_LOCATION, "gsl_odeiv2_evolve_apply failed" ) );
+		    }
 		}
+		_time_ode += std::chrono::duration<double>( Clock::now()-time_t0 ).count();
 	    }
 	    
 	    // Check step count number and step size validity
@@ -1337,9 +1383,14 @@ public:
 			   "  x2 = " << x2 << "\n" );
 
 	    // Handle collisions and space charge of step.
-	    if( !handle_trajectory( *particle, x, x2, false, nstp == 0 ) ) {
-		x = x2;
-		break; // Particle done
+	    {
+		Clock::time_point time_t0 = Clock::now();
+		bool ok = handle_trajectory( *particle, x, x2, false, nstp == 0 );
+		_time_trajhandle += std::chrono::duration<double>( Clock::now()-time_t0 ).count();
+		if( !ok ) {
+		    x = x2;
+		    break; // Particle done
+		}
 	    }
 
 	    // Check if particle mirroring is required to avoid 

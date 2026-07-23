@@ -50,11 +50,17 @@
 
 using Clock = std::chrono::steady_clock;
 
+// All of these are reset to 0 at the start of every subsolve() call (see
+// its top) so the "Timing summary" printed at the end of subsolve()
+// reflects that one Poisson solve only, not an accumulation across every
+// major cycle of the whole program run.
 static double time_spmv = 0.0;
 static double time_prec = 0.0;
 static double time_dot = 0.0;
 static double time_norm = 0.0;
 static double time_axpy = 0.0;
+static double time_gmg_prepare = 0.0;
+static double time_gmg_construct = 0.0;
 
 EpotBiCGSTABSolver::EpotBiCGSTABSolver( Geometry &geom, 
 					double eps, 
@@ -71,18 +77,22 @@ EpotBiCGSTABSolver::EpotBiCGSTABSolver( Geometry &geom,
     if( eps <= 0.0 || newton_eps <= 0.0 )
         throw( ErrorDim( ERROR_LOCATION, "invalid accuracy request" ) );
 
-    // Default preconditioner: parallel red-black SOR.
+    // Default preconditioner: ILU0.
     //
-    // RBSOR_Precond(nsweeps=2, w=1.0) performs two red-black
-    // Gauss-Seidel sweep pairs per BiCGSTAB preconditioning step.
-    // This is cheaper per application than ILU0 and parallelises
-    // across ibsimu.get_thread_count() threads, making it significantly
-    // faster for the high-resolution 3D cases where the solver is slow.
+    // ILU0 gives a better-conditioned system per BiCGSTAB iteration
+    // than the alternatives below, at the cost of being a serial
+    // (sequential forward/backward substitution) operation that scales
+    // poorly with problem size -- it is kept as the default for
+    // unchanged convergence behavior, not because it's the fastest
+    // option at high resolution.
     //
-    // The old ILU0 preconditioner can still be restored via
-    //   solver.set_preconditioner( ILU0_Precond() );
-    // It gives a better-conditioned system per iteration but is serial
-    // and scales poorly with problem size.
+    // A parallel alternative is available and generally faster overall
+    // for high-resolution 3D problems (fewer serial bottlenecks per
+    // BiCGSTAB iteration, at the cost of needing more iterations since
+    // it's a weaker preconditioner per application):
+    //   solver.set_preconditioner( RBSOR_Precond() );
+    // RBSOR_Precond(nsweeps=4, w=1.4) performs red-black Gauss-Seidel
+    // sweep pairs, parallelised across ibsimu.get_thread_count() threads.
     _pc = new ILU0_Precond();
 }
 
@@ -356,6 +366,14 @@ void EpotBiCGSTABSolver::subsolve( MeshScalarField &epot, const MeshScalarField 
 {
     _epot = &epot;
 
+    // Zero every per-solve timing accumulator -- see their doc
+    // comments/declarations. Must happen before preprocess()/build_mat_vec()
+    // get a chance to run, since the linear-build/dielectric-cache timers
+    // are accumulated from inside those.
+    time_spmv = time_prec = time_dot = time_norm = time_axpy = 0.0;
+    time_gmg_prepare = time_gmg_construct = 0.0;
+    reset_build_timing();
+
     // Preprocess and set starting guess
     preprocess( epot, scharge );
 
@@ -384,9 +402,14 @@ void EpotBiCGSTABSolver::subsolve( MeshScalarField &epot, const MeshScalarField 
 	const Vector *B;
 	get_vecmat( &A, &B );
 
+	auto t0 = Clock::now();
 	if( !_pc->is_prepared() )
 	    _pc->prepare( *A );
+	auto t1 = Clock::now();
+	time_gmg_prepare += std::chrono::duration<double>(t1-t0).count();
 	_pc->construct( *A );
+	auto t2 = Clock::now();
+	time_gmg_construct += std::chrono::duration<double>(t2-t1).count();
 
 	_iter = 0;
         bicgstab( *A, *B, X, *_pc );
@@ -435,13 +458,23 @@ void EpotBiCGSTABSolver::subsolve( MeshScalarField &epot, const MeshScalarField 
             get_resjac( &J, &R, X );
             double f = ssqr( *R );
 
-	    if( !_pc->is_prepared() )
-		_pc->prepare( *J );
+	    {
+		auto t0 = Clock::now();
+		if( !_pc->is_prepared() )
+		    _pc->prepare( *J );
+		auto t1 = Clock::now();
+		time_gmg_prepare += std::chrono::duration<double>(t1-t0).count();
+	    }
 
 	    for( a = 0; a < (int)_newton_imax; a++ ) {
 
                 // Calculate dX = J^{-1}*R
-		_pc->construct( *J );
+		{
+		    auto t0 = Clock::now();
+		    _pc->construct( *J );
+		    auto t1 = Clock::now();
+		    time_gmg_construct += std::chrono::duration<double>(t1-t0).count();
+		}
                 dX.clear();
 		iter_old = _iter;
                 bicgstab( *J, *R, dX, *_pc );
@@ -504,9 +537,14 @@ void EpotBiCGSTABSolver::subsolve( MeshScalarField &epot, const MeshScalarField 
 
 		// Calculate dX = J^{-1}*R
 		get_resjac( &J, &R, X );
+		auto t0 = Clock::now();
 		if( !_pc->is_prepared() )
 		    _pc->prepare( *J );
+		auto t1 = Clock::now();
+		time_gmg_prepare += std::chrono::duration<double>(t1-t0).count();
 		_pc->construct( *J );
+		auto t2 = Clock::now();
+		time_gmg_construct += std::chrono::duration<double>(t2-t1).count();
 
 		dX.clear();
 		iter_old = _iter;
@@ -550,13 +588,25 @@ void EpotBiCGSTABSolver::subsolve( MeshScalarField &epot, const MeshScalarField 
 	ibsimu.message( 1 ) << "total iterations = " << _iter << "\n";
 
     }
-	ibsimu.message(1)
-    << "\nTiming summary:\n"
-    << "  SpMV          : " << time_spmv << " s\n"
-    << "  Preconditioner: " << time_prec << " s\n"
-    << "  Dot products  : " << time_dot << " s\n"
-    << "  Norms         : " << time_norm << " s\n"
-    << "  Vector ops    : " << time_axpy << " s\n";
+
+    // Per-solve timing breakdown -- every value here was reset to 0 at
+    // the top of this subsolve() call (see there), so this reflects
+    // only this Poisson solve, not an accumulation across the whole
+    // program run. Matrix-build figures come from EpotMatrixSolver
+    // (this class' base) via build_mat_vec()'s own timing.
+    ibsimu.message(1) << "\nTiming summary:\n";
+    if( time_dielectric_cache() > 0.0 )
+	ibsimu.message(1) << "  Dielectric material cache (one-time): " << time_dielectric_cache() << " s\n";
+    ibsimu.message(1)
+    << "  Linear matrix build   : " << time_linbuild() << " s\n"
+    << "  Nonlinear (plasma) update: " << time_nonlin() << " s\n"
+    << "  GMG prepare           : " << time_gmg_prepare << " s\n"
+    << "  GMG construct         : " << time_gmg_construct << " s\n"
+    << "  SpMV                  : " << time_spmv << " s\n"
+    << "  Preconditioner apply  : " << time_prec << " s\n"
+    << "  Dot products          : " << time_dot << " s\n"
+    << "  Norms                 : " << time_norm << " s\n"
+    << "  Vector ops            : " << time_axpy << " s\n";
 
     // Postprocess and set solution
     set_solution( epot, X );

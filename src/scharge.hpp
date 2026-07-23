@@ -48,6 +48,8 @@
 #include "particles.hpp"
 #include "cfifo.hpp"
 
+class Geometry;
+
 
 /*! \brief Finalize space charge calculation.
  *
@@ -57,6 +59,27 @@
  *
  */
 void scharge_finalize_pic( MeshScalarField &scharge );
+
+
+/*! \brief Zero deposited space charge at every real solid mesh node
+ *  (conductor or dielectric interior alike, solid number >=7).
+ *
+ *  scharge_add_from_trajectory_pic()/scharge_add_step_pic() have no
+ *  notion of Geometry at all: they bilinearly/trilinearly spread a
+ *  particle's charge across the corner nodes of whatever mesh cell it
+ *  currently occupies, purely by position, regardless of whether some
+ *  of those corners happen to lie inside a solid. That's harmless for
+ *  a conductor -- its row is Dirichlet-eliminated, so this rhs term is
+ *  never read -- but not for a dielectric interior, which is an
+ *  ordinary free row whose own equation is supposed to be charge-free
+ *  (see add_vacuum_node()'s rhs comment in epot_matrixsolver.cpp): any
+ *  charge that leaks in there directly corrupts that node's potential.
+ *
+ *  Call this once after scharge_finalize_pic()/scharge_finalize_linear()/
+ *  scharge_finalize_step_pic(), while \a scharge and \a geom still
+ *  share the same mesh discretization.
+ */
+void scharge_clear_solid_nodes( MeshScalarField &scharge, const Geometry &geom );
 
 
 /*! \brief Function for adding charge to space charge density map from

@@ -121,7 +121,42 @@ void EpotSolver::set_forced_potential_volume( CallbackFunctorD_V *force_pot_func
 }
 
 
-void EpotSolver::set_initial_plasma( double Up, 
+namespace {
+    /* A dielectric solid's interior is tagged the same way as plain
+     * vacuum (SMESH_NODE_ID_PURE_VACUUM[_FIX], material number in the
+     * lower bits -- see Geometry::build_mesh_parallel_thread_3d()), so
+     * the raw tag is enough to recognise it *unless* it reaches a
+     * simulation box wall: Geometry::override_dielectric_box_boundary_3d()
+     * resets such a node and lets it be reclassified by the ordinary
+     * box-edge decision tree, which retags it SMESH_NODE_ID_NEUMANN or
+     * SMESH_NODE_ID_DIRICHLET -- discarding the material number, even
+     * though the node is still physically dielectric material. That's
+     * the right call for the matrix discretisation itself (the box's
+     * own condition, not the dielectric's bulk equation, applies right
+     * at that surface -- see the doc comment on that function), but it
+     * means the raw tag alone can no longer answer "is this dielectric"
+     * for a Neumann-tagged node. This recovers the answer geometrically
+     * when the fast path (raw tag) can't, mirroring
+     * EpotMatrixSolver::self_material_at()'s slow path -- duplicated
+     * rather than shared since this class doesn't depend on that one
+     * (which is the derived class).
+     */
+    bool is_dielectric_at( const Geometry &geom, uint32_t mesh_value, const Vec3D &x )
+    {
+	uint32_t node_id = mesh_value & SMESH_NODE_ID_MASK;
+	if( ( node_id == SMESH_NODE_ID_PURE_VACUUM || node_id == SMESH_NODE_ID_PURE_VACUUM_FIX ) &&
+	    ( mesh_value & SMESH_NEAR_SOLID_INDEX_MASK ) >= 7 )
+	    return( true ); // fast path -- tag already says dielectric-interior directly
+
+	uint32_t solid_number = geom.inside( x );
+	if( solid_number < 7 )
+	    return( false ); // plain vacuum (or, shouldn't happen, outside the box)
+	return( geom.get_boundary( solid_number ).type() == BOUND_DIELECTRIC );
+    }
+}
+
+
+void EpotSolver::set_initial_plasma( double Up,
 				     CallbackFunctorB_V *init_plasma_func )
 {
     _plasma     = PLASMA_INITIAL;
@@ -130,6 +165,60 @@ void EpotSolver::set_initial_plasma( double Up,
 	throw( Error( ERROR_LOCATION, "NULL initial plasma function" ) );
     _init_plasma_func = init_plasma_func;
     reset_problem();
+}
+
+
+/* See the doc comment in epot_solver.hpp. Deliberately does not touch
+ * _plasma/_init_plasma_func/reset_problem() at all -- unlike
+ * set_initial_plasma(), this doesn't define a plasma model by itself,
+ * it only fills in a starting guess for scharge that the caller then
+ * passes to solve() alongside a real set_pexp_plasma()/
+ * set_nsimp_plasma() call.
+ *
+ * Solid nodes are always skipped, regardless of what plasma_region_func
+ * says: a Dirichlet (conductor) node is eliminated from the matrix
+ * entirely, so scharge there is simply never read, but a dielectric
+ * node is an ordinary *free* row (see is_dielectric_at()'s doc comment)
+ * whose right-hand side directly includes -scharge*h*h/EPSILON0 (see
+ * add_vacuum_node() and friends) -- setting rho there injects a large,
+ * entirely spurious free-charge source term straight into the
+ * dielectric's own Poisson equation, which has no mobile charge at all.
+ * This is exactly the same category of mistake set_initial_plasma()'s
+ * fixed-potential path had (see is_dielectric_at() and its call sites
+ * in preprocess()), just landing on scharge here instead of a forced
+ * potential. plasma_region_func only needs to describe the plasma's
+ * geometric extent (e.g. "z < 0"); it does not need to know where the
+ * solids are.
+ */
+void EpotSolver::set_initial_plasma_rho( MeshScalarField &scharge, double rho,
+					 CallbackFunctorB_V *plasma_region_func ) const
+{
+    if( !plasma_region_func )
+	throw( Error( ERROR_LOCATION, "NULL plasma region function" ) );
+
+    int nthreads = (int)ibsimu.get_thread_count();
+#pragma omp parallel for num_threads(nthreads) collapse(3) schedule(dynamic,64)
+    for( uint32_t k = 0; k < _geom.size(2); k++ ) {
+	for( uint32_t j = 0; j < _geom.size(1); j++ ) {
+	    for( uint32_t i = 0; i < _geom.size(0); i++ ) {
+
+		Vec3D x( _geom.origo(0) + _geom.h()*i,
+			 _geom.origo(1) + _geom.h()*j,
+			 _geom.origo(2) + _geom.h()*k );
+
+		if( !(*plasma_region_func)( x ) )
+		    continue;
+
+		uint32_t mesh = _geom.mesh(i,j,k);
+		if( (mesh & SMESH_NODE_ID_MASK) == SMESH_NODE_ID_DIRICHLET )
+		    continue; // conductor -- eliminated row, never read
+		if( is_dielectric_at( _geom, mesh, x ) )
+		    continue; // real dielectric material -- no mobile charge, see above
+
+		scharge(i,j,k) = rho;
+	    }
+	}
+    }
 }
 
 
@@ -242,41 +331,6 @@ void EpotSolver::nsimp_newton( double &rhs, double &drhs, double epot ) const
 	    rhs  += w;
 	    drhs += _plE[i]*w;
 	}
-    }
-}
-
-
-namespace {
-    /* A dielectric solid's interior is tagged the same way as plain
-     * vacuum (SMESH_NODE_ID_PURE_VACUUM[_FIX], material number in the
-     * lower bits -- see Geometry::build_mesh_parallel_thread_3d()), so
-     * the raw tag is enough to recognise it *unless* it reaches a
-     * simulation box wall: Geometry::override_dielectric_box_boundary_3d()
-     * resets such a node and lets it be reclassified by the ordinary
-     * box-edge decision tree, which retags it SMESH_NODE_ID_NEUMANN or
-     * SMESH_NODE_ID_DIRICHLET -- discarding the material number, even
-     * though the node is still physically dielectric material. That's
-     * the right call for the matrix discretisation itself (the box's
-     * own condition, not the dielectric's bulk equation, applies right
-     * at that surface -- see the doc comment on that function), but it
-     * means the raw tag alone can no longer answer "is this dielectric"
-     * for a Neumann-tagged node. This recovers the answer geometrically
-     * when the fast path (raw tag) can't, mirroring
-     * EpotMatrixSolver::self_material_at()'s slow path -- duplicated
-     * rather than shared since this class doesn't depend on that one
-     * (which is the derived class).
-     */
-    bool is_dielectric_at( const Geometry &geom, uint32_t mesh_value, const Vec3D &x )
-    {
-	uint32_t node_id = mesh_value & SMESH_NODE_ID_MASK;
-	if( ( node_id == SMESH_NODE_ID_PURE_VACUUM || node_id == SMESH_NODE_ID_PURE_VACUUM_FIX ) &&
-	    ( mesh_value & SMESH_NEAR_SOLID_INDEX_MASK ) >= 7 )
-	    return( true ); // fast path -- tag already says dielectric-interior directly
-
-	uint32_t solid_number = geom.inside( x );
-	if( solid_number < 7 )
-	    return( false ); // plain vacuum (or, shouldn't happen, outside the box)
-	return( geom.get_boundary( solid_number ).type() == BOUND_DIELECTRIC );
     }
 }
 

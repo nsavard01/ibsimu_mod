@@ -1353,6 +1353,13 @@ void Geometry::build_mesh_parallel_thread_3d( void )
     // Start from an all-vacuum mesh.
     memset( _smesh, 0, sizeof(uint32_t)*ntot );
 
+    // Phase timing: this whole function runs once (or a handful of
+    // times at most) per program run, so a full Timer per phase (each
+    // a syscall or two) is negligible overhead -- unlike the per-
+    // operation chrono deltas used inside the Poisson solve's hot
+    // loops, there is no call-frequency concern here.
+    Timer t_solid;
+
     // Parallel: mark solid (Dirichlet) nodes, solid-major, highest
     // numbered solid first (see note above).
 #pragma omp parallel num_threads(nthreads)
@@ -1398,6 +1405,7 @@ void Geometry::build_mesh_parallel_thread_3d( void )
 	    }
 	}
     }
+    t_solid.stop();
 
     // Fix up any dielectric solid that reaches the box edge -- see the
     // doc comment on override_dielectric_box_boundary_3d(). Must run
@@ -1405,12 +1413,17 @@ void Geometry::build_mesh_parallel_thread_3d( void )
     // node back to "unclaimed", and relies on prepare_3d()'s own
     // decision tree (is_near_solid() checked first, then box edges,
     // then vacuum) to reclassify it exactly like an ordinary free node.
+    Timer t_boxfix;
     override_dielectric_box_boundary_3d();
+    t_boxfix.stop();
 
     // Serial part: mark box boundaries/vacuum and prepare near solid data
+    Timer t_prepare;
     build_mesh_parallel_prepare_3d();
+    t_prepare.stop();
 
     // Parallel: Build near solid data
+    Timer t_nearsolid;
 #pragma omp parallel for num_threads(nthreads) collapse(3) schedule(dynamic,64)
     for( int32_t k = 0; k < _size[2]; k++ ) {
 	for( int32_t j = 0; j < _size[1]; j++ ) {
@@ -1425,6 +1438,13 @@ void Geometry::build_mesh_parallel_thread_3d( void )
 	    }
 	}
     }
+    t_nearsolid.stop();
+
+    ibsimu.message( 1 ) << "Mesh build timing:\n"
+			<< "  Solid tagging          : " << t_solid << "\n"
+			<< "  Dielectric box-edge fix : " << t_boxfix << "\n"
+			<< "  Near-solid prepare (serial): " << t_prepare << "\n"
+			<< "  Near-solid data build   : " << t_nearsolid << "\n";
 }
 
 
@@ -1435,6 +1455,10 @@ void Geometry::build_mesh_parallel_thread_2d( void )
 
     // Start from an all-vacuum mesh.
     memset( _smesh, 0, sizeof(uint32_t)*ntot );
+
+    // See build_mesh_parallel_thread_3d() -- same rationale for using a
+    // full Timer per phase here (runs once per program, not a hot loop).
+    Timer t_solid;
 
     // Parallel: mark solid (Dirichlet) nodes, solid-major, highest
     // numbered solid first (see note above).
@@ -1467,18 +1491,24 @@ void Geometry::build_mesh_parallel_thread_2d( void )
 	    }
 	}
     }
+    t_solid.stop();
 
     // Fix up any dielectric solid that reaches the box edge -- see the
     // doc comment on override_dielectric_box_boundary_3d() (same
     // rationale, 2d/CYL). Must run *before* build_mesh_parallel_prepare_2d()
     // -- see the comment at the equivalent call in
     // build_mesh_parallel_thread_3d().
+    Timer t_boxfix;
     override_dielectric_box_boundary_2d();
+    t_boxfix.stop();
 
     // Serial part: mark box boundaries/vacuum and prepare near solid data
+    Timer t_prepare;
     build_mesh_parallel_prepare_2d();
+    t_prepare.stop();
 
     // Parallel: Build near solid data
+    Timer t_nearsolid;
 #pragma omp parallel for num_threads(nthreads) collapse(2) schedule(dynamic,64)
     for( int32_t j = 0; j < _size[1]; j++ ) {
 	for( int32_t i = 0; i < _size[0]; i++ ) {
@@ -1491,6 +1521,13 @@ void Geometry::build_mesh_parallel_thread_2d( void )
 	    }
 	}
     }
+    t_nearsolid.stop();
+
+    ibsimu.message( 1 ) << "Mesh build timing:\n"
+			<< "  Solid tagging          : " << t_solid << "\n"
+			<< "  Dielectric box-edge fix : " << t_boxfix << "\n"
+			<< "  Near-solid prepare (serial): " << t_prepare << "\n"
+			<< "  Near-solid data build   : " << t_nearsolid << "\n";
 }
 
 

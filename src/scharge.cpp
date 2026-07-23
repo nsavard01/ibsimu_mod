@@ -47,6 +47,7 @@
 #include "trajectory.hpp"
 #include "scharge.hpp"
 #include "ibsimu.hpp"
+#include "geometry.hpp"
 
 
 //#define DEBUG_SCHARGE 1
@@ -193,6 +194,63 @@ void scharge_finalize_pic( MeshScalarField &scharge )
     }
 
     ibsimu.dec_indent();
+}
+
+
+/* Return true if mesh_value's raw tag identifies a genuine solid node
+ * (a real user-defined solid, number >=7 -- not the simulation box
+ * edge itself): either a conductor (SMESH_NODE_ID_DIRICHLET) or a
+ * dielectric interior (SMESH_NODE_ID_PURE_VACUUM/_FIX carrying a
+ * material number in its lower bits -- see
+ * Geometry::build_mesh_parallel_thread_3d()). Pure bitmask check, same
+ * fast path as EpotMatrixSolver::material_number()/is_solid() --
+ * deliberately does not chase the rarer box-edge-reclassified-
+ * dielectric case (self_material_at()'s geometric fallback), since
+ * that only affects a thin boundary layer and this is a bulk cleanup.
+ */
+static bool scharge_is_real_solid_tag( uint32_t mesh_value )
+{
+    uint32_t node_id = mesh_value & SMESH_NODE_ID_MASK;
+    if( node_id == SMESH_NODE_ID_DIRICHLET )
+	return( (mesh_value & SMESH_BOUNDARY_NUMBER_MASK) >= 7 );
+    if( node_id == SMESH_NODE_ID_PURE_VACUUM || node_id == SMESH_NODE_ID_PURE_VACUUM_FIX )
+	return( (mesh_value & SMESH_NEAR_SOLID_INDEX_MASK) >= 7 );
+    return( false );
+}
+
+
+/* See the doc comment in scharge.hpp. */
+void scharge_clear_solid_nodes( MeshScalarField &scharge, const Geometry &geom )
+{
+    switch( geom.geom_mode() ) {
+    case MODE_2D:
+    case MODE_CYL:
+    {
+	for( uint32_t j = 0; j < scharge.size(1); j++ ) {
+	    for( uint32_t i = 0; i < scharge.size(0); i++ ) {
+		if( scharge_is_real_solid_tag( geom.mesh(i,j) ) )
+		    scharge( i, j ) = 0.0;
+	    }
+	}
+	break;
+    }
+    case MODE_3D:
+    {
+	for( uint32_t k = 0; k < scharge.size(2); k++ ) {
+	    for( uint32_t j = 0; j < scharge.size(1); j++ ) {
+		for( uint32_t i = 0; i < scharge.size(0); i++ ) {
+		    if( scharge_is_real_solid_tag( geom.mesh(i,j,k) ) )
+			scharge( i, j, k ) = 0.0;
+		}
+	    }
+	}
+	break;
+    }
+    default:
+    {
+	throw( Error( ERROR_LOCATION, "unsupported geometry mode" ) );
+    }
+    }
 }
 
 
