@@ -1064,22 +1064,48 @@ void GMG_Precond::solve( Vector &x, const Vector &b ) const
     // then keeps them at x=0 throughout, i.e. they are inert). Fixed
     // linear operator, always starting from zero -- same rationale as
     // RBSOR_Precond::solve().
+    //
+    // These four passes (two full-mesh fills, then the dof-sized
+    // scatter in and gather out at the end) used to run single-threaded
+    // while everything inside the V-cycle itself was parallel. That is
+    // not a negligible tail: solve() is called TWICE per BiCGSTAB
+    // iteration, so on a large mesh these serial memory-bound sweeps
+    // showed up as a fixed serial cost on every preconditioner
+    // application. They are all trivially data-parallel -- the fills
+    // write disjoint elements, and _row_to_node is a permutation-like
+    // injective map (each dof owns exactly one distinct mesh node), so
+    // the scatter/gather have no write conflicts either.
     std::vector<double> &x0 = _x[0];
     std::vector<double> &b0 = _b[0];
-    std::fill( x0.begin(), x0.end(), 0.0 );
-    std::fill( b0.begin(), b0.end(), 0.0 );
-    for( int d = 0; d < dof; d++ )
-        b0[ _row_to_node[d] ] = b[d];
 
     uint32_t nthreads = (_nthreads ? _nthreads : (uint32_t)omp_get_max_threads());
 
+    const size_t n0 = x0.size();
+    double *x0p = x0.data();
+    double *b0p = b0.data();
+    const int32_t *r2n = _row_to_node.data();
+    const double *bp = b.get_data();
+
     #pragma omp parallel num_threads(nthreads)
     {
+        #pragma omp for schedule(static) nowait
+        for( size_t n = 0; n < n0; n++ )
+            x0p[n] = 0.0;
+        #pragma omp for schedule(static)
+        for( size_t n = 0; n < b0.size(); n++ )
+            b0p[n] = 0.0;
+
+        #pragma omp for schedule(static)
+        for( int d = 0; d < dof; d++ )
+            b0p[ r2n[d] ] = bp[d];
+
         for( uint32_t c = 0; c < _ncycles; c++ )
             vcycle( 0, x0, b0 );
     }
 
     // Extract the dof-sized solution back out of the embedded vector.
+    double *xp = x.get_data();
+    #pragma omp parallel for num_threads(nthreads) schedule(static)
     for( int d = 0; d < dof; d++ )
-        x[d] = x0[ _row_to_node[d] ];
+        xp[d] = x0p[ r2n[d] ];
 }

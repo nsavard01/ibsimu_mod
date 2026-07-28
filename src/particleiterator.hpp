@@ -188,9 +188,25 @@ public:
 
 	coldata.clear();
 
-	// Construct trajectory representation
-	TrajectoryRep1D *traj = new TrajectoryRep1D[PP::dim()];
-	for( size_t a = 0; a < PP::dim(); a++ ) {
+	// Construct trajectory representation.
+	//
+	// Stack array rather than new[]/delete[]: this function runs once
+	// per accepted ODE step of every particle -- the innermost loop of
+	// the whole mover -- so a heap allocation here is a malloc/free
+	// pair per step, millions of them over a run, for what is at most
+	// three tiny PODs. PP::dim() is 2 (ParticleP2D/ParticlePCyl) or 3
+	// (ParticleP3D), fixed per particle type, so 3 always suffices;
+	// the guard below keeps that honest if a higher-dimensional
+	// particle type is ever added. Also removes the leak that the old
+	// new[] ... delete[] pair had if traj[a].solve() below threw.
+	const size_t ndim = PP::dim();
+	if( ndim > 3 )
+	    // Unreachable for every particle type that exists; PP::dim()
+	    // is an inline function returning a literal, so this folds away
+	    // entirely at -O2 rather than costing a branch per step.
+	    throw( Error( ERROR_LOCATION, "particle dimension > 3 not supported here" ) );
+	TrajectoryRep1D traj[3];
+	for( size_t a = 0; a < ndim; a++ ) {
 	    traj[a].construct( x2[0]-x1[0], 
 			       x1[2*a+1], x1[2*a+2], 
 			       x2[2*a+1], x2[2*a+2] );
@@ -199,7 +215,7 @@ public:
 	}
 
 	// Solve trajectory intersections
-	for( size_t a = 0; a < PP::dim(); a++ ) {
+	for( size_t a = 0; a < ndim; a++ ) {
 
 	    // Mesh number of x1 (start point)
 	    int i = (int)floor( (x1[2*a+1]-mesh.origo(a))/mesh.h() );
@@ -233,7 +249,7 @@ public:
 			PP xcol;
 			double x, v;
 			xcol(0) = x1[0] + K[b]*(x2[0]-x1[0]);
-			for( size_t c = 0; c < PP::dim(); c++ ) {
+			for( size_t c = 0; c < ndim; c++ ) {
 			    traj[c].coord( x, v, K[b] );
 			    if( a == c )
 				xcol[2*c+1] = val; // limit numerical inaccuracy
@@ -261,8 +277,6 @@ public:
 
 	// Sort intersections in increasing time order
 	sort( coldata.begin(), coldata.end() );
-
-	delete[] traj;
 
 	DEBUG_DEC_INDENT();
 	DEBUG_MESSAGE( "Coldata built\n" );

@@ -397,6 +397,10 @@ CRowMatrix::~CRowMatrix()
 
 void CRowMatrix::resize( int n, int m )
 {
+    // Frees _col/_val outright (and may realloc _ptr) -- any cached MKL
+    // handle is left pointing at freed memory.
+    mkl_invalidate();
+
     free( _col );
     free( _val );
     _col = NULL;
@@ -423,9 +427,7 @@ void CRowMatrix::resize( int n, int m )
 
 void CRowMatrix::clear( void )
 {
-    #ifdef USE_MKL
-    _mkl_dirty = true;
-    #endif
+    mkl_invalidate();
     _nz    = 0;
     _asize = 0;
     memset( _ptr, 0, (_n+1)*sizeof(int) );
@@ -448,6 +450,9 @@ inline void CRowMatrix::clear_no_check( int i, int j )
     /* Do nothing if the element does not exist */
     if( a == _ptr[i+1] )
 	return;
+
+    /* Structural change below (element removed, _ptr shifted). */
+    mkl_invalidate();
 
     /* Move data */
     int movesize = _nz-a-1;
@@ -473,6 +478,9 @@ void CRowMatrix::clear_check( int i, int j )
 void CRowMatrix::reserve( int size )
 {
     if( size > _asize ) {
+	// reallocate() moves _col/_val -- any cached MKL handle would be
+	// left holding dangling pointers.
+	mkl_invalidate();
 	_asize = size;
 	reallocate();
     }
@@ -481,9 +489,7 @@ void CRowMatrix::reserve( int size )
 
 void CRowMatrix::set_nz( int nz )
 {
-    #ifdef USE_MKL
-    _mkl_dirty = true;
-    #endif
+    mkl_invalidate();
     if( nz > _asize ) {
 	_asize = nz;
 	reallocate();
@@ -522,6 +528,11 @@ void CRowMatrix::merge( CRowMatrix &mat )
 
 void CRowMatrix::order_ascending( void )
 {
+    /* Permutes _col/_val in place -- no pointer changes, but which
+     * value belongs to which column does change, so a cached MKL
+     * handle (especially an optimized internal copy) is stale. */
+    mkl_invalidate();
+
     /* Sort each row. */
     for( int i = 0; i < _n; i++ )
 	insertion_sort_iv( _col, _val, _ptr[i], _ptr[i+1] );
@@ -555,6 +566,15 @@ inline double CRowMatrix::get_no_check( int i, int j ) const
 
 inline double &CRowMatrix::set_no_check( int i, int j )
 {
+    /* Returns a writable reference either way, so the caller is about
+     * to change a value (existing element) or the structure (new
+     * element) -- both invalidate a cached MKL handle. Marked up front
+     * since we hand out the reference and never see the write itself.
+     * Callers that update many elements in a tight loop should prefer
+     * value_ptr()/values_changed() (see the header) to mark once rather
+     * than per element. */
+    mkl_invalidate();
+
     /* Use existing element if it exists */
     for( int a = _ptr[i]; a < _ptr[i+1]; a++ )
     if( _col[a] == j )
@@ -579,6 +599,18 @@ inline double &CRowMatrix::set_no_check( int i, int j )
 	_ptr[a]++;
 
     return( _val[_ptr[i+1]-1] );
+}
+
+
+int CRowMatrix::value_index( int i, int j ) const
+{
+    if( i < 0 || i >= _n || j < 0 || j >= _m )
+	throw( ErrorRange( ERROR_LOCATION, i, _n, j, _m ) );
+
+    for( int a = _ptr[i]; a < _ptr[i+1]; a++ )
+	if( _col[a] == j )
+	    return( a );
+    return( -1 );
 }
 
 

@@ -239,8 +239,11 @@ bool EpotEfield::dielectric_face_field( int32_t i1, int32_t j1, int32_t k1,
     else
 	alpha = _geom->solid_face_frac( i1, j1, k1, bisect_solid, sign, coord );
 
-    double eps1 = ( mat1 == 0 ) ? 1.0 : _geom->get_boundary( mat1 ).value();
-    double eps2 = ( mat2 == 0 ) ? 1.0 : _geom->get_boundary( mat2 ).value();
+    // boundary(), not get_boundary(): both material numbers came from
+    // dielectric_material_at() so they are valid by construction, and
+    // this runs per staggered field point.
+    double eps1 = ( mat1 == 0 ) ? 1.0 : _geom->boundary( mat1 ).value();
+    double eps2 = ( mat2 == 0 ) ? 1.0 : _geom->boundary( mat2 ).value();
     double eps_eff = 1.0/( alpha/eps1 + (1.0-alpha)/eps2 );
     double flux = eps_eff*(phi1-phi2)/h;
 

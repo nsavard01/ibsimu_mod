@@ -109,7 +109,20 @@ protected:
     Node2DoF               _n2d;           /*!< \brief Nodes to degrees of freedom map. */
     CRowMatrix            *_fd_mat;        /*!< \brief Finite Difference matrix. */
     Vector                *_fd_vec;        /*!< \brief Finite Difference vector. */
-    Vector                *_d_vec;         /*!< \brief Derivative vector for nonlinear solution. */
+
+    /*! \brief Derivative vector for nonlinear solution (the D(X) in
+     *  J = J0 + I*D(X)).
+     *
+     *  Owned by value and resized once per preprocess() rather than
+     *  new'd/delete'd inside every get_resjac() call: that allocated and
+     *  freed a _dof-sized vector on every single Newton iteration, and
+     *  leaked it outright whenever the build_mat_vec() call between the
+     *  new and the delete threw. Cleared at the top of get_resjac()
+     *  instead, which also preserves the old behaviour that rows never
+     *  visited by update_nonlinear_node() (i.e. when no plasma model is
+     *  active) read back as exactly zero.
+     */
+    Vector                 _d_vec;
     const Vector          *_sol;           /*!< \brief Current solution vector. */
 
     MeshScalarField       *_epot;
@@ -168,6 +181,26 @@ protected:
      *  from J0(a,a) each time instead.
      */
     std::vector<double>     _fd_mat_diag0;
+
+    /*! \brief Flat index into _fd_mat's value array of each row's
+     *  diagonal element, resolved once right after the linear build.
+     *
+     *  get_resjac() rewrites the whole Jacobian diagonal on every Newton
+     *  iteration -- twice, in fact: once to restore J0(a,a) before the
+     *  J0*X multiply, once to write J0(a,a)-D(a) afterwards. Going
+     *  through CRowMatrix::set(a,a) means linear-scanning row a to
+     *  locate the diagonal on each of those 2*_dof accesses, i.e. work
+     *  proportional to the whole nonzero count per Newton iteration, with
+     *  a data-dependent inner branch. The positions never move (the
+     *  matrix structure is fixed for the whole preprocess() ..
+     *  postprocess() bracket, and order_ascending() has already run), so
+     *  they are resolved once here and every later sweep becomes a
+     *  direct indexed write into CRowMatrix::value_ptr().
+     *
+     *  Cleared by reset_matrix(), and rebuilt alongside _fd_mat_diag0,
+     *  so it can never outlive the structure it indexes into.
+     */
+    std::vector<int>        _fd_mat_diag_idx;
 
     /*! \brief Accumulated time spent in build_mat_vec()'s one-time-per-
      *  major-cycle linear (geometry+rhs) build -- the part gated by

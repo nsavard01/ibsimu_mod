@@ -118,7 +118,8 @@ void EpotMatrixSolver::Node2DoF::debug_print( std::ostream &os ) const
 
 
 EpotMatrixSolver::EpotMatrixSolver( Geometry &geom )
-    : EpotSolver(geom), _dof(0), _fd_mat(0), _fd_vec(0), _d_vec(0),
+    : EpotSolver(geom), _dof(0), _fd_mat(0), _fd_vec(0),
+      _sol(0),
       _linear_built(false), _fd_vec_base(0),
       _time_linbuild(0.0), _time_nonlin(0.0)
 {
@@ -210,26 +211,26 @@ void EpotMatrixSolver::update_nonlinear_node( uint32_t a, uint32_t i, uint32_t j
 	inplasma = (*_plasma_calc_func)(x);
 
     if( !inplasma ) {
-	(*_d_vec)(a) = 0; // No plasma calculation
+	_d_vec(a) = 0; // No plasma calculation
     } else if( _plasma == PLASMA_PEXP ) {
 	double p = (*_sol)(a);
 	double rhst, drhst;
 	pexp_newton( rhst, drhst, p );
 	(*_fd_vec)(a) += rhst;
-	(*_d_vec)(a) = drhst;
+	_d_vec(a) = drhst;
     } else if( _plasma == PLASMA_NSIMP ) {
 	double p = (*_sol)(a);
 	double rhst, drhst;
 	nsimp_newton( rhst, drhst, p );
 	(*_fd_vec)(a) += rhst;
-	(*_d_vec)(a) = drhst;
+	_d_vec(a) = drhst;
     } else if( _plasma == PLASMA_SHIELD ) {
 	double p = (*_sol)(a);
 	double rhst, drhst;
 	shield_newton( rhst, drhst, p );
 	double R = -(*_scharge)(i,j,k)*_geom.h()*_geom.h()/EPSILON0;
 	(*_fd_vec)(a) += R*rhst;
-	(*_d_vec)(a) = R*drhst;
+	_d_vec(a) = R*drhst;
     }
 }
 
@@ -240,7 +241,10 @@ double EpotMatrixSolver::node_epsilon_r( uint32_t i, uint32_t j, uint32_t k ) co
     uint32_t solid_number = _geom.dielectric_material_at( i, j, k );
     if( solid_number == 0 )
 	return( 1.0 ); // plain vacuum
-    return( _geom.get_boundary( solid_number ).value() );
+    // boundary(), not get_boundary(): solid_number came straight from
+    // dielectric_material_at() so it is valid by construction, and this
+    // runs per node -- no need to copy a Bound or re-range-check it.
+    return( _geom.boundary( solid_number ).value() );
 }
 
 
@@ -324,7 +328,7 @@ double EpotMatrixSolver::vacuum_face_coefficient( int32_t i, int32_t j, int32_t 
     // differs) walking back with the opposite sign instead, and take
     // the complementary fraction.
     uint32_t bisect_solid = ( self_material != 0 ) ? self_material : nb_material;
-    double eps_neighbor = ( nb_material != 0 ) ? _geom.get_boundary( nb_material ).value() : 1.0;
+    double eps_neighbor = ( nb_material != 0 ) ? _geom.boundary( nb_material ).value() : 1.0;
     double alpha;
     if( bisect_solid == self_material )
 	alpha = 1.0 - _geom.solid_face_frac( ni, nj, nk, bisect_solid, -sign, coord );
@@ -1234,6 +1238,9 @@ void EpotMatrixSolver::reset_matrix( void )
     _dof = 0;
     _linear_built = false;
     _fd_mat_diag0.clear();
+    // Must be dropped together with the matrix these index into -- see
+    // _fd_mat_diag_idx's doc comment.
+    _fd_mat_diag_idx.clear();
 
     _n2d.clear();
 }
@@ -1298,6 +1305,11 @@ void EpotMatrixSolver::preprocess( MeshScalarField &epot, const MeshScalarField 
     // Allocate problem matrix and vector
     _fd_mat = new CRowMatrix( _dof, _dof );
     _fd_vec = new Vector( _dof );
+
+    // Sized once here rather than per get_resjac() call; contents are
+    // reset at the top of each of those calls.
+    _d_vec.resize( _dof );
+    _d_vec.clear();
 }
 
 
@@ -1410,9 +1422,30 @@ void EpotMatrixSolver::build_mat_vec( void )
 	// re-derive the Jacobian diagonal fresh each Newton iteration
 	// (J0(a,a) - D(a)) instead of repeatedly subtracting from
 	// whatever the now-persistent _fd_mat's diagonal currently holds.
+	//
+	// Also resolve, once, where each diagonal element physically lives
+	// in the matrix's value array, so get_resjac()'s two per-iteration
+	// diagonal sweeps become direct indexed writes rather than
+	// row-scanning set(a,a) calls -- see _fd_mat_diag_idx's doc
+	// comment. Done after order_ascending() above, and the structure
+	// is fixed from here until the next reset_matrix(), so these
+	// indices stay valid for the whole solve.
 	_fd_mat_diag0.resize( _dof );
-	for( uint32_t a = 0; a < _dof; a++ )
-	    _fd_mat_diag0[a] = _fd_mat->get( a, a );
+	_fd_mat_diag_idx.resize( _dof );
+	for( uint32_t a = 0; a < _dof; a++ ) {
+	    int idx = _fd_mat->value_index( a, a );
+	    if( idx < 0 )
+		// Every free row gets an explicit centre-node link from
+		// add_vacuum_node()/add_near_solid_node()/add_neumann_node(),
+		// so a structurally missing diagonal means the stencil for
+		// this row was never emitted -- a real bug upstream, and one
+		// that would otherwise show up much later as a silently
+		// wrong Jacobian rather than an error here.
+		throw( Error( ERROR_LOCATION, "no diagonal element on matrix row "
+			      + to_string(a) ) );
+	    _fd_mat_diag_idx[a] = idx;
+	    _fd_mat_diag0[a] = _fd_mat->value_ptr()[idx];
+	}
 
 	_linear_built = true;
 	_time_linbuild += std::chrono::duration<double>( Clock::now()-time_t0 ).count();
@@ -1482,9 +1515,15 @@ void EpotMatrixSolver::get_resjac( const CRowMatrix **J, const Vector **R, const
 {
     // Build residual and jacobian from linear matric and vector.
     // Calculate R = J0*X - B(X) and J = J0 + I*D(X)
-    _d_vec = new Vector( _dof );
+    //
+    // _d_vec is a member resized once in preprocess(), not a per-call
+    // allocation. Cleared here so rows that update_nonlinear_node()
+    // never visits (every row, when no plasma model is active) still
+    // read back as exactly zero, exactly as a freshly calloc'd Vector
+    // used to.
+    _d_vec.clear();
 
-    // Construct whole right hand side to _fd_vec, nonlinear component of diagonal 
+    // Construct whole right hand side to _fd_vec, nonlinear component of diagonal
     // to _d_vec and linear part of jacobian to _fd_mat.
     _sol = &X;
     build_mat_vec();
@@ -1495,8 +1534,19 @@ void EpotMatrixSolver::get_resjac( const CRowMatrix **J, const Vector **R, const
     // J0(a,a). Restore the pure linear diagonal before using _fd_mat as
     // J0 for the w = J0*X multiply below, otherwise w would silently
     // pick up the previous iteration's nonlinear correction.
+    //
+    // Written straight into the value array via the diagonal positions
+    // cached in _fd_mat_diag_idx rather than through set(a,a), which
+    // would re-scan row a to find the diagonal on every one of these
+    // 2*_dof accesses -- see _fd_mat_diag_idx's doc comment. Structure
+    // is fixed here (no insertions since order_ascending()), so the
+    // cached indices are valid; values_changed() below tells the matrix
+    // its cached MKL handle is stale, once for the whole sweep instead
+    // of once per element.
+    double *mval = _fd_mat->value_ptr();
     for( uint32_t a = 0; a < _dof; a++ )
-	_fd_mat->set(a,a) = _fd_mat_diag0[a];
+	mval[_fd_mat_diag_idx[a]] = _fd_mat_diag0[a];
+    _fd_mat->values_changed();
 
     // Linear part
     Vector w = (*_fd_mat) * X;
@@ -1507,13 +1557,12 @@ void EpotMatrixSolver::get_resjac( const CRowMatrix **J, const Vector **R, const
 	// Set (not subtract from) the diagonal: it must be re-derived
 	// fresh from the pure-linear J0(a,a) each call, not adjusted
 	// relative to whatever a previous iteration left there.
-	_fd_mat->set(a,a) = _fd_mat_diag0[a] - (*_d_vec)(a);
+	mval[_fd_mat_diag_idx[a]] = _fd_mat_diag0[a] - _d_vec(a);
     }
+    _fd_mat->values_changed();
 
     *J = _fd_mat;
     *R = _fd_vec;
-
-    delete _d_vec;
 }
 
 

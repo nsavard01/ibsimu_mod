@@ -84,6 +84,15 @@ class Bound
     double                    _value;   /*!< \brief Boundary value if constant. */
     const CallbackFunctorD_V *_functor; /*!< \brief Value functor, NULL if constant. */
 
+    /*! \brief Out-of-line cold paths for the inline value() accessors
+     *  above, so that the common constant-value case inlines down to a
+     *  null test plus a load without dragging either the exception
+     *  machinery or the CallbackFunctorD_V definition into every
+     *  translation unit that merely reads a permittivity.
+     */
+    void throw_nonconstant( void ) const;
+    double functor_value( const Vec3D &x ) const;
+
 public:
 
     /*! \brief Constructor for constant value boundary.
@@ -99,8 +108,12 @@ public:
     Bound( std::istream &is );
 
     /*! \brief Return boundary type.
+     *
+     *  Inline: Geometry::dielectric_material_at() calls this on every
+     *  lookup, and that in turn runs per free node per Newton iteration
+     *  and per stencil face during the matrix build.
      */
-    bound_e type( void ) const;
+    bound_e type( void ) const { return( _type ); }
 
     /*! \brief Set constant boundary value.
      */
@@ -111,18 +124,26 @@ public:
      *  This function works only if boundary value is
      *  constant. Otherwise throws an error.
      */
-    double value( void ) const;
+    double value( void ) const {
+	if( _functor )
+	    throw_nonconstant();
+	return( _value );
+    }
 
     /*! \brief Return boundary value at \a x.
      */
-    double value( const Vec3D &x ) const;
+    double value( const Vec3D &x ) const {
+	if( _functor )
+	    return( functor_value( x ) );
+	return( _value );
+    }
 
     /*! \brief Return if boundary value is constant.
      *
      *  Returns true if boundary value is constant and false if it is
      *  a function of location.
      */
-    bool is_constant() const;
+    bool is_constant() const { return( !_functor ); }
 
     /*! \brief Saves data to stream \a os.
      */
@@ -640,8 +661,38 @@ public:
      *  solver (EpotMatrixSolver), surface triangulation (solid_dist(),
      *  below), scharge cleanup -- can share this one answer instead of
      *  each keeping its own copy or cache of the same logic.
+     *
+     *  Defined inline: EpotMatrixSolver::update_nonlinear_node() calls
+     *  this once per free node on every Newton iteration, and
+     *  vacuum_face_coefficient() calls it once per face (six times per
+     *  node in 3D) during the matrix build, so an out-of-line call --
+     *  uninlinable across translation units without LTO -- was pure
+     *  overhead around what is otherwise two array reads and a compare.
      */
-    uint32_t dielectric_material_at( int32_t i, int32_t j, int32_t k ) const;
+    uint32_t dielectric_material_at( int32_t i, int32_t j, int32_t k ) const {
+	uint32_t solid_number = _material[i + j*_size[0] + k*_size[0]*_size[1]];
+	if( solid_number == 0 || _bound[solid_number-1].type() != BOUND_DIELECTRIC )
+	    return( 0 ); // vacuum, or a conductor -- not this function's concern
+	return( solid_number );
+    }
+
+    /*! \brief Non-throwing, non-copying access to boundary \a n's
+     *  definition -- the same object get_boundary() returns, but by
+     *  const reference and without the range check.
+     *
+     *  get_boundary() returns Bound BY VALUE and validates \a n on every
+     *  call, which is the right interface for user code but makes it a
+     *  poor fit for the solver's inner loops (node_epsilon_r() and
+     *  vacuum_face_coefficient() ask for a permittivity per node/face):
+     *  the copy is pointless there, and the potentially-throwing check
+     *  blocks inlining. Callers of this overload are responsible for
+     *  passing an \a n they already know is valid -- in practice one
+     *  that came out of material()/dielectric_material_at(), which can
+     *  only ever return 0 or a real solid number by construction.
+     */
+    const Bound &boundary( uint32_t n ) const {
+	return( _bound[n-1] );
+    }
 
     /*! \brief Returns number from solid mesh array.
      *

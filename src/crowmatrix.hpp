@@ -103,6 +103,37 @@ class CRowMatrix : public Matrix {
     void mkl_build_handle() const;
 #endif
 
+    /*! \brief Mark any cached MKL sparse handle stale.
+     *
+     *  Must be called from EVERY mutation of _ptr/_col/_val -- values,
+     *  structure and reallocation alike -- not just the structural ones.
+     *  The handle created by mkl_sparse_d_create_csr() aliases these
+     *  arrays, and mkl_sparse_optimize() is additionally permitted to
+     *  keep its own reordered copy, so:
+     *
+     *    - a realloc (reserve()/reallocate()) or free (resize()/clear())
+     *      leaves the handle holding dangling pointers -- a use-after-free
+     *      on the next mkl_sparse_d_mv();
+     *    - an in-place value overwrite (set_no_check()'s existing-element
+     *      path, used by EpotMatrixSolver::get_resjac() on every Newton
+     *      iteration to refresh the Jacobian diagonal) may be invisible to
+     *      an optimized internal copy, silently multiplying by a stale
+     *      matrix;
+     *    - a permutation (order_ascending()) changes which value belongs
+     *      to which column without changing any pointer at all.
+     *
+     *  Whether the last two actually bite depends on MKL's internal
+     *  choices for a given version/matrix, which is exactly why this is
+     *  handled defensively rather than relying on today's behaviour.
+     *  Compiles to nothing without USE_MKL.
+     */
+    inline void mkl_invalidate( void ) const
+    {
+#ifdef USE_MKL
+	_mkl_dirty = true;
+#endif
+    }
+
     void reallocate( void );
     void allocate( void );
 
@@ -269,6 +300,49 @@ public:
      *  is defined. Throws ErrorRange exception on range checking errors.
      */
     double &set( int i, int j );
+
+    /*! \brief Return the flat index into the value array of the element
+     *  at (\a i, \a j), or -1 if that element is not stored.
+     *
+     *  Intended to be resolved ONCE for a set of elements whose
+     *  positions are then reused many times -- the canonical case being
+     *  EpotMatrixSolver's Jacobian diagonal, rewritten on every Newton
+     *  iteration. set() has to linear-scan row \a i on every single call
+     *  to find the element, so refreshing d diagonal entries costs
+     *  O(nnz) scanning per sweep; caching these indices once turns each
+     *  later sweep into d direct array writes.
+     *
+     *  Only valid while the matrix STRUCTURE is unchanged. Any call that
+     *  inserts/removes an element or reorders a row (set() on a
+     *  not-yet-present element, clear(), order_ascending(), resize(),
+     *  reserve(), set_row(), construct_add(), ...) invalidates every
+     *  previously returned index. Values may be freely overwritten
+     *  through value_ptr() in the meantime.
+     */
+    int value_index( int i, int j ) const;
+
+    /*! \brief Raw, writable pointer to the value array, for use with
+     *  value_index().
+     *
+     *  Callers writing through this pointer MUST call values_changed()
+     *  afterwards, since bypassing set() also bypasses its automatic
+     *  invalidation of any cached MKL sparse handle. Doing it this way
+     *  round is deliberate: it lets a bulk update mark the matrix stale
+     *  exactly once instead of once per element.
+     */
+    double *value_ptr( void ) { return( _val ); }
+
+    /*! \brief Const overload of value_ptr().
+     */
+    const double *value_ptr( void ) const { return( _val ); }
+
+    /*! \brief Declare that element values were modified directly through
+     *  value_ptr(), so any cached MKL sparse handle must be rebuilt.
+     *
+     *  Not needed after set()/construct_add()/set_row(), which already
+     *  do this themselves.
+     */
+    void values_changed( void ) { mkl_invalidate(); }
 
     /*! \brief Function to set matrix row elements.
      *

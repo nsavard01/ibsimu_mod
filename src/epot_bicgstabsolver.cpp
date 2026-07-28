@@ -50,10 +50,28 @@
 
 using Clock = std::chrono::steady_clock;
 
-// All of these are reset to 0 at the start of every subsolve() call (see
-// its top) so the "Timing summary" printed at the end of subsolve()
-// reflects that one Poisson solve only, not an accumulation across every
-// major cycle of the whole program run.
+/* Per-operation timing of the BiCGSTAB inner loop.
+ *
+ * The breakdown (SpMV vs. preconditioner vs. dot/norm/axpy) is genuinely
+ * useful when tuning a preconditioner, but collecting it costs two
+ * steady_clock::now() calls around every single vector operation -- about
+ * twenty clock reads per BiCGSTAB iteration, each a vDSO call of a few
+ * tens of nanoseconds. That is negligible next to a large 3D SpMV, but it
+ * is pure overhead on small/medium problems where an iteration is itself
+ * only microseconds, and it runs on every iteration of every Newton step
+ * of every major cycle.
+ *
+ * So it is compiled out by default and re-enabled with
+ * -DIBSIMU_SOLVER_TIMING. With it off, IBSIMU_TIME_OP(acc, stmt) expands
+ * to just stmt, the accumulators fold away, and the timing summary at the
+ * end of subsolve() is suppressed.
+ */
+/* The accumulators themselves are always defined (they cost nothing) and
+ * the once-per-solve GMG prepare/construct timers below are always
+ * collected -- it is only the per-ITERATION instrumentation that is
+ * conditional, since that is the only part whose clock reads are
+ * frequent enough to matter. With timing off, the five per-iteration
+ * figures simply stay at zero and the summary says so. */
 static double time_spmv = 0.0;
 static double time_prec = 0.0;
 static double time_dot = 0.0;
@@ -61,6 +79,23 @@ static double time_norm = 0.0;
 static double time_axpy = 0.0;
 static double time_gmg_prepare = 0.0;
 static double time_gmg_construct = 0.0;
+
+#ifdef IBSIMU_SOLVER_TIMING
+
+#define IBSIMU_TIME_OP( acc, stmt )					\
+    do {								\
+	auto _ibsimu_t0 = Clock::now();					\
+	stmt;								\
+	(acc) += std::chrono::duration<double>( Clock::now()-_ibsimu_t0 ).count(); \
+    } while( 0 )
+
+#else
+
+/* (void)&(acc) keeps the accumulator "used" so no -Wunused warning
+ * appears, without emitting any code. */
+#define IBSIMU_TIME_OP( acc, stmt ) do { (void)&(acc); stmt; } while( 0 )
+
+#endif
 
 EpotBiCGSTABSolver::EpotBiCGSTABSolver( Geometry &geom, 
 					double eps, 
@@ -229,29 +264,22 @@ void EpotBiCGSTABSolver::bicgstab( const Matrix &mat, const Vector &rhs, Vector 
     Vector p, phat, s, shat, t, v;
     double maxsize = _geom.size().max();
     double errscale = maxsize*maxsize;
-	auto t0 = Clock::now();
-    double norm_rhs = norm2(rhs);
-	auto t1 = Clock::now();
-    time_norm += std::chrono::duration<double>(t1-t0).count();
+    double norm_rhs;
+    IBSIMU_TIME_OP( time_norm, norm_rhs = norm2(rhs) );
     if( sol.size() != mat.columns() ) {
 	sol.resize( mat.columns() );
 	sol.clear();
     }
 
-	 t0 = Clock::now();
-    Vector r = mat * sol;
-	 t1 = Clock::now();
-	time_spmv += std::chrono::duration<double>(t1-t0).count();
+    Vector r;
+    IBSIMU_TIME_OP( time_spmv, r = mat * sol );
 
     r = rhs - r;
     Vector rtilde = r;
 
     if( norm_rhs == 0.0 )
 	norm_rhs = 1;
-	 t0 = Clock::now();
-    _res = norm2(r) / norm_rhs;
-	 t1 = Clock::now();
-    time_norm += std::chrono::duration<double>(t1-t0).count();
+    IBSIMU_TIME_OP( time_norm, _res = norm2(r) / norm_rhs );
     _err = errscale*_res;
     if( _err <= _eps )
 	return;
@@ -265,74 +293,36 @@ void EpotBiCGSTABSolver::bicgstab( const Matrix &mat, const Vector &rhs, Vector 
 
     uint32_t i = 0; // Local iteration counter
     while( _iter < _imax ) {
-	 t0 = Clock::now();
-	rho_1 = dot_prod( rtilde, r );
-	 t1 = Clock::now();
-    time_dot += std::chrono::duration<double>(t1-t0).count();
+	IBSIMU_TIME_OP( time_dot, rho_1 = dot_prod( rtilde, r ) );
 	if( rho_1 == 0 )
 	    break;
 	if( i == 0 )
 	    p = r;
 	else {
-		 t0 = Clock::now();
 	    beta = (rho_1/rho_2) * (alpha/omega);
-	    p = r + beta * (p - omega * v);
-		 t1 = Clock::now();
-    	time_axpy += std::chrono::duration<double>(t1-t0).count();
+	    IBSIMU_TIME_OP( time_axpy, p = r + beta * (p - omega * v) );
 	}
-	 t0 = Clock::now();
-	pc.solve( phat, p );
-	 t1 = Clock::now();
-    time_prec += std::chrono::duration<double>(t1-t0).count();
-	 t0 = Clock::now();
-	v = mat * phat;
-	 t1 = Clock::now();
-    time_spmv += std::chrono::duration<double>(t1-t0).count();
-	 t0 = Clock::now();
-	alpha = rho_1 / dot_prod( rtilde, v );
-	 t1 = Clock::now();
-    time_dot += std::chrono::duration<double>(t1-t0).count();
-	 t0 = Clock::now();
-	s = r - alpha * v;
-	 t1 = Clock::now();
-    time_axpy += std::chrono::duration<double>(t1-t0).count();
+	IBSIMU_TIME_OP( time_prec, pc.solve( phat, p ) );
+	IBSIMU_TIME_OP( time_spmv, v = mat * phat );
+	IBSIMU_TIME_OP( time_dot, alpha = rho_1 / dot_prod( rtilde, v ) );
+	IBSIMU_TIME_OP( time_axpy, s = r - alpha * v );
 	i++;
 	_iter++;
-	 t0 = Clock::now();
-	_res = norm2(s)/norm_rhs;
-	 t1 = Clock::now();
-    time_norm += std::chrono::duration<double>(t1-t0).count();
+	IBSIMU_TIME_OP( time_norm, _res = norm2(s)/norm_rhs );
 	_err = errscale*_res;
 	if( _err < _eps ) {
-		 t0 = Clock::now();
-	    sol += alpha * phat;
-		 t1 = Clock::now();
-    	time_axpy += std::chrono::duration<double>(t1-t0).count();
+	    IBSIMU_TIME_OP( time_axpy, sol += alpha * phat );
 	    break;
 	}
-	 t0 = Clock::now();
-	pc.solve( shat, s );
-	 t1 = Clock::now();
-    time_prec += std::chrono::duration<double>(t1-t0).count();
-	 t0 = Clock::now();
-	t = mat * shat;
-	 t1 = Clock::now();
-    time_spmv += std::chrono::duration<double>(t1-t0).count();
-	 t0 = Clock::now();
-	omega = dot_prod( t, s ) / dot_prod( t, t );
-	 t1 = Clock::now();
-    time_dot += std::chrono::duration<double>(t1-t0).count();
-	 t0 = Clock::now();
-	sol += alpha * phat + omega * shat;
-	r = s - omega * t;
-	 t1 = Clock::now();
-    time_axpy += std::chrono::duration<double>(t1-t0).count();
+	IBSIMU_TIME_OP( time_prec, pc.solve( shat, s ) );
+	IBSIMU_TIME_OP( time_spmv, t = mat * shat );
+	IBSIMU_TIME_OP( time_dot, omega = dot_prod( t, s ) / dot_prod( t, t ) );
+	IBSIMU_TIME_OP( time_axpy,
+			sol += alpha * phat + omega * shat;
+			r = s - omega * t );
 
 	rho_2 = rho_1;
-	 t0 = Clock::now();
-	_res = norm2(r) / norm_rhs;
-	 t1 = Clock::now();
-    time_norm += std::chrono::duration<double>(t1-t0).count();
+	IBSIMU_TIME_OP( time_norm, _res = norm2(r) / norm_rhs );
 	_err = errscale*_res;
 	if( _err < _eps )
 	    break;
@@ -599,12 +589,19 @@ void EpotBiCGSTABSolver::subsolve( MeshScalarField &epot, const MeshScalarField 
     << "  Linear matrix build   : " << time_linbuild() << " s\n"
     << "  Nonlinear (plasma) update: " << time_nonlin() << " s\n"
     << "  GMG prepare           : " << time_gmg_prepare << " s\n"
-    << "  GMG construct         : " << time_gmg_construct << " s\n"
+    << "  GMG construct         : " << time_gmg_construct << " s\n";
+#ifdef IBSIMU_SOLVER_TIMING
+    ibsimu.message(1)
     << "  SpMV                  : " << time_spmv << " s\n"
     << "  Preconditioner apply  : " << time_prec << " s\n"
     << "  Dot products          : " << time_dot << " s\n"
     << "  Norms                 : " << time_norm << " s\n"
     << "  Vector ops            : " << time_axpy << " s\n";
+#else
+    ibsimu.message(1)
+    << "  (per-iteration SpMV/preconditioner/dot/norm/axpy breakdown not\n"
+    << "   collected -- rebuild with -DIBSIMU_SOLVER_TIMING to enable)\n";
+#endif
 
     // Postprocess and set solution
     set_solution( epot, X );

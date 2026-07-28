@@ -77,10 +77,9 @@ Bound::Bound( bound_e type, const CallbackFunctorD_V *functor )
 }
 
 
-bound_e Bound::type( void ) const
-{
-    return( _type );
-}
+/* type(), value(), value(x) and is_constant() are defined inline in
+ * geometry.hpp -- see their doc comments there. Only their cold paths
+ * live here. */
 
 
 void Bound::set_value( double value )
@@ -90,25 +89,15 @@ void Bound::set_value( double value )
 }
 
 
-double Bound::value( void ) const
+void Bound::throw_nonconstant( void ) const
 {
-    if( _functor )
-	throw( Error( ERROR_LOCATION, "non-constant boundary value" ) );
-    return( _value );
+    throw( Error( ERROR_LOCATION, "non-constant boundary value" ) );
 }
 
 
-double Bound::value( const Vec3D &x ) const
+double Bound::functor_value( const Vec3D &x ) const
 {
-    if( _functor )
-	return( (*_functor)( x ) );
-    return( _value );
-}
-
-
-bool Bound::is_constant() const
-{
-    return( !_functor );
+    return( (*_functor)( x ) );
 }
 
 
@@ -2779,13 +2768,8 @@ int32_t Geometry::surface_trianglec( int32_t i, int32_t j, int32_t k ) const
 
 
 /* See the doc comment in the header. */
-uint32_t Geometry::dielectric_material_at( int32_t i, int32_t j, int32_t k ) const
-{
-    uint32_t solid_number = _material[i + j*_size[0] + k*_size[0]*_size[1]];
-    if( solid_number == 0 || _bound[solid_number-1].type() != BOUND_DIELECTRIC )
-	return( 0 ); // vacuum, or a conductor -- not this function's concern
-    return( solid_number );
-}
+/* dielectric_material_at() is now defined inline in geometry.hpp -- see
+ * its doc comment there for why. */
 
 
 uint8_t Geometry::solid_dist( uint32_t i, uint32_t j, uint32_t k, uint32_t dir ) const
