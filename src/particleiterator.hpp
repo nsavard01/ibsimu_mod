@@ -343,47 +343,41 @@ template <class PP> class ParticleIterator {
     }
 
     /*! \brief Return solid number from nodes around cube (i,j,k).
+     *
+     *  Reads Geometry::material() directly (real solid membership,
+     *  conductor or dielectric alike, independent of any stencil-tag
+     *  reclassification) instead of SMESH_NODE_IS_SOLID_MATERIAL on the
+     *  raw mesh tag, which is blind exactly at a solid that reaches the
+     *  simulation box edge -- see Geometry's _material doc comment.
      */
     uint32_t get_solid( int i, int j, int k ) {
-	uint32_t node;
+	uint32_t m;
 	if( PP::dim() == 2 ) {
-	    node = _pidata._geom->mesh( i, j );
-	    if( SMESH_NODE_IS_SOLID_MATERIAL(node) )
-		return( node & SMESH_BOUNDARY_NUMBER_MASK );
-	    node = _pidata._geom->mesh( i+1, j );
-	    if( SMESH_NODE_IS_SOLID_MATERIAL(node) )
-		return( node & SMESH_BOUNDARY_NUMBER_MASK );
-	    node = _pidata._geom->mesh( i, j+1 );
-	    if( SMESH_NODE_IS_SOLID_MATERIAL(node) )
-		return( node & SMESH_BOUNDARY_NUMBER_MASK );
-	    node = _pidata._geom->mesh( i+1, j+1 );
-	    if( SMESH_NODE_IS_SOLID_MATERIAL(node) )
-		return( node & SMESH_BOUNDARY_NUMBER_MASK );
+	    if( (m = _pidata._geom->material( i, j )) != 0 )
+		return( m );
+	    if( (m = _pidata._geom->material( i+1, j )) != 0 )
+		return( m );
+	    if( (m = _pidata._geom->material( i, j+1 )) != 0 )
+		return( m );
+	    if( (m = _pidata._geom->material( i+1, j+1 )) != 0 )
+		return( m );
 	} else {
-	    node = _pidata._geom->mesh( i, j, k );
-	    if( SMESH_NODE_IS_SOLID_MATERIAL(node) )
-		return( node & SMESH_BOUNDARY_NUMBER_MASK );
-	    node = _pidata._geom->mesh( i+1, j, k );
-	    if( SMESH_NODE_IS_SOLID_MATERIAL(node) )
-		return( node & SMESH_BOUNDARY_NUMBER_MASK );
-	    node = _pidata._geom->mesh( i, j+1, k );
-	    if( SMESH_NODE_IS_SOLID_MATERIAL(node) )
-		return( node & SMESH_BOUNDARY_NUMBER_MASK );
-	    node = _pidata._geom->mesh( i+1, j+1, k );
-	    if( SMESH_NODE_IS_SOLID_MATERIAL(node) )
-		return( node & SMESH_BOUNDARY_NUMBER_MASK );
-	    node = _pidata._geom->mesh( i, j, k+1 );
-	    if( SMESH_NODE_IS_SOLID_MATERIAL(node) )
-		return( node & SMESH_BOUNDARY_NUMBER_MASK );
-	    node = _pidata._geom->mesh( i+1, j, k+1 );
-	    if( SMESH_NODE_IS_SOLID_MATERIAL(node) )
-		return( node & SMESH_BOUNDARY_NUMBER_MASK );
-	    node = _pidata._geom->mesh( i, j+1, k+1 );
-	    if( SMESH_NODE_IS_SOLID_MATERIAL(node) )
-		return( node & SMESH_BOUNDARY_NUMBER_MASK );
-	    node = _pidata._geom->mesh( i+1, j+1, k+1 );
-	    if( SMESH_NODE_IS_SOLID_MATERIAL(node) )
-		return( node & SMESH_BOUNDARY_NUMBER_MASK );
+	    if( (m = _pidata._geom->material( i, j, k )) != 0 )
+		return( m );
+	    if( (m = _pidata._geom->material( i+1, j, k )) != 0 )
+		return( m );
+	    if( (m = _pidata._geom->material( i, j+1, k )) != 0 )
+		return( m );
+	    if( (m = _pidata._geom->material( i+1, j+1, k )) != 0 )
+		return( m );
+	    if( (m = _pidata._geom->material( i, j, k+1 )) != 0 )
+		return( m );
+	    if( (m = _pidata._geom->material( i+1, j, k+1 )) != 0 )
+		return( m );
+	    if( (m = _pidata._geom->material( i, j+1, k+1 )) != 0 )
+		return( m );
+	    if( (m = _pidata._geom->material( i+1, j+1, k+1 )) != 0 )
+		return( m );
 	}
 	return( 0 );
     }
@@ -642,15 +636,13 @@ template <class PP> class ParticleIterator {
     /*! \brief Return if node (i,j) is a solid node
      */
     bool is_solid( int i, int j ) {
-	uint32_t node = _pidata._geom->mesh_check( i, j );
-	return( SMESH_NODE_IS_SOLID_MATERIAL(node) );
+	return( _pidata._geom->material_check( i, j ) != 0 );
     }
 
     /*! \brief Return if node (i,j,k) is a solid node
      */
     bool is_solid( int i, int j, int k ) {
-	uint32_t node = _pidata._geom->mesh_check( i, j, k );
-	return( SMESH_NODE_IS_SOLID_MATERIAL(node) );
+	return( _pidata._geom->material_check( i, j, k ) != 0 );
     }
 
     /*! \brief Handle particle mesh intersection.

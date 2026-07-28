@@ -223,6 +223,60 @@ class Geometry : public Mesh
     uint32_t                  *_smesh;     /*!< \brief Solid mesh array. */
     std::vector<uint8_t>       _nearsolid; /*!< \brief Near solid data. */
 
+    /*! \brief Real solid number (0 = vacuum, else the solid -- conductor
+     *  or dielectric alike -- this node's location truly belongs to),
+     *  for *every* node, independent of and never touched by any
+     *  stencil/tag reclassification (near-solid, box-edge overrides,
+     *  the _FIX bit, etc.).
+     *
+     *  _smesh's own tag is fundamentally a single mutually-exclusive
+     *  "what stencil applies here" category (plain free node, near a
+     *  conductor, box Neumann, box Dirichlet...), and only *sometimes*
+     *  also carries a material number in its unused low bits, for
+     *  whichever category happened to claim the node first. That's
+     *  fine as long as a node only ever needs one of those meanings at
+     *  once, but it breaks at a genuine triple point -- a dielectric
+     *  solid that reaches the simulation box edge *and* has a real
+     *  conductor immediately adjacent there needs to be NEAR_SOLID-
+     *  tagged (to carry that conductor's cached bracket-distance data)
+     *  while *also* remembering its own dielectric material for its
+     *  own permittivity -- two payloads the same node needs at once,
+     *  which no single category tag can hold no matter which spare bit
+     *  pattern is used for it.
+     *
+     *  This array sidesteps that by never being reclassified at all:
+     *  it's populated once, directly from solid membership, at the
+     *  same point build_mesh_parallel_thread_3d()/_2d()/_1d() already
+     *  tests each node against every solid to build the initial tag --
+     *  so filling it in costs one more array write per hit, no extra
+     *  geometry queries. override_dielectric_box_boundary_3d()/_2d()/
+     *  _1d() and the near-solid/box-edge classification passes still
+     *  run exactly as before (they still have their own, unrelated job:
+     *  deciding which *stencil* applies at a node) but none of them
+     *  touch this array, so a node's real material is always readable
+     *  here regardless of what its _smesh tag ends up being reclassified
+     *  to. See material()/material_check().
+     *
+     *  Serialized directly by Geometry::save()/the istream constructor,
+     *  rather than being re-derived from _sdata on load: save_solids is
+     *  false in every real caller in this codebase, so a loaded Geometry's
+     *  _sdata is all NULL placeholders and there is no live solid geometry
+     *  left to re-query via inside() by the time a stream constructor
+     *  would need to rebuild this array.
+     *
+     *  This used to be duplicated ad hoc wherever a caller needed
+     *  material identity independent of tag reclassification --
+     *  EpotMatrixSolver's own _dielectric_mat cache (populated
+     *  reactively via a Geometry::inside() fallback query per node, the
+     *  first time it was needed) being the most complete prior version.
+     *  Promoting the same idea here, populated for free at mesh-build
+     *  time instead of reactively, lets every consumer (the potential
+     *  solver, scharge cleanup, surface triangulation, particle
+     *  collision) share one already-correct answer instead of each
+     *  needing its own cache or living with the tag's blind spots.
+     */
+    std::vector<uint8_t>       _material;
+
     double                     _surface_eps; /*!< \brief Vertec matching tolerance. */
     VTriangleSurface           _surface;   /*!< \brief Triangulated surface. */
     std::vector<int32_t>       _triptr;    /*!< \brief Pointer from mesh cell to first triangle. */
@@ -537,6 +591,57 @@ public:
     uint32_t &mesh( int32_t i, int32_t j, int32_t k ) {
 	return( _smesh[i + j*_size[0] + k*_size[0]*_size[1]] );
     }
+
+    /*! \brief Returns the real solid number node \a i truly belongs to
+     *  (0 = vacuum), independent of any stencil/tag reclassification.
+     *  See _material's doc comment.
+     */
+    uint32_t material( int32_t i ) const { return( _material[i] ); }
+
+    /*! \brief Returns the real solid number node (\a i, \a j) truly
+     *  belongs to (0 = vacuum), independent of any stencil/tag
+     *  reclassification. See _material's doc comment.
+     */
+    uint32_t material( int32_t i, int32_t j ) const {
+	return( _material[i + j*_size[0]] );
+    }
+
+    /*! \brief Returns the real solid number node (\a i, \a j, \a k)
+     *  truly belongs to (0 = vacuum), independent of any stencil/tag
+     *  reclassification. See _material's doc comment.
+     */
+    uint32_t material( int32_t i, int32_t j, int32_t k ) const {
+	return( _material[i + j*_size[0] + k*_size[0]*_size[1]] );
+    }
+
+    /*! \brief Like material(), but returns 0 (never solid) instead of
+     *  throwing/reading out of bounds for a point outside the mesh --
+     *  mirrors mesh_check()'s bounds handling, but since being outside
+     *  the box is never "real solid material" there is no equivalent of
+     *  mesh_check()'s synthetic Dirichlet boundary number to return.
+     */
+    uint32_t material_check( int32_t i ) const;
+
+    /*! \brief See material_check( int32_t i ) const.
+     */
+    uint32_t material_check( int32_t i, int32_t j ) const;
+
+    /*! \brief See material_check( int32_t i ) const.
+     */
+    uint32_t material_check( int32_t i, int32_t j, int32_t k ) const;
+
+    /*! \brief Return the dielectric solid number node (\a i, \a j, \a k)
+     *  truly belongs to, or 0 if it's vacuum or a conductor. Reads
+     *  material() directly (see _material's doc comment) filtered to
+     *  dielectrics only.
+     *
+     *  Public so every consumer that needs a node's material identity
+     *  independent of any stencil/tag reclassification -- the potential
+     *  solver (EpotMatrixSolver), surface triangulation (solid_dist(),
+     *  below), scharge cleanup -- can share this one answer instead of
+     *  each keeping its own copy or cache of the same logic.
+     */
+    uint32_t dielectric_material_at( int32_t i, int32_t j, int32_t k ) const;
 
     /*! \brief Returns number from solid mesh array.
      *

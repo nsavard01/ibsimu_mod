@@ -171,6 +171,84 @@ uint8_t EpotEfield::solid_dist( uint32_t node, uint32_t dir ) const
 }
 
 
+/* Return true and set *e to the correct dielectric-aware field value
+ * if a genuine material interface crosses between node1 (i1,j1,k1)
+ * and node2 (i2,j2,k2, h away in direction sign along axis coord),
+ * given their potentials phi1/phi2. Returns false (leaving *e
+ * untouched) when both sides share the same material -- including
+ * plain vacuum-vacuum -- in which case the caller should use the
+ * plain (phi1-phi2)/h formula instead.
+ *
+ * Only called from the "free space" branch of precalc_1d/2d/3d(),
+ * i.e. only once the caller has already ruled out either node being
+ * NEAR_SOLID or a real (>=7) Dirichlet-tagged conductor -- so both
+ * nodes here are guaranteed to be plain PURE_VACUUM(_FIX)-category
+ * nodes, and Geometry::dielectric_material_at() (which is exactly as
+ * valid for a NEAR_SOLID-vs-NEAR_SOLID pair as for PURE_VACUUM, since
+ * it reads the independent, never-reclassified Geometry::_material
+ * array rather than the stencil tag) is the right and only question
+ * left to ask.
+ *
+ * Physics: across a material interface, D = eps*E is continuous, but
+ * E itself is not -- it jumps by the ratio of permittivities. Given
+ * the true (possibly non-grid-aligned) interface position at
+ * fractional distance alpha*h from node1 towards node2, the flux is
+ *   flux = eps_eff * (phi1-phi2)/h,  eps_eff = 1/(alpha/eps1 + (1-alpha)/eps2)
+ * (same series-combination formula as
+ * EpotMatrixSolver::face_epsilon_alpha(), duplicated here rather than
+ * shared since the two classes don't otherwise depend on each other),
+ * and by flux continuity flux = eps1*E1 = eps2*E2, so the true field
+ * on each side is E1 = flux/eps1, E2 = flux/eps2 -- these differ
+ * whenever eps1 != eps2.
+ *
+ * The staggered field sample point this function is computing for is
+ * always fixed at the geometric midpoint (alpha=0.5) between node1
+ * and node2, regardless of where the true interface actually sits.
+ * Report whichever side's field value actually applies there: if the
+ * interface is farther from node1 than the midpoint (alpha > 0.5),
+ * the midpoint is still in node1's medium (use E1); otherwise the
+ * midpoint has already crossed into node2's medium (use E2). This is
+ * genuinely necessary here (unlike vacuum_face_coefficient(), which
+ * only ever needs one blended coefficient, never a location-specific
+ * field value) -- it is exactly the subtlety of the field not being
+ * evaluated at a node that the fixed conductor near-solid case below
+ * does not have to deal with (there, the medium is uniform vacuum
+ * throughout the whole gap up to the conductor surface, so no second
+ * medium, and hence no such side-selection, is involved).
+ */
+bool EpotEfield::dielectric_face_field( int32_t i1, int32_t j1, int32_t k1,
+					 int32_t i2, int32_t j2, int32_t k2,
+					 int sign, int coord,
+					 double phi1, double phi2, double h,
+					 double &e ) const
+{
+    uint32_t mat1 = _geom->dielectric_material_at( i1, j1, k1 );
+    uint32_t mat2 = _geom->dielectric_material_at( i2, j2, k2 );
+    if( mat1 == mat2 )
+	return( false ); // same medium on both sides (incl. vacuum-vacuum) -- no correction needed
+
+    // Bisect against whichever side is the actual dielectric solid --
+    // see EpotMatrixSolver::vacuum_face_coefficient()'s doc comment
+    // for why the direction/complement has to be chosen this way:
+    // Geometry::solid_face_frac() assumes its (i,j,k) argument is
+    // OUTSIDE the target solid, walking towards it.
+    uint32_t bisect_solid = ( mat1 != 0 ) ? mat1 : mat2;
+    double alpha; // fractional distance (0,1] from node1 to the interface
+    if( bisect_solid == mat1 )
+	alpha = 1.0 - _geom->solid_face_frac( i2, j2, k2, bisect_solid, -sign, coord );
+    else
+	alpha = _geom->solid_face_frac( i1, j1, k1, bisect_solid, sign, coord );
+
+    double eps1 = ( mat1 == 0 ) ? 1.0 : _geom->get_boundary( mat1 ).value();
+    double eps2 = ( mat2 == 0 ) ? 1.0 : _geom->get_boundary( mat2 ).value();
+    double eps_eff = 1.0/( alpha/eps1 + (1.0-alpha)/eps2 );
+    double flux = eps_eff*(phi1-phi2)/h;
+
+    e = ( alpha >= 0.5 ) ? flux/eps1 : flux/eps2;
+    return( true );
+}
+
+
 void EpotEfield::precalc_1d( void )
 {
     double h = _epot.h();
@@ -236,9 +314,14 @@ void EpotEfield::precalc_1d( void )
 	    }
 	    
 	} else {
-	    
-	    // Free space
-	    _F[0][i] = (_epot(i-1) - _epot(i)) / h;
+
+	    // Free space, or a dielectric interface within it -- see
+	    // dielectric_face_field()'s doc comment.
+	    double e;
+	    if( dielectric_face_field( i-1,0,0, i,0,0, 1,0, _epot(i-1), _epot(i), h, e ) )
+		_F[0][i] = e;
+	    else
+		_F[0][i] = (_epot(i-1) - _epot(i)) / h;
 
 	}
     }
@@ -328,9 +411,14 @@ void EpotEfield::precalc_2d( void )
 		}
 
 	    } else {
-		
-		// Free space
-		_F[0][i+j*n] = (_epot(i-1,j) - _epot(i,j)) / h;
+
+		// Free space, or a dielectric interface within it -- see
+		// dielectric_face_field()'s doc comment.
+		double e;
+		if( dielectric_face_field( i-1,j,0, i,j,0, 1,0, _epot(i-1,j), _epot(i,j), h, e ) )
+		    _F[0][i+j*n] = e;
+		else
+		    _F[0][i+j*n] = (_epot(i-1,j) - _epot(i,j)) / h;
 	    }
 	}
 	
@@ -408,9 +496,14 @@ void EpotEfield::precalc_2d( void )
 		}
 
 	    } else {
-		
-		// Free space
-		_F[1][i+j*_epot.size(0)] = (_epot(i,j-1) - _epot(i,j)) / h;
+
+		// Free space, or a dielectric interface within it -- see
+		// dielectric_face_field()'s doc comment.
+		double e;
+		if( dielectric_face_field( i,j-1,0, i,j,0, 1,1, _epot(i,j-1), _epot(i,j), h, e ) )
+		    _F[1][i+j*_epot.size(0)] = e;
+		else
+		    _F[1][i+j*_epot.size(0)] = (_epot(i,j-1) - _epot(i,j)) / h;
 	    }
 	}
 
@@ -504,9 +597,14 @@ void EpotEfield::precalc_3d( void )
 		    }
 		    
 		} else {
-		    
-		    // Free space
-		    _F[0][i+(j+k*_epot.size(1))*n] = (_epot(i-1,j,k) - _epot(i,j,k)) / h;
+
+		    // Free space, or a dielectric interface within it --
+		    // see dielectric_face_field()'s doc comment.
+		    double e;
+		    if( dielectric_face_field( i-1,j,k, i,j,k, 1,0, _epot(i-1,j,k), _epot(i,j,k), h, e ) )
+			_F[0][i+(j+k*_epot.size(1))*n] = e;
+		    else
+			_F[0][i+(j+k*_epot.size(1))*n] = (_epot(i-1,j,k) - _epot(i,j,k)) / h;
 		}
 	    }
 	    
@@ -587,9 +685,14 @@ void EpotEfield::precalc_3d( void )
 		    }
 		    
 		} else {
-		    
-		    // Free space
-		    _F[1][i+(j+k*m)*_epot.size(0)] = (_epot(i,j-1,k) - _epot(i,j,k)) / h;
+
+		    // Free space, or a dielectric interface within it --
+		    // see dielectric_face_field()'s doc comment.
+		    double e;
+		    if( dielectric_face_field( i,j-1,k, i,j,k, 1,1, _epot(i,j-1,k), _epot(i,j,k), h, e ) )
+			_F[1][i+(j+k*m)*_epot.size(0)] = e;
+		    else
+			_F[1][i+(j+k*m)*_epot.size(0)] = (_epot(i,j-1,k) - _epot(i,j,k)) / h;
 		}
 	    }
 
@@ -670,9 +773,14 @@ void EpotEfield::precalc_3d( void )
 		    }
 		    
 		} else {
-		    
-		    // Free space
-		    _F[2][i+(j+k*_epot.size(1))*_epot.size(0)] = (_epot(i,j,k-1) - _epot(i,j,k)) / h;
+
+		    // Free space, or a dielectric interface within it --
+		    // see dielectric_face_field()'s doc comment.
+		    double e;
+		    if( dielectric_face_field( i,j,k-1, i,j,k, 1,2, _epot(i,j,k-1), _epot(i,j,k), h, e ) )
+			_F[2][i+(j+k*_epot.size(1))*_epot.size(0)] = e;
+		    else
+			_F[2][i+(j+k*_epot.size(1))*_epot.size(0)] = (_epot(i,j,k-1) - _epot(i,j,k)) / h;
 		}
 	    }
 

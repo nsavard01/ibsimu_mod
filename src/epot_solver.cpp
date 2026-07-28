@@ -123,35 +123,22 @@ void EpotSolver::set_forced_potential_volume( CallbackFunctorD_V *force_pot_func
 
 namespace {
     /* A dielectric solid's interior is tagged the same way as plain
-     * vacuum (SMESH_NODE_ID_PURE_VACUUM[_FIX], material number in the
-     * lower bits -- see Geometry::build_mesh_parallel_thread_3d()), so
-     * the raw tag is enough to recognise it *unless* it reaches a
-     * simulation box wall: Geometry::override_dielectric_box_boundary_3d()
-     * resets such a node and lets it be reclassified by the ordinary
-     * box-edge decision tree, which retags it SMESH_NODE_ID_NEUMANN or
-     * SMESH_NODE_ID_DIRICHLET -- discarding the material number, even
-     * though the node is still physically dielectric material. That's
-     * the right call for the matrix discretisation itself (the box's
-     * own condition, not the dielectric's bulk equation, applies right
-     * at that surface -- see the doc comment on that function), but it
-     * means the raw tag alone can no longer answer "is this dielectric"
-     * for a Neumann-tagged node. This recovers the answer geometrically
-     * when the fast path (raw tag) can't, mirroring
-     * EpotMatrixSolver::self_material_at()'s slow path -- duplicated
-     * rather than shared since this class doesn't depend on that one
-     * (which is the derived class).
+     * vacuum (SMESH_NODE_ID_PURE_VACUUM[_FIX] -- see
+     * Geometry::build_mesh_parallel_thread_3d()), and a dielectric
+     * reaching a simulation box wall or a real conductor gets its tag
+     * reclassified to SMESH_NODE_ID_NEUMANN/DIRICHLET/NEAR_SOLID there
+     * instead -- the right call for the matrix discretisation itself
+     * (the box's own condition, or the conductor's, applies right at
+     * that surface), but it means the raw tag alone can't answer "is
+     * this dielectric" uniformly. Geometry::dielectric_material_at() is
+     * the shared, always-correct answer to that question -- O(1),
+     * independent of any such reclassification (see its doc comment) --
+     * so this is now a thin wrapper around it rather than its own
+     * fast-path/geometric-fallback pair.
      */
-    bool is_dielectric_at( const Geometry &geom, uint32_t mesh_value, const Vec3D &x )
+    bool is_dielectric_at( const Geometry &geom, uint32_t i, uint32_t j, uint32_t k )
     {
-	uint32_t node_id = mesh_value & SMESH_NODE_ID_MASK;
-	if( ( node_id == SMESH_NODE_ID_PURE_VACUUM || node_id == SMESH_NODE_ID_PURE_VACUUM_FIX ) &&
-	    ( mesh_value & SMESH_NEAR_SOLID_INDEX_MASK ) >= 7 )
-	    return( true ); // fast path -- tag already says dielectric-interior directly
-
-	uint32_t solid_number = geom.inside( x );
-	if( solid_number < 7 )
-	    return( false ); // plain vacuum (or, shouldn't happen, outside the box)
-	return( geom.get_boundary( solid_number ).type() == BOUND_DIELECTRIC );
+	return( geom.dielectric_material_at( i, j, k ) != 0 );
     }
 }
 
@@ -212,7 +199,7 @@ void EpotSolver::set_initial_plasma_rho( MeshScalarField &scharge, double rho,
 		uint32_t mesh = _geom.mesh(i,j,k);
 		if( (mesh & SMESH_NODE_ID_MASK) == SMESH_NODE_ID_DIRICHLET )
 		    continue; // conductor -- eliminated row, never read
-		if( is_dielectric_at( _geom, mesh, x ) )
+		if( is_dielectric_at( _geom, i, j, k ) )
 		    continue; // real dielectric material -- no mobile charge, see above
 
 		scharge(i,j,k) = rho;
@@ -433,14 +420,14 @@ void EpotSolver::preprocess( MeshScalarField &epot )
 		    double val;
 		    if( _force_pot_func2 &&
 			comp_isfinite( (val = (*_force_pot_func2)( x ))) &&
-			!is_dielectric_at( _geom, mesh, x ) ) {
+			!is_dielectric_at( _geom, i, j, k ) ) {
 
 			// Mark as fixed vacuum
 			_geom.mesh(i,j,k) |= SMESH_NODE_FIXED;
 			epot(i,j,k) = val;
 
 		    } else if( _force_pot_func && (*_force_pot_func)( x ) &&
-			       !is_dielectric_at( _geom, mesh, x ) ) {
+			       !is_dielectric_at( _geom, i, j, k ) ) {
 
 			// Mark as fixed vacuum
 			_geom.mesh(i,j,k) |= SMESH_NODE_FIXED;
@@ -449,7 +436,7 @@ void EpotSolver::preprocess( MeshScalarField &epot )
 		    } else if( (_plasma == PLASMA_PEXP_INITIAL ||
 				_plasma == PLASMA_NSIMP_INITIAL) &&
 			       _init_plasma_func && (*_init_plasma_func)( x ) &&
-			       !is_dielectric_at( _geom, mesh, x ) ) {
+			       !is_dielectric_at( _geom, i, j, k ) ) {
 
 			// Mark as fixed vacuum
 			_geom.mesh(i,j,k) |= SMESH_NODE_FIXED;
@@ -479,7 +466,7 @@ void EpotSolver::preprocess( MeshScalarField &epot )
 		    // forcing would otherwise actually apply pay for it.
 		    if( _force_pot_func && (*_force_pot_func)( x ) ) {
 
-			if( !is_dielectric_at( _geom, mesh, x ) ) {
+			if( !is_dielectric_at( _geom, i, j, k ) ) {
 			    // Mark as fixed vacuum
 			    _geom.mesh(i,j,k) = SMESH_NODE_ID_PURE_VACUUM_FIX;
 			    epot(i,j,k) = _force_pot;
@@ -489,7 +476,7 @@ void EpotSolver::preprocess( MeshScalarField &epot )
 				_plasma == PLASMA_NSIMP_INITIAL) &&
 			       _init_plasma_func && (*_init_plasma_func)( x ) ) {
 
-			if( !is_dielectric_at( _geom, mesh, x ) ) {
+			if( !is_dielectric_at( _geom, i, j, k ) ) {
 			    // Mark as fixed vacuum
 			    _geom.mesh(i,j,k) = SMESH_NODE_ID_PURE_VACUUM_FIX;
 			    epot(i,j,k) = _Up;

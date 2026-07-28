@@ -595,8 +595,6 @@ void EpotBiCGSTABSolver::subsolve( MeshScalarField &epot, const MeshScalarField 
     // program run. Matrix-build figures come from EpotMatrixSolver
     // (this class' base) via build_mat_vec()'s own timing.
     ibsimu.message(1) << "\nTiming summary:\n";
-    if( time_dielectric_cache() > 0.0 )
-	ibsimu.message(1) << "  Dielectric material cache (one-time): " << time_dielectric_cache() << " s\n";
     ibsimu.message(1)
     << "  Linear matrix build   : " << time_linbuild() << " s\n"
     << "  Nonlinear (plasma) update: " << time_nonlin() << " s\n"

@@ -79,6 +79,12 @@ class EpotEfield : public VectorField {
 
     uint8_t solid_dist( uint32_t node, uint32_t dir ) const;
 
+    bool dielectric_face_field( int32_t i1, int32_t j1, int32_t k1,
+                                 int32_t i2, int32_t j2, int32_t k2,
+                                 int sign, int coord,
+                                 double phi1, double phi2, double h,
+                                 double &e ) const;
+
     void copy_1d( const EpotEfield &efield );
     void copy_2d( const EpotEfield &efield );
     void copy_3d( const EpotEfield &efield );

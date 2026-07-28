@@ -62,7 +62,10 @@ void scharge_finalize_pic( MeshScalarField &scharge );
 
 
 /*! \brief Zero deposited space charge at every real solid mesh node
- *  (conductor or dielectric interior alike, solid number >=7).
+ *  (conductor or dielectric interior alike, solid number >=7), as
+ *  identified by Geometry::material() -- correct everywhere, including
+ *  at the simulation box's own outer shell, independent of any
+ *  stencil/tag reclassification there.
  *
  *  scharge_add_from_trajectory_pic()/scharge_add_step_pic() have no
  *  notion of Geometry at all: they bilinearly/trilinearly spread a
@@ -70,10 +73,16 @@ void scharge_finalize_pic( MeshScalarField &scharge );
  *  currently occupies, purely by position, regardless of whether some
  *  of those corners happen to lie inside a solid. That's harmless for
  *  a conductor -- its row is Dirichlet-eliminated, so this rhs term is
- *  never read -- but not for a dielectric interior, which is an
- *  ordinary free row whose own equation is supposed to be charge-free
- *  (see add_vacuum_node()'s rhs comment in epot_matrixsolver.cpp): any
- *  charge that leaks in there directly corrupts that node's potential.
+ *  never read -- and, since EpotMatrixSolver::add_vacuum_node() guards
+ *  its own rhs term on self_material==0, it is also harmless for a
+ *  dielectric interior: that guard makes the potential solve correct
+ *  regardless of what scharge holds at a dielectric node. So this
+ *  function is not load-bearing for the solve either way -- it exists
+ *  for diagnostic/plotting cleanliness (so a scharge plot doesn't show
+ *  stray PIC-deposited values sitting inside visibly solid material),
+ *  which Geometry::material() now gives for free and without any of
+ *  the box-edge blind spot an earlier, raw-tag-based version of this
+ *  check had.
  *
  *  Call this once after scharge_finalize_pic()/scharge_finalize_linear()/
  *  scharge_finalize_step_pic(), while \a scharge and \a geom still

@@ -119,8 +119,8 @@ void EpotMatrixSolver::Node2DoF::debug_print( std::ostream &os ) const
 
 EpotMatrixSolver::EpotMatrixSolver( Geometry &geom )
     : EpotSolver(geom), _dof(0), _fd_mat(0), _fd_vec(0), _d_vec(0),
-      _linear_built(false), _fd_vec_base(0), _dielectric_mat_built(false),
-      _time_dielectric_cache(0.0), _time_linbuild(0.0), _time_nonlin(0.0)
+      _linear_built(false), _fd_vec_base(0),
+      _time_linbuild(0.0), _time_nonlin(0.0)
 {
 
 }
@@ -196,18 +196,15 @@ void EpotMatrixSolver::update_nonlinear_node( uint32_t a, uint32_t i, uint32_t j
     // solving the linear Laplace equation it should. This also catches
     // a dielectric node reclassified NEAR_SOLID/NEUMANN at a box edge
     // or next to a conductor, where the raw tag alone no longer says
-    // "dielectric" -- see self_material_at()'s doc comment.
+    // "dielectric".
     //
-    // Read from the _dielectric_mat cache (populated once, ever -- see
-    // its doc comment) instead of calling self_material_at() directly
-    // here: this function runs every Newton iteration (and every
-    // step-size backtracking re-evaluation) for every free node, and
-    // self_material_at()'s fallback for anything but a directly-tagged
-    // dielectric node is a real Geometry::inside() query -- paying
-    // that on every node, every such call, is what caused the severe
-    // per-solve slowdown. _dielectric_mat is indexed by the full flat
-    // mesh index, not the dof row a.
-    bool inplasma = _dielectric_mat[(k*_geom.size(1)+j)*_geom.size(0)+i] == 0;
+    // Geometry::dielectric_material_at() is an O(1) read (see its doc
+    // comment) that's already correct regardless of any such
+    // reclassification, computed once for free during mesh build --
+    // this function runs every Newton iteration (and every step-size
+    // backtracking re-evaluation) for every free node, so it matters
+    // that this isn't a Geometry::inside() query repeated on every call.
+    bool inplasma = _geom.dielectric_material_at( i, j, k ) == 0;
     if( inplasma && _plasma_calc_func )
 	// Test if within plasma calculation region
 	inplasma = (*_plasma_calc_func)(x);
@@ -237,36 +234,10 @@ void EpotMatrixSolver::update_nonlinear_node( uint32_t a, uint32_t i, uint32_t j
 }
 
 
-/* See the doc comment on material_number() in the header. */
-uint32_t EpotMatrixSolver::material_number( uint32_t mesh_value )
-{
-    uint32_t node_id = mesh_value & SMESH_NODE_ID_MASK;
-    if( node_id != SMESH_NODE_ID_PURE_VACUUM && node_id != SMESH_NODE_ID_PURE_VACUUM_FIX )
-	return( 0 ); // near-solid/Neumann/Dirichlet/fine-boundary: never inside a dielectric here
-    return( mesh_value & SMESH_NEAR_SOLID_INDEX_MASK );
-}
-
-
-/* See the doc comment on self_material_at() in the header. */
-uint32_t EpotMatrixSolver::self_material_at( uint32_t mesh_value, const Vec3D &x ) const
-{
-    uint32_t mat = material_number( mesh_value );
-    if( mat != 0 )
-	return( mat ); // fast path -- tag already says dielectric-interior directly
-
-    uint32_t solid_number = _geom.inside( x );
-    if( solid_number < 7 )
-	return( 0 ); // plain vacuum, or (shouldn't happen for a real mesh node) outside the box
-    if( _geom.get_boundary( solid_number ).type() != BOUND_DIELECTRIC )
-	return( 0 ); // a conductor -- not this function's concern, treat as vacuum
-    return( solid_number );
-}
-
-
 /* See the doc comment on node_epsilon_r() in the header. */
-double EpotMatrixSolver::node_epsilon_r( uint32_t mesh_value ) const
+double EpotMatrixSolver::node_epsilon_r( uint32_t i, uint32_t j, uint32_t k ) const
 {
-    uint32_t solid_number = material_number( mesh_value );
+    uint32_t solid_number = _geom.dielectric_material_at( i, j, k );
     if( solid_number == 0 )
 	return( 1.0 ); // plain vacuum
     return( _geom.get_boundary( solid_number ).value() );
@@ -322,22 +293,16 @@ double EpotMatrixSolver::vacuum_face_coefficient( int32_t i, int32_t j, int32_t 
 	return( eps_self / alpha );
     }
 
-    // The neighbour's material_number() alone is not enough here: a
-    // Neumann (or near-solid/fine-boundary) neighbour's own tag may
-    // itself have been overridden away from a dielectric tag that
-    // reached that node (see self_material_at()'s doc comment) -- e.g.
-    // a Neumann side wall at a z-level that a dielectric slab varying
-    // along z actually occupies there. Recover it via the
-    // _dielectric_mat cache (populated once, ever, for the whole mesh
-    // -- see its doc comment) instead of calling self_material_at()
-    // directly: this function runs once per face of every
-    // vacuum/near-solid/Neumann node during the one-time-per-major-
-    // cycle linear build, so an on-demand Geometry::inside() fallback
-    // here (repeated for up to 6 faces per node) was the single
-    // largest remaining source of redundant per-cycle geometry
-    // queries once update_nonlinear_node()'s own copy was fixed.
-    uint32_t n_full = ((uint32_t)nk*_geom.size(1) + (uint32_t)nj)*_geom.size(0) + (uint32_t)ni;
-    uint32_t nb_material = _dielectric_mat[n_full];
+    // The neighbour's raw tag alone is not enough here: a Neumann (or
+    // near-solid/fine-boundary) neighbour's own tag may itself have
+    // been overridden away from a dielectric tag that reached that
+    // node -- e.g. a Neumann side wall at a z-level that a dielectric
+    // slab varying along z actually occupies there.
+    // Geometry::dielectric_material_at() recovers the true answer
+    // directly (O(1), independent of any such reclassification -- see
+    // its doc comment), so no on-demand Geometry::inside() fallback or
+    // solver-private cache is needed here at all.
+    uint32_t nb_material = _geom.dielectric_material_at( ni, nj, nk );
     if( nb_material == self_material )
 	return( eps_self ); // same medium on both sides of this face -- no correction needed
 
@@ -390,9 +355,8 @@ void EpotMatrixSolver::add_vacuum_node( uint32_t i, uint32_t j, uint32_t k, cons
     // node) at an arbitrary sub-cell position is not yet corrected this
     // way -- see vacuum_face_coefficient()'s doc comment for that
     // scoped limitation.
-    uint32_t self_mesh = _geom.mesh(i,j,k);
-    uint32_t self_material = material_number( self_mesh );
-    double eps_self = node_epsilon_r( self_mesh );
+    uint32_t self_material = _geom.dielectric_material_at( i, j, k );
+    double eps_self = node_epsilon_r( i, j, k );
     double cof = 0.0;
 
     switch( _geom.geom_mode() ) {
@@ -454,11 +418,23 @@ void EpotMatrixSolver::add_vacuum_node( uint32_t i, uint32_t j, uint32_t k, cons
     // Right hand side. Left as-is (no epsilon_r factor) even inside a
     // dielectric: this is the flux-conservative form of
     // div(eps*grad(phi)) = -rho/eps0, so the permittivity belongs
-    // entirely on the coefficients above, not the rhs -- and rho
-    // (scharge) should be exactly zero inside a solid dielectric's
-    // bulk in any case, since particles are absorbed at solid surfaces
-    // rather than depositing charge past them.
-    if( _plasma != PLASMA_SHIELD )
+    // entirely on the coefficients above, not the rhs.
+    //
+    // self_material == 0 guards this rather than trusting scharge to
+    // already be zero inside a dielectric's bulk: PIC/linear deposition
+    // has no notion of Geometry at all (see scharge_clear_solid_nodes()'s
+    // doc comment in scharge.hpp), so without this guard, correctness
+    // here would depend on every scharge-producing code path upstream
+    // remembering to clean solid nodes out first -- exactly the kind of
+    // cross-module invariant that's easy to silently break later. This
+    // is a genuine dielectric interior node (this function is shared
+    // between plain vacuum and dielectric interior -- see the dielectric
+    // material/permittivity comment above), so it truly has no free
+    // charge in its own bulk equation, unlike add_near_solid_node()'s and
+    // add_neumann_node()'s unconditional reads of the same scharge term,
+    // which are genuine vacuum locations that can legitimately have real
+    // nearby charge and must keep reading it.
+    if( _plasma != PLASMA_SHIELD && self_material == 0 )
 	(*_fd_vec)(a) += -(*_scharge)(i,j,k)*_geom.h()*_geom.h()/EPSILON0;
 }
 
@@ -505,8 +481,8 @@ void EpotMatrixSolver::add_near_solid_node_1d( uint32_t i, const Vec3D &x )
     } else {
 	bool xm_conductor = sflag & 0x01;
 	bool xp_conductor = sflag & 0x02;
-	bool xm_dielectric = !xm_conductor && dielectric_material_at(i-1,0,0) != 0;
-	bool xp_dielectric = !xp_conductor && dielectric_material_at(i+1,0,0) != 0;
+	bool xm_dielectric = !xm_conductor && _geom.dielectric_material_at(i-1,0,0) != 0;
+	bool xp_dielectric = !xp_conductor && _geom.dielectric_material_at(i+1,0,0) != 0;
 
 	if( xm_dielectric || xp_dielectric ) {
 	    double wm = xm_conductor ? 1.0/alpha :
@@ -564,8 +540,8 @@ void EpotMatrixSolver::add_near_solid_node_2d( uint32_t i, uint32_t j, const Vec
     } else if( sflag & 0x03 ) {
 	bool xm_conductor = sflag & 0x01;
 	bool xp_conductor = sflag & 0x02;
-	bool xm_dielectric = !xm_conductor && dielectric_material_at(i-1,j,0) != 0;
-	bool xp_dielectric = !xp_conductor && dielectric_material_at(i+1,j,0) != 0;
+	bool xm_dielectric = !xm_conductor && _geom.dielectric_material_at(i-1,j,0) != 0;
+	bool xp_dielectric = !xp_conductor && _geom.dielectric_material_at(i+1,j,0) != 0;
 
 	if( xm_dielectric || xp_dielectric ) {
 	    double wm = xm_conductor ? 1.0/alpha :
@@ -614,8 +590,8 @@ void EpotMatrixSolver::add_near_solid_node_2d( uint32_t i, uint32_t j, const Vec
     } else if( sflag & 0x0c ) {
 	bool ym_conductor = sflag & 0x04;
 	bool yp_conductor = sflag & 0x08;
-	bool ym_dielectric = !ym_conductor && dielectric_material_at(i,j-1,0) != 0;
-	bool yp_dielectric = !yp_conductor && dielectric_material_at(i,j+1,0) != 0;
+	bool ym_dielectric = !ym_conductor && _geom.dielectric_material_at(i,j-1,0) != 0;
+	bool yp_dielectric = !yp_conductor && _geom.dielectric_material_at(i,j+1,0) != 0;
 
 	if( ym_dielectric || yp_dielectric ) {
 	    double wm = ym_conductor ? 1.0/alpha :
@@ -684,8 +660,8 @@ void EpotMatrixSolver::add_near_solid_node_cyl( uint32_t i, uint32_t j, const Ve
     } else if( sflag & 0x03 ) {
 	bool xm_conductor = sflag & 0x01;
 	bool xp_conductor = sflag & 0x02;
-	bool xm_dielectric = !xm_conductor && dielectric_material_at(i-1,j,0) != 0;
-	bool xp_dielectric = !xp_conductor && dielectric_material_at(i+1,j,0) != 0;
+	bool xm_dielectric = !xm_conductor && _geom.dielectric_material_at(i-1,j,0) != 0;
+	bool xp_dielectric = !xp_conductor && _geom.dielectric_material_at(i+1,j,0) != 0;
 
 	if( xm_dielectric || xp_dielectric ) {
 	    double wm = xm_conductor ? 1.0/alpha :
@@ -813,8 +789,8 @@ void EpotMatrixSolver::add_near_solid_node_3d( uint32_t i, uint32_t j, uint32_t 
 	// case below and the existing Taylor formula is used unchanged.
 	bool xm_conductor = sflag & 0x01;
 	bool xp_conductor = sflag & 0x02;
-	bool xm_dielectric = !xm_conductor && dielectric_material_at(i-1,j,k) != 0;
-	bool xp_dielectric = !xp_conductor && dielectric_material_at(i+1,j,k) != 0;
+	bool xm_dielectric = !xm_conductor && _geom.dielectric_material_at(i-1,j,k) != 0;
+	bool xp_dielectric = !xp_conductor && _geom.dielectric_material_at(i+1,j,k) != 0;
 
 	if( xm_dielectric || xp_dielectric ) {
 	    double wm = xm_conductor ? 1.0/alpha :
@@ -874,8 +850,8 @@ void EpotMatrixSolver::add_near_solid_node_3d( uint32_t i, uint32_t j, uint32_t 
 	// dielectric on opposite sides of the *same* axis).
 	bool ym_conductor = sflag & 0x04;
 	bool yp_conductor = sflag & 0x08;
-	bool ym_dielectric = !ym_conductor && dielectric_material_at(i,j-1,k) != 0;
-	bool yp_dielectric = !yp_conductor && dielectric_material_at(i,j+1,k) != 0;
+	bool ym_dielectric = !ym_conductor && _geom.dielectric_material_at(i,j-1,k) != 0;
+	bool yp_dielectric = !yp_conductor && _geom.dielectric_material_at(i,j+1,k) != 0;
 
 	if( ym_dielectric || yp_dielectric ) {
 	    double wm = ym_conductor ? 1.0/alpha :
@@ -925,8 +901,8 @@ void EpotMatrixSolver::add_near_solid_node_3d( uint32_t i, uint32_t j, uint32_t 
 	// See the X-axis branch above.
 	bool zm_conductor = sflag & 0x10;
 	bool zp_conductor = sflag & 0x20;
-	bool zm_dielectric = !zm_conductor && dielectric_material_at(i,j,k-1) != 0;
-	bool zp_dielectric = !zp_conductor && dielectric_material_at(i,j,k+1) != 0;
+	bool zm_dielectric = !zm_conductor && _geom.dielectric_material_at(i,j,k-1) != 0;
+	bool zp_dielectric = !zp_conductor && _geom.dielectric_material_at(i,j,k+1) != 0;
 
 	if( zm_dielectric || zp_dielectric ) {
 	    double wm = zm_conductor ? 1.0/alpha :
@@ -990,15 +966,16 @@ void EpotMatrixSolver::add_neumann_node_1d( uint32_t i, const Vec3D &x )
     uint32_t a = _n2d(i) & N2D_INDEX_MASK;
     uint8_t bindex = boundary_index(i);
 
-    // See the doc comment on self_material_at() -- a Neumann box-wall
-    // node's own mesh tag generally cannot carry material info (it may
-    // have been overridden away from a dielectric tag that reached
-    // this edge), so its permittivity has to be recovered from the
-    // geometry directly rather than from material_number() alone. This
-    // matters whenever some *other* axis has a material boundary near
-    // this node -- in 1D there is only one axis, so this mainly keeps
-    // add_neumann_node_1d() consistent with the other geom modes.
-    uint32_t self_material = self_material_at( _geom.mesh(i), x );
+    // A Neumann box-wall node's own mesh tag generally cannot carry
+    // material info (it may have been overridden away from a dielectric
+    // tag that reached this edge), so its permittivity has to be
+    // recovered from Geometry::dielectric_material_at() (O(1), correct
+    // regardless of that reclassification) rather than the raw tag
+    // alone. This matters whenever some *other* axis has a material
+    // boundary near this node -- in 1D there is only one axis, so this
+    // mainly keeps add_neumann_node_1d() consistent with the other geom
+    // modes.
+    uint32_t self_material = _geom.dielectric_material_at( i, 0, 0 );
     double eps_self = ( self_material == 0 ) ? 1.0 : _geom.get_boundary( self_material ).value();
 
     if( bindex & EPOT_SOLVER_BXMIN ) {
@@ -1020,11 +997,11 @@ void EpotMatrixSolver::add_neumann_node_2d( uint32_t i, uint32_t j, const Vec3D 
     uint32_t a = _n2d(i,j) & N2D_INDEX_MASK;
     uint8_t bindex = boundary_index(i,j);
 
-    // See add_neumann_node_1d()/self_material_at() -- recover this
-    // node's true permittivity even though its own tag may not carry
-    // it, since a material boundary along the *other* axis can sit
-    // right next to a Neumann-tagged node on this one.
-    uint32_t self_material = self_material_at( _geom.mesh(i,j), x );
+    // See add_neumann_node_1d() -- recover this node's true permittivity
+    // even though its own tag may not carry it, since a material
+    // boundary along the *other* axis can sit right next to a
+    // Neumann-tagged node on this one.
+    uint32_t self_material = _geom.dielectric_material_at( i, j, 0 );
     double eps_self = ( self_material == 0 ) ? 1.0 : _geom.get_boundary( self_material ).value();
     double cof = 0.0;
 
@@ -1073,8 +1050,8 @@ void EpotMatrixSolver::add_neumann_node_cyl( uint32_t i, uint32_t j, const Vec3D
     uint32_t a = _n2d(i,j) & N2D_INDEX_MASK;
     uint8_t bindex = boundary_index(i,j);
 
-    // See add_neumann_node_1d()/self_material_at().
-    uint32_t self_material = self_material_at( _geom.mesh(i,j), x );
+    // See add_neumann_node_1d().
+    uint32_t self_material = _geom.dielectric_material_at( i, j, 0 );
     double eps_self = ( self_material == 0 ) ? 1.0 : _geom.get_boundary( self_material ).value();
     double cof = 0.0;
 
@@ -1149,8 +1126,8 @@ void EpotMatrixSolver::add_neumann_node_3d( uint32_t i, uint32_t j, uint32_t k, 
     uint32_t a = _n2d(i,j,k) & N2D_INDEX_MASK;
     uint8_t bindex = boundary_index(i,j,k);
 
-    // See add_neumann_node_1d()/self_material_at().
-    uint32_t self_material = self_material_at( _geom.mesh(i,j,k), x );
+    // See add_neumann_node_1d().
+    uint32_t self_material = _geom.dielectric_material_at( i, j, k );
     double eps_self = ( self_material == 0 ) ? 1.0 : _geom.get_boundary( self_material ).value();
     double cof = 0.0;
 
@@ -1331,39 +1308,15 @@ void EpotMatrixSolver::build_mat_vec( void )
 
     int nthreads = (int)ibsimu.get_thread_count();
 
-    if( !_dielectric_mat_built ) {
-
-	auto time_t0 = Clock::now();
-
-	// One-time (ever, not per major cycle -- see _dielectric_mat's
-	// and _dielectric_mat_built's doc comments) precomputation of
-	// every mesh node's dielectric material, so update_nonlinear_node()
-	// and vacuum_face_coefficient() can both look it up in O(1)
-	// afterward instead of repeatedly re-running self_material_at()'s
-	// Geometry::inside() fallback -- for the entire mesh, up to 7
-	// times per node (once for self, once for each face's neighbour),
-	// every major cycle.
-	uint32_t meshsize = _geom.size(0)*_geom.size(1)*_geom.size(2);
-	_dielectric_mat.resize( meshsize );
-
-#pragma omp parallel for num_threads(nthreads) collapse(3) schedule(dynamic,64)
-	for( uint32_t k = 0; k < _geom.size(2); k++ ) {
-	    for( uint32_t j = 0; j < _geom.size(1); j++ ) {
-		for( uint32_t i = 0; i < _geom.size(0); i++ ) {
-
-		    Vec3D x( _geom.origo(0) + _geom.h()*i,
-			     _geom.origo(1) + _geom.h()*j,
-			     _geom.origo(2) + _geom.h()*k );
-
-		    uint32_t a = (k*_geom.size(1)+j)*_geom.size(0)+i;
-		    _dielectric_mat[a] = self_material_at( _geom.mesh(a), x );
-		}
-	    }
-	}
-
-	_dielectric_mat_built = true;
-	_time_dielectric_cache += std::chrono::duration<double>( Clock::now()-time_t0 ).count();
-    }
+    // Every mesh node's dielectric material used to be precomputed here,
+    // once ever, into a solver-private _dielectric_mat cache (each entry
+    // populated via self_material_at()'s Geometry::inside() fallback,
+    // since the raw tag alone wasn't always enough -- see
+    // Geometry::dielectric_material_at()'s doc comment). That's no
+    // longer needed: Geometry now populates the same information into
+    // its own material() array for free during mesh build, so
+    // update_nonlinear_node()/vacuum_face_coefficient()/add_vacuum_node()
+    // etc. just call Geometry::dielectric_material_at(i,j,k) directly.
 
     if( !_linear_built ) {
 

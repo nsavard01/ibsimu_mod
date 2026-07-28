@@ -182,6 +182,7 @@ Geometry::Geometry( geom_mode_e geom_mode, Int3D size, Vec3D origo, double h )
 
     _built = false;
     _smesh = new uint32_t[_size[0]*_size[1]*_size[2]];
+    _material.assign( (size_t)_size[0]*_size[1]*_size[2], 0 );
 
     ibsimu.message( 1 ) << "Done\n";
     ibsimu.dec_indent();
@@ -223,6 +224,17 @@ Geometry::Geometry( std::istream &is )
     _nearsolid.resize( nearsolidsize );
     read_compressed_block( is, sizeof(uint8_t)*nearsolidsize,
 			   (int8_t *)&_nearsolid[0] );
+
+    // _material is read back directly rather than re-derived via
+    // populate_material_array() -- that function calls Solid::inside()
+    // through _sdata, but _sdata was just loaded above as all NULL
+    // placeholders whenever this file was saved with save_solids=false
+    // (the only mode any real caller in this codebase actually uses), so
+    // there is no live solid geometry left to query. See Geometry::save()'s
+    // matching write and _material's own doc comment.
+    _material.resize( (size_t)_size[0]*_size[1]*_size[2] );
+    read_compressed_block( is, sizeof(uint8_t)*_material.size(),
+			   (int8_t *)&_material[0] );
 
     ibsimu.dec_indent();
 }
@@ -433,6 +445,30 @@ uint32_t Geometry::mesh_check( int32_t i, int32_t j, int32_t k ) const
 	return( SMESH_NODE_ID_DIRICHLET | 6 );
 
     return( _smesh[i + _size[0]*(j + k*_size[1])] );
+}
+
+
+uint32_t Geometry::material_check( int32_t i ) const
+{
+    if( i < 0 || i >= _size[0] )
+	return( 0 ); // outside the box is never real solid material
+    return( _material[i] );
+}
+
+
+uint32_t Geometry::material_check( int32_t i, int32_t j ) const
+{
+    if( i < 0 || i >= _size[0] || j < 0 || j >= _size[1] )
+	return( 0 );
+    return( _material[i + j*_size[0]] );
+}
+
+
+uint32_t Geometry::material_check( int32_t i, int32_t j, int32_t k ) const
+{
+    if( i < 0 || i >= _size[0] || j < 0 || j >= _size[1] || k < 0 || k >= _size[2] )
+	return( 0 );
+    return( _material[i + j*_size[0] + k*_size[0]*_size[1]] );
 }
 
 
@@ -1352,6 +1388,7 @@ void Geometry::build_mesh_parallel_thread_3d( void )
 
     // Start from an all-vacuum mesh.
     memset( _smesh, 0, sizeof(uint32_t)*ntot );
+    _material.assign( ntot, 0 );
 
     // Phase timing: this whole function runs once (or a handful of
     // times at most) per program run, so a full Timer per phase (each
@@ -1398,8 +1435,15 @@ void Geometry::build_mesh_parallel_thread_3d( void )
 			    continue;
 
 			Vec3D x( i*_h+_origo[0], j*_h+_origo[1], k*_h+_origo[2] );
-			if( solid->inside( x ) )
+			if( solid->inside( x ) ) {
 			    mesh(i,j,k) = nid;
+			    // Record true solid membership independent of
+			    // the tag above -- see _material's doc comment.
+			    // Same "still unclaimed" ordering as the tag
+			    // write, so this gets the same highest-solid-
+			    // wins precedence for free.
+			    _material[i + j*_size[0] + k*_size[0]*_size[1]] = (uint8_t)(a+7);
+			}
 		    }
 		}
 	    }
@@ -1455,6 +1499,7 @@ void Geometry::build_mesh_parallel_thread_2d( void )
 
     // Start from an all-vacuum mesh.
     memset( _smesh, 0, sizeof(uint32_t)*ntot );
+    _material.assign( ntot, 0 );
 
     // See build_mesh_parallel_thread_3d() -- same rationale for using a
     // full Timer per phase here (runs once per program, not a hot loop).
@@ -1485,8 +1530,12 @@ void Geometry::build_mesh_parallel_thread_2d( void )
 			continue;
 
 		    Vec3D x( i*_h+_origo[0], j*_h+_origo[1] );
-		    if( solid->inside( x ) )
+		    if( solid->inside( x ) ) {
 			mesh(i,j) = nid;
+			// See build_mesh_parallel_thread_3d() -- _material's
+			// doc comment.
+			_material[i + j*_size[0]] = (uint8_t)(a+7);
+		    }
 		}
 	    }
 	}
@@ -1533,6 +1582,8 @@ void Geometry::build_mesh_parallel_thread_2d( void )
 
 void Geometry::build_mesh_parallel_thread_1d( void )
 {
+    _material.assign( (size_t)_size[0], 0 );
+
     // Mark solid (Dirichlet) nodes. Others left to zero.
     for( int32_t i = 0; i < _size[0]; i++ ) {
 	double x = i*_h+_origo[0];
@@ -1544,6 +1595,13 @@ void Geometry::build_mesh_parallel_thread_1d( void )
 		mesh(i) = SMESH_NODE_ID_PURE_VACUUM | nid;
 	    else
 		mesh(i) = SMESH_NODE_ID_DIRICHLET | nid;
+	    // nid here can also be 1-6 (a box face, from inside()'s own
+	    // boundary fallback -- see its doc comment) which is not a
+	    // real user-defined solid; only >=7 belongs in _material.
+	    // See build_mesh_parallel_thread_3d() for _material's
+	    // rationale generally.
+	    if( nid >= 7 )
+		_material[i] = (uint8_t)nid;
 	} else {
 	    mesh(i) = 0;
 	}
@@ -1932,52 +1990,48 @@ uint8_t Geometry::mc_case( int32_t i, int32_t j, int32_t k ) const
     std::cout << "mc_case( " << i << ", " << j << ", " << k << " ) ";
 #endif
 
-    // Go through mesh nodes surrounding cube (i,j,k)
+    // Go through mesh nodes surrounding cube (i,j,k). Uses _material
+    // directly (real solid membership, conductor or dielectric alike,
+    // independent of any stencil-tag reclassification) rather than
+    // SMESH_NODE_IS_SOLID_MATERIAL(_smesh[...]), which is blind exactly
+    // at a solid that reaches the simulation box edge -- see
+    // _material's doc comment.
     uint8_t res = 0;
-    uint32_t node;
     uint32_t ptr = (k*_size[1] + j)*_size[0] + i;
 
     // Node 1 (i,j,k)
-    node = _smesh[ptr];
-    if( SMESH_NODE_IS_SOLID_MATERIAL(node) )
+    if( _material[ptr] != 0 )
 	res += MC_V1;
 
     // Node 2 (i+1,j,k)
-    node = _smesh[ptr+1];
-    if( SMESH_NODE_IS_SOLID_MATERIAL(node) )
+    if( _material[ptr+1] != 0 )
 	res += MC_V2;
 
     // Node 3 (i+1,j+1,k)
-    node = _smesh[ptr+1+_size[0]];
-    if( SMESH_NODE_IS_SOLID_MATERIAL(node) )
+    if( _material[ptr+1+_size[0]] != 0 )
 	res += MC_V3;
 
     // Node 4 (i,j+1,k)
-    node = _smesh[ptr+_size[0]];
-    if( SMESH_NODE_IS_SOLID_MATERIAL(node) )
+    if( _material[ptr+_size[0]] != 0 )
 	res += MC_V4;
 
     // Second z-level
     ptr += _size[0]*_size[1];
 
     // Node 5 (i,j,k+1)
-    node = _smesh[ptr];
-    if( SMESH_NODE_IS_SOLID_MATERIAL(node) )
+    if( _material[ptr] != 0 )
 	res += MC_V5;
 
     // Node 6 (i+1,j,k+1)
-    node = _smesh[ptr+1];
-    if( SMESH_NODE_IS_SOLID_MATERIAL(node) )
+    if( _material[ptr+1] != 0 )
 	res += MC_V6;
 
     // Node 7 (i+1,j+1,k+1)
-    node = _smesh[ptr+1+_size[0]];
-    if( SMESH_NODE_IS_SOLID_MATERIAL(node) )
+    if( _material[ptr+1+_size[0]] != 0 )
 	res += MC_V7;
 
     // Node 8 (i,j+1,k+1)
-    node = _smesh[ptr+_size[0]];
-    if( SMESH_NODE_IS_SOLID_MATERIAL(node) )
+    if( _material[ptr+_size[0]] != 0 )
 	res += MC_V8;
 
 #ifdef MC_DEBUG
@@ -2240,31 +2294,28 @@ void Geometry::build_surface( void )
 
 uint8_t Geometry::surface_cell_face_case_2d( const int32_t i[3], const int32_t vb[3] ) const
 {
+    // Uses _material directly instead of SMESH_NODE_IS_SOLID_MATERIAL --
+    // see mc_case()'s comment / _material's doc comment.
     int res = 0;
-    uint32_t node;
     int32_t j[3] = { i[0], i[1], i[2] };
 
     // Node 1 (x,y)
-    node = mesh( (j[2]*_size[1] + j[1])*_size[0] + j[0] );
-    if( SMESH_NODE_IS_SOLID_MATERIAL(node) )
+    if( _material[ (j[2]*_size[1] + j[1])*_size[0] + j[0] ] != 0 )
 	res += 1;
 
     // Node 2 (x+1,y)
     j[vb[0]]++;
-    node = mesh( (j[2]*_size[1] + j[1])*_size[0] + j[0] );
-    if( SMESH_NODE_IS_SOLID_MATERIAL(node) )
+    if( _material[ (j[2]*_size[1] + j[1])*_size[0] + j[0] ] != 0 )
 	res += 2;
 
     // Node 3 (x+1,y+1)
     j[vb[1]]++;
-    node = mesh( (j[2]*_size[1] + j[1])*_size[0] + j[0] );
-    if( SMESH_NODE_IS_SOLID_MATERIAL(node) )
+    if( _material[ (j[2]*_size[1] + j[1])*_size[0] + j[0] ] != 0 )
 	res += 4;
 
     // Node 4 (x,y+1)
     j[vb[0]]--;
-    node = mesh( (j[2]*_size[1] + j[1])*_size[0] + j[0] );
-    if( SMESH_NODE_IS_SOLID_MATERIAL(node) )
+    if( _material[ (j[2]*_size[1] + j[1])*_size[0] + j[0] ] != 0 )
 	res += 8;
 
     return( res );
@@ -2596,32 +2647,28 @@ uint32_t Geometry::surface_inside( const Vec3D &x ) const
 
 uint32_t Geometry::surface_inside_solid_number( int32_t i, int32_t j,int32_t k ) const
 {
+    // Uses _material directly (already the real solid number itself,
+    // no mask needed) instead of SMESH_NODE_IS_SOLID_MATERIAL +
+    // SMESH_BOUNDARY_NUMBER_MASK -- see mc_case()'s comment /
+    // _material's doc comment.
     uint32_t ptr = (k*_size[1] + j)*_size[0] + i;
-    uint32_t node = _smesh[ptr];
-    if( SMESH_NODE_IS_SOLID_MATERIAL(node) )
-	return( node & SMESH_BOUNDARY_NUMBER_MASK );
-    node = _smesh[ptr+1];
-    if( SMESH_NODE_IS_SOLID_MATERIAL(node) )
-	return( node & SMESH_BOUNDARY_NUMBER_MASK );
-    node = _smesh[ptr+_size[0]];
-    if( SMESH_NODE_IS_SOLID_MATERIAL(node) )
-	return( node & SMESH_BOUNDARY_NUMBER_MASK );
-    node = _smesh[ptr+_size[0]+1];
-    if( SMESH_NODE_IS_SOLID_MATERIAL(node) )
-	return( node & SMESH_BOUNDARY_NUMBER_MASK );
+    if( _material[ptr] != 0 )
+	return( _material[ptr] );
+    if( _material[ptr+1] != 0 )
+	return( _material[ptr+1] );
+    if( _material[ptr+_size[0]] != 0 )
+	return( _material[ptr+_size[0]] );
+    if( _material[ptr+_size[0]+1] != 0 )
+	return( _material[ptr+_size[0]+1] );
 
     ptr += _size[1]*_size[0];
-    node = _smesh[ptr];
-    if( SMESH_NODE_IS_SOLID_MATERIAL(node) )
-	return( node & SMESH_BOUNDARY_NUMBER_MASK );
-    node = _smesh[ptr+1];
-    if( SMESH_NODE_IS_SOLID_MATERIAL(node) )
-	return( node & SMESH_BOUNDARY_NUMBER_MASK );
-    node = _smesh[ptr+_size[0]];
-    if( SMESH_NODE_IS_SOLID_MATERIAL(node) )
-	return( node & SMESH_BOUNDARY_NUMBER_MASK );
-    node = _smesh[ptr+_size[0]+1];
-    return( node & SMESH_BOUNDARY_NUMBER_MASK );
+    if( _material[ptr] != 0 )
+	return( _material[ptr] );
+    if( _material[ptr+1] != 0 )
+	return( _material[ptr+1] );
+    if( _material[ptr+_size[0]] != 0 )
+	return( _material[ptr+_size[0]] );
+    return( _material[ptr+_size[0]+1] );
 }
 
 
@@ -2731,23 +2778,13 @@ int32_t Geometry::surface_trianglec( int32_t i, int32_t j, int32_t k ) const
 }
 
 
-namespace {
-    /* Solid number a raw smesh value belongs to if it is dielectric
-     * interior (SMESH_NODE_ID_PURE_VACUUM[_FIX] with a nonzero solid
-     * number in its lower bits -- see
-     * Geometry::build_mesh_parallel_thread_3d()), else 0. Local
-     * counterpart of EpotMatrixSolver::material_number() -- duplicated
-     * rather than shared since the two classes don't otherwise depend
-     * on each other, but must stay in sync with the same mesh tagging
-     * convention.
-     */
-    uint32_t dielectric_material_number( uint32_t mesh_value )
-    {
-	uint32_t node_id = mesh_value & SMESH_NODE_ID_MASK;
-	if( node_id != SMESH_NODE_ID_PURE_VACUUM && node_id != SMESH_NODE_ID_PURE_VACUUM_FIX )
-	    return( 0 );
-	return( mesh_value & SMESH_NEAR_SOLID_INDEX_MASK );
-    }
+/* See the doc comment in the header. */
+uint32_t Geometry::dielectric_material_at( int32_t i, int32_t j, int32_t k ) const
+{
+    uint32_t solid_number = _material[i + j*_size[0] + k*_size[0]*_size[1]];
+    if( solid_number == 0 || _bound[solid_number-1].type() != BOUND_DIELECTRIC )
+	return( 0 ); // vacuum, or a conductor -- not this function's concern
+    return( solid_number );
 }
 
 
@@ -2813,9 +2850,8 @@ uint8_t Geometry::solid_dist( uint32_t i, uint32_t j, uint32_t k, uint32_t dir )
     default: throw( Error( ERROR_LOCATION, "invalid direction" ) );
     }
 
-    uint32_t self_mat = dielectric_material_number( snode );
-    uint32_t nb_snode = _smesh[ni + nj*_size[0] + nk*_size[0]*_size[1]];
-    uint32_t nb_mat = dielectric_material_number( nb_snode );
+    uint32_t self_mat = dielectric_material_at( i, j, k );
+    uint32_t nb_mat = dielectric_material_at( ni, nj, nk );
 
     if( self_mat == 0 && nb_mat == 0 )
 	throw( Error( ERROR_LOCATION, "not a near solid node" ) ); // genuinely neither side is a dielectric
@@ -2889,8 +2925,18 @@ void Geometry::save( std::ostream &os, bool save_solids ) const
 			    (int8_t *)_smesh );
 
     write_int32( os, _nearsolid.size() );
-    write_compressed_block( os, _nearsolid.size()*sizeof(uint8_t), 
+    write_compressed_block( os, _nearsolid.size()*sizeof(uint8_t),
 			    (int8_t *)&_nearsolid[0] );
+
+    // _material has to be serialized explicitly here (unlike a "just call
+    // populate_material_array() again on load" scheme) because it's built
+    // from live Solid::inside() queries against _sdata, and save_solids is
+    // false in every real caller in this codebase -- so on load _sdata is
+    // all NULL placeholders (FILEID_NULL) and there is no solid geometry
+    // left to re-derive it from. See the istream constructor's matching
+    // read and _material's own doc comment.
+    write_compressed_block( os, _material.size()*sizeof(uint8_t),
+			    (int8_t *)&_material[0] );
 }
 
 

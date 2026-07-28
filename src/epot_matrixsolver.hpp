@@ -169,66 +169,6 @@ protected:
      */
     std::vector<double>     _fd_mat_diag0;
 
-    /*! \brief Cached self_material_at() result for *every* mesh node
-     *  (free or fixed alike) -- dielectric solid number, or 0 for
-     *  plain vacuum/near-solid/Neumann/conductor -- indexed by the
-     *  full flat mesh index (k*size(1)+j)*size(0)+i, not by dof row.
-     *
-     *  Two call sites need this on a hot path: update_nonlinear_node()
-     *  (every Newton iteration and every step-size backtracking
-     *  re-evaluation, for every free node's own material) and
-     *  vacuum_face_coefficient() (every stencil face of every
-     *  vacuum/near-solid/Neumann node, for its *neighbour's* material,
-     *  to detect a dielectric interface). self_material_at()'s fast
-     *  path only recognizes a node whose raw tag directly carries a
-     *  material number -- for every other node (which is to say
-     *  essentially all of them, dielectric or not) it falls back to
-     *  Geometry::inside(), a real geometric containment query against
-     *  every solid. Calling that on demand at either site, repeatedly,
-     *  is what caused two severe slowdowns in turn: first
-     *  update_nonlinear_node() doing it for ~all DOF on every Newton
-     *  iteration, then (after that was cached per major cycle)
-     *  vacuum_face_coefficient() doing it for ~all DOF times up to 6
-     *  faces, redone from scratch every major cycle even though the
-     *  geometry -- and therefore every node's material -- never
-     *  changes after the mesh is built.
-     *
-     *  So unlike _linear_built's cache (which legitimately must be
-     *  redone every major cycle, since the rhs depends on the current
-     *  space charge), this one is populated exactly once, ever, the
-     *  first time build_mat_vec() runs -- see _dielectric_mat_built --
-     *  and never invalidated afterward, since nothing here depends on
-     *  scharge, epot, or the FIXED bit (material_number() already
-     *  handles the transiently-fixed _FIX tag variants equivalently to
-     *  their unfixed counterparts, so the cached value is correct
-     *  whether or not the node happens to be force-pinned when read).
-     */
-    std::vector<uint32_t>   _dielectric_mat;
-
-    /*! \brief True once _dielectric_mat has been populated. Deliberately
-     *  never reset by reset_matrix() -- see _dielectric_mat's doc
-     *  comment for why it has a longer lifetime than _linear_built.
-     */
-    bool                    _dielectric_mat_built;
-
-    /*! \brief Accumulated time spent in _dielectric_mat's one-time (ever)
-     *  population pass -- see build_mat_vec(). IS reset by
-     *  reset_build_timing() like the other two, even though the
-     *  underlying _dielectric_mat cache itself is never rebuilt: the
-     *  timed block is gated by _dielectric_mat_built, so once that
-     *  flag is set the block simply never executes again and this
-     *  accumulator harmlessly stays at 0 for the rest of the program.
-     *  (An earlier version of this code deliberately excluded this
-     *  variable from reset_build_timing(), on the reasoning that
-     *  "it only happens once, so don't bother resetting it" -- but
-     *  that left it holding its one nonzero value forever, so every
-     *  subsolve() after the first misleadingly reprinted the
-     *  original one-time cost as if it had been paid again. Resetting
-     *  it unconditionally, every call, is what actually makes it read
-     *  0 after the first subsolve(), which was always the intent.)
-     */
-    double                  _time_dielectric_cache;
-
     /*! \brief Accumulated time spent in build_mat_vec()'s one-time-per-
      *  major-cycle linear (geometry+rhs) build -- the part gated by
      *  _linear_built. Reset by reset_build_timing().
@@ -293,26 +233,15 @@ protected:
     void reset_matrix( void );
 
     /*! \brief Zero the per-solve build_mat_vec() timing accumulators
-     *  (_time_linbuild, _time_nonlin, _time_dielectric_cache). Called
-     *  once at the start of each EpotBiCGSTABSolver::subsolve() so the
-     *  values reported afterward reflect that solve only, not an
-     *  accumulation across the whole program run. _time_dielectric_cache
-     *  is included here too even though the cache it measures is only
-     *  ever (re)built once: resetting the timer is what makes it read
-     *  0 in every subsolve() after the one where the build actually
-     *  happened, instead of forever reprinting the original one-time
-     *  cost. See _time_dielectric_cache's own doc comment.
+     *  (_time_linbuild, _time_nonlin). Called once at the start of each
+     *  EpotBiCGSTABSolver::subsolve() so the values reported afterward
+     *  reflect that solve only, not an accumulation across the whole
+     *  program run.
      */
     void reset_build_timing( void ) {
 	_time_linbuild = 0.0;
 	_time_nonlin = 0.0;
-	_time_dielectric_cache = 0.0;
     }
-
-    /*! \brief Time (seconds) spent in _dielectric_mat's one-time-ever
-     *  population pass. 0 for every subsolve() after the first.
-     */
-    double time_dielectric_cache( void ) const { return( _time_dielectric_cache ); }
 
     /*! \brief Time (seconds) spent in this solve's one-time linear
      *  (geometry+rhs) matrix build.
@@ -343,55 +272,24 @@ private:
      */
     void update_nonlinear_node( uint32_t a, uint32_t i, uint32_t j, uint32_t k, const Vec3D &x );
 
-    /*! \brief Return the dielectric solid number a mesh node belongs
-     *  to, or 0 if it is not inside any dielectric (real vacuum, or any
-     *  non-PURE_VACUUM tag: near-solid, Neumann, Dirichlet, fine-
-     *  boundary).
+    /*! \brief Return the relative permittivity at mesh location
+     *  (\a i, \a j, \a k).
      *
-     *  A dielectric solid's interior is tagged SMESH_NODE_ID_PURE_VACUUM
-     *  with its solid number (>=7) in the lower bits, instead of
-     *  SMESH_NODE_ID_DIRICHLET (see
-     *  Geometry::build_mesh_parallel_thread_3d()) -- this recovers that
-     *  solid number, or 0 for plain vacuum/anything else. Used both to
-     *  get a node's own permittivity (node_epsilon_r()) and to compare
-     *  two adjacent nodes' materials (vacuum_face_coefficient()).
+     *  1.0 (vacuum) unless Geometry::dielectric_material_at() is
+     *  nonzero there, in which case the solid's Bound (BOUND_DIELECTRIC)
+     *  supplies epsilon_r. Geometry::dielectric_material_at() is O(1)
+     *  and always correct (independent of any stencil/tag
+     *  reclassification -- box edge, near-solid, etc.), so this no
+     *  longer needs its own fast-path/fallback distinction: that used
+     *  to live here as material_number() (raw-tag fast path) and
+     *  self_material_at() (geometric fallback for a reclassified node),
+     *  backed by a solver-private _dielectric_mat cache populated via a
+     *  Geometry::inside() query per node the first time it was needed.
+     *  Both collapsed into this one call once Geometry started
+     *  providing the same already-correct answer directly, for free
+     *  (computed once, during mesh build, rather than reactively).
      */
-    static uint32_t material_number( uint32_t mesh_value );
-
-    /*! \brief Like material_number(), but also correct for a Neumann or
-     *  Dirichlet box-wall node whose own mesh tag has been overridden
-     *  and so no longer carries its material directly.
-     *
-     *  A dielectric solid that reaches the simulation box edge has
-     *  that boundary layer's tag overwritten with the box's own
-     *  condition (see Geometry::override_dielectric_box_boundary_3d())
-     *  -- necessarily so, since the box edge's own Dirichlet/Neumann
-     *  condition takes priority there, not the dielectric's bulk
-     *  equation. But add_neumann_node() still needs to know that
-     *  node's *permittivity* to weight its own links correctly
-     *  whenever the boundary it sits on isn't the only thing that
-     *  varies nearby (e.g. a Neumann side wall that a dielectric slab
-     *  varying along a different axis happens to touch) -- material_number()
-     *  alone would silently and incorrectly say "vacuum" there, since
-     *  the tag itself no longer encodes it. This falls back to asking
-     *  Geometry directly, by real-world position \a x, which solid (if
-     *  any) the point is inside, bypassing the (possibly-overridden)
-     *  mesh tag entirely. Returns 0 for plain vacuum, for a point
-     *  outside the geometry, or for a non-dielectric (conductor) solid
-     *  -- the last case would indicate a genuinely conflicting/
-     *  pathological geometry (a conductor reaching exactly to a
-     *  Neumann-tagged wall) that this function does not attempt to
-     *  resolve.
-     */
-    uint32_t self_material_at( uint32_t mesh_value, const Vec3D &x ) const;
-
-    /*! \brief Return the relative permittivity of whatever mesh node
-     *  \a mesh_value describes.
-     *
-     *  1.0 (vacuum) unless material_number() is nonzero, in which case
-     *  the solid's Bound (BOUND_DIELECTRIC) supplies epsilon_r.
-     */
-    double node_epsilon_r( uint32_t mesh_value ) const;
+    double node_epsilon_r( uint32_t i, uint32_t j, uint32_t k ) const;
 
     /*! \brief Effective coefficient for the face linking free node
      *  (\a i, \a j, \a k) -- of permittivity \a eps_self and dielectric
@@ -477,19 +375,17 @@ private:
      */
     static double face_epsilon_alpha( double eps_self, double eps_neighbor, double alpha );
 
-    /*! \brief O(1) lookup into _dielectric_mat by full mesh coordinates
-     *  (i,j,k) -- 0 if that node is not inside a dielectric.
-     *
-     *  Used by add_near_solid_node_1d/2d/cyl/3d to detect a conductor/
-     *  dielectric/vacuum triple point: a near-solid axis with a cached
-     *  conductor distance on one side whose *other* side (not visible
-     *  to is_solid(), which never recognizes a dielectric) turns out to
-     *  be a dielectric-interior cell rather than plain vacuum. See
-     *  add_near_solid_node_3d()'s doc comment on that branch for the
-     *  full rationale.
-     */
-    uint32_t dielectric_material_at( uint32_t i, uint32_t j, uint32_t k ) const
-        { return( _dielectric_mat[ (k*_geom.size(1)+j)*_geom.size(0)+i ] ); }
+    // add_near_solid_node_1d/2d/cyl/3d's conductor/dielectric/vacuum
+    // triple-point detection, and add_neumann_node_1d/2d/cyl/3d's own
+    // permittivity lookup, now call _geom.dielectric_material_at(i,j,k)
+    // directly -- see that function's doc comment in geometry.hpp. This
+    // used to be a private O(1)-lookup wrapper around a solver-only
+    // _dielectric_mat cache (populated once, ever, via a
+    // Geometry::inside() fallback query per node); promoting the same
+    // logic onto Geometry itself (populated for free during mesh build
+    // instead) let every consumer -- this class, scharge cleanup,
+    // surface triangulation -- share one already-correct answer, so the
+    // solver-private copy of it was removed.
 
     void add_vacuum_node( uint32_t i, uint32_t j, uint32_t k, const Vec3D &x );
     void add_near_solid_node_1d( uint32_t i, const Vec3D &x );
