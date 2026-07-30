@@ -1,0 +1,12 @@
+prefix=@CMAKE_INSTALL_PREFIX@
+exec_prefix=${prefix}
+libdir=@CMAKE_INSTALL_FULL_LIBDIR@
+includedir=@CMAKE_INSTALL_FULL_INCLUDEDIR@/@IBSIMU_PC_INCLUDE_SUBDIR@
+
+Name: libibsimu
+Description: Ion Beam Simulation Package
+Version: @PROJECT_VERSION@
+Requires: cairo gsl @IBSIMU_PC_REQUIRES_OPTIONAL@
+Libs: -L${libdir} -l@IBSIMU_LIB_NAME@ @IBSIMU_PC_LIBS_EXTRA@
+Libs.private: -lm
+Cflags: -I${includedir} @IBSIMU_PC_CFLAGS_EXTRA@
