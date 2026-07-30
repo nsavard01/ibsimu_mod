@@ -53,6 +53,10 @@
 #include "particlestepper.hpp"
 #include "trajectorydiagnostics.hpp"
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 
 class ParticleDataBaseImp {
 
@@ -440,33 +444,81 @@ public:
 	    throw( Error( ERROR_LOCATION, "unsupported axis" ) );
 	}
 
-	// Scan through particle trajectory points
-	double Isum = 0.0;
-	std::vector<PP> intsc;
-	for( size_t a = 0; a < _particles.size(); a++ ) {
-	    size_t N = _particles[a]->traj_size();
-	    if( N < 2 )
-		continue;
-	    PP x1 = _particles[a]->traj(0);
-	    for( size_t b = 1; b < N; b++ ) {
-		PP x2 = _particles[a]->traj(b);
-		intsc.clear();
-		size_t nintsc;
-		if( b == 1 )
-		    nintsc = PP::trajectory_intersections_at_plane( intsc, crd, val, x1, x2, -1 );
-		else if( b == N-1 )
-		    nintsc = PP::trajectory_intersections_at_plane( intsc, crd, val, x1, x2, +1 );
-		else
-		    nintsc = PP::trajectory_intersections_at_plane( intsc, crd, val, x1, x2, 0 );
-		for( size_t c = 0; c < nintsc; c++ ) {
-		    Isum += _particles[a]->IQ();
-		    tdata.push_back( Particle<PP>( _particles[a]->IQ(), _particles[a]->q(),
-						   _particles[a]->m(), intsc[c] ) );
+	// Scan through particle trajectory points.
+	//
+	// Parallelised over particles. Unlike iterate_trajectories(), which
+	// distributes work through _scheduler, this scan used to be the only
+	// serial hot path left: its cost goes as the TOTAL number of stored
+	// trajectory points, so at high Npart_per_cell it can dominate a major
+	// cycle even though the particle push itself is threaded.
+	//
+	// Each thread scans a disjoint subset of particles into its own buffer;
+	// buffers are concatenated in thread order afterwards. Output order thus
+	// differs from the serial version, which is harmless -- nothing
+	// downstream depends on particle ordering, and bitwise reproducibility
+	// was already unavailable because the threaded particle push accumulates
+	// space charge via atomic_add_double() in nondeterministic order.
+	// schedule(static) rather than dynamic so that for a fixed thread count
+	// the particle->thread mapping is fixed and the merged result is at
+	// least reproducible run to run; the chunk size limits load imbalance
+	// when trajectory lengths vary (absorbed particles have short ones).
+	int nthreads = (int)ibsimu.get_thread_count();
+	if( nthreads < 1 )
+	    nthreads = 1;
+	const long long npart = (long long)_particles.size();
+	std::vector< std::vector< Particle<PP> > > tbuf( nthreads );
+	std::vector<double> tIsum( nthreads, 0.0 );
+	
+#ifdef _OPENMP
+#pragma omp parallel num_threads(nthreads)
+#endif
+	{
+	    int tid = 0;
+#ifdef _OPENMP
+	    tid = omp_get_thread_num();
+#endif
+	    std::vector<PP> intsc;
+	    std::vector< Particle<PP> > &out = tbuf[tid];
+	    double Isum_local = 0.0;
+#ifdef _OPENMP
+#pragma omp for schedule(static,64)
+#endif
+	    for( long long a = 0; a < npart; a++ ) {
+		size_t N = _particles[a]->traj_size();
+		if( N < 2 )
+		    continue;
+		PP x1 = _particles[a]->traj(0);
+		    for( size_t b = 1; b < N; b++ ) {
+			PP x2 = _particles[a]->traj(b);
+			intsc.clear();
+			size_t nintsc;
+			if( b == 1 )
+			    nintsc = PP::trajectory_intersections_at_plane( intsc, crd, val, x1, x2, -1 );
+			else if( b == N-1 )
+			    nintsc = PP::trajectory_intersections_at_plane( intsc, crd, val, x1, x2, +1 );
+			else
+			    nintsc = PP::trajectory_intersections_at_plane( intsc, crd, val, x1, x2, 0 );
+			for( size_t c = 0; c < nintsc; c++ ) {
+			    Isum_local += _particles[a]->IQ();
+			    out.push_back( Particle<PP>( _particles[a]->IQ(), _particles[a]->q(),
+							 _particles[a]->m(), intsc[c] ) );
+			}
+	
+			x1 = x2;
+		    }
 		}
-
-		x1 = x2;
-	    }
+		tIsum[tid] = Isum_local;
 	}
+	
+	double Isum = 0.0;
+	for( int t = 0; t < nthreads; t++ )
+	    Isum += tIsum[t];
+	size_t total = 0;
+	for( int t = 0; t < nthreads; t++ )
+	    total += tbuf[t].size();
+	tdata.reserve( tdata.size() + total );
+	for( int t = 0; t < nthreads; t++ )
+	    tdata.insert( tdata.end(), tbuf[t].begin(), tbuf[t].end() );
 
 	ibsimu.message( 1 ) << "number of trajectories = " << tdata.size() << "\n";
 	if( PP::geom_mode() == MODE_2D )
@@ -556,31 +608,82 @@ public:
 	    throw( Error( ERROR_LOCATION, "unsupported axis" ) );
 	}
 
-	// Scan through particle trajectory points
-	double Isum = 0.0;
-	std::vector<PP> intsc;
-	for( size_t a = 0; a < _particles.size(); a++ ) {
-	    size_t N = _particles[a]->traj_size();
-	    if( N < 2 )
-		continue;
-	    PP x1 = _particles[a]->traj(0);
-	    for( size_t b = 1; b < N; b++ ) {
-		PP x2 = _particles[a]->traj(b);
-		intsc.clear();
-		size_t nintsc;
-		if( b == 1 )
-		    nintsc = PP::trajectory_intersections_at_plane( intsc, crd, val, x1, x2, -1 );
-		else if( b == N-1 )
-		    nintsc = PP::trajectory_intersections_at_plane( intsc, crd, val, x1, x2, +1 );
-		else
-		    nintsc = PP::trajectory_intersections_at_plane( intsc, crd, val, x1, x2, 0 );
-		for( size_t c = 0; c < nintsc; c++ ) {
-		    Isum += _particles[a]->IQ();
-		    add_diagnostics( tdata, intsc[c], *_particles[a], crd, a );
+	// Scan through particle trajectory points.
+	//
+	// Parallelised over particles. Unlike iterate_trajectories(), which
+	// distributes work through _scheduler, this scan used to be the only
+	// serial hot path left: its cost goes as the TOTAL number of stored
+	// trajectory points, so at high Npart_per_cell it can dominate a major
+	// cycle even though the particle push itself is threaded.
+	//
+	// Each thread scans a disjoint subset of particles into its own buffer;
+	// buffers are concatenated in thread order afterwards. Output order thus
+	// differs from the serial version, which is harmless -- nothing
+	// downstream depends on particle ordering, and bitwise reproducibility
+	// was already unavailable because the threaded particle push accumulates
+	// space charge via atomic_add_double() in nondeterministic order.
+	// schedule(static) rather than dynamic so that for a fixed thread count
+	// the particle->thread mapping is fixed and the merged result is at
+	// least reproducible run to run; the chunk size limits load imbalance
+	// when trajectory lengths vary (absorbed particles have short ones).
+	int nthreads = (int)ibsimu.get_thread_count();
+	if( nthreads < 1 )
+	    nthreads = 1;
+	const long long npart = (long long)_particles.size();
+	std::vector<TrajectoryDiagnosticData> tbuf( nthreads );
+	for( int t = 0; t < nthreads; t++ )
+	    for( size_t d = 0; d < diagnostics.size(); d++ )
+		tbuf[t].add_data_column( diagnostics[d] );
+	std::vector<double> tIsum( nthreads, 0.0 );
+	
+#ifdef _OPENMP
+#pragma omp parallel num_threads(nthreads)
+#endif
+	{
+	    int tid = 0;
+#ifdef _OPENMP
+	    tid = omp_get_thread_num();
+#endif
+	    std::vector<PP> intsc;
+	    TrajectoryDiagnosticData &out = tbuf[tid];
+	    double Isum_local = 0.0;
+#ifdef _OPENMP
+#pragma omp for schedule(static,64)
+#endif
+	    for( long long a = 0; a < npart; a++ ) {
+		size_t N = _particles[a]->traj_size();
+		if( N < 2 )
+		    continue;
+		PP x1 = _particles[a]->traj(0);
+		    for( size_t b = 1; b < N; b++ ) {
+			PP x2 = _particles[a]->traj(b);
+			intsc.clear();
+			size_t nintsc;
+			if( b == 1 )
+			    nintsc = PP::trajectory_intersections_at_plane( intsc, crd, val, x1, x2, -1 );
+			else if( b == N-1 )
+			    nintsc = PP::trajectory_intersections_at_plane( intsc, crd, val, x1, x2, +1 );
+			else
+			    nintsc = PP::trajectory_intersections_at_plane( intsc, crd, val, x1, x2, 0 );
+			for( size_t c = 0; c < nintsc; c++ ) {
+			    Isum_local += _particles[a]->IQ();
+			    add_diagnostics( out, intsc[c], *_particles[a], crd, (int)a );
+			}
+	
+			x1 = x2;
+		    }
 		}
-
-		x1 = x2;
-	    }
+		tIsum[tid] = Isum_local;
+	}
+	
+	double Isum = 0.0;
+	for( int t = 0; t < nthreads; t++ )
+	    Isum += tIsum[t];
+	for( int t = 0; t < nthreads; t++ ) {
+	    size_t nt = tbuf[t].traj_size();
+	    for( size_t j = 0; j < nt; j++ )
+		for( size_t i = 0; i < tdata.diag_size(); i++ )
+		    tdata.add_data( i, tbuf[t](j,i) );
 	}
 
 	ibsimu.message( 1 ) << "number of trajectories = " << tdata.traj_size() << "\n";
