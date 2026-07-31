@@ -1,0 +1,33 @@
+/* src/config.h.in -- processed by CMake's configure_file() into
+ * ${CMAKE_BINARY_DIR}/src/config.h
+ *
+ * Mirrors the macros previously produced by autoconf/autoheader from
+ * configure.ac. Only what the source tree actually checks with
+ * #if/#ifdef/#ifndef is defined here -- see src/CMakeLists.txt for how
+ * each @VAR@ is set.
+ */
+
+#ifndef CONFIG_H
+#define CONFIG_H 1
+
+/* Optional feature toggles (mirror --with-* / --disable-* configure flags) */
+#cmakedefine GTK3 1
+#cmakedefine OPENGL 1
+#cmakedefine USE_MKL 1
+#cmakedefine CSG 1
+#cmakedefine SIGSEGV_STACK 1
+
+/* Platform / library feature checks (mirror AC_CHECK_* results) */
+#cmakedefine HAVE_UNISTD_H 1
+#cmakedefine HAVE_GETCWD 1
+#cmakedefine HAVE_SIGINFO_T 1
+#cmakedefine HAVE_CLOCKID_T 1
+#cmakedefine HAVE_STRUCT_TIMESPEC 1
+#cmakedefine HAVE_SYS_TIME_H 1
+#cmakedefine HAVE_GETTIMEOFDAY 1
+#cmakedefine HAVE_CLOCK_GETTIME 1
+#cmakedefine HAVE_LIBRT 1
+#cmakedefine HAVE_STRERROR_R 1
+#cmakedefine STRERROR_R_CHAR_P 1
+
+#endif /* CONFIG_H */
