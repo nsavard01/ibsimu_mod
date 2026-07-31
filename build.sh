@@ -5,7 +5,7 @@
 # Override the install location with: IBSIMU_PREFIX=/some/path ./build.sh
 set -euo pipefail
 
-PREFIX="${IBSIMU_PREFIX:-/opt/ibsimu/1.0.6}"
+PREFIX="${IBSIMU_PREFIX:-/opt/ibsimu/mod_ibsimu}"
 
 cmake -S . -B build \
       -DCMAKE_BUILD_TYPE=Release \
