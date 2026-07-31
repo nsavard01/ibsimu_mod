@@ -68,6 +68,33 @@ configure_file(
 )
 
 # ---------------------------------------------------------------------
+# Generated id.hpp -- only used by ibsimu.cpp's startup banner, derived
+# from git so nobody has to hand-maintain an untracked file again.
+# ---------------------------------------------------------------------
+
+set(IBSIMU_GIT_ID "unknown")
+find_package(Git QUIET)
+if(GIT_FOUND)
+  execute_process(
+    COMMAND ${GIT_EXECUTABLE} log -1 "--format=%h, %cd" --date=local
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    OUTPUT_VARIABLE _ibsimu_git_id
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+    RESULT_VARIABLE _ibsimu_git_result
+  )
+  if(_ibsimu_git_result EQUAL 0 AND _ibsimu_git_id)
+    set(IBSIMU_GIT_ID "${_ibsimu_git_id}")
+  endif()
+endif()
+
+configure_file(
+  "${CMAKE_CURRENT_SOURCE_DIR}/id.hpp.in"
+  "${CMAKE_CURRENT_BINARY_DIR}/id.hpp"
+  @ONLY
+)
+
+# ---------------------------------------------------------------------
 # Library target
 # ---------------------------------------------------------------------
 

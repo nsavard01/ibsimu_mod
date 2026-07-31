@@ -10,6 +10,12 @@
 #ifndef CONFIG_H
 #define CONFIG_H 1
 
+/* Package version -- autotools injected this via AC_INIT/autoheader;
+ * ibsimu.cpp's startup banner does `"... " VERSION " (" IBSIMU_GIT_ID ")"`
+ * (string literal concatenation), so this must always be defined, not
+ * conditional on a #cmakedefine. */
+#define VERSION "@PROJECT_VERSION@"
+
 /* Optional feature toggles (mirror --with-* / --disable-* configure flags) */
 #cmakedefine GTK3 1
 #cmakedefine OPENGL 1
