@@ -188,11 +188,31 @@ if(IBSIMU_WITH_CSG)
   string(APPEND IBSIMU_PC_REQUIRES_OPTIONAL " csg")
 endif()
 
-set(IBSIMU_PC_LIBS_EXTRA "${FREETYPE_LIBRARIES} ${FONTCONFIG_LIBRARIES} -lz ${LIBPNG_LIBRARIES}")
-set(IBSIMU_PC_CFLAGS_EXTRA "")
+# NOTE: pkg_check_modules()'s *_LIBRARIES variables are bare library
+# names (no -l, no CMake list flattening applied), and *_LDFLAGS /
+# *_LDFLAGS_OTHER are themselves CMake ;-separated lists -- pasting
+# either straight into a text file via configure_file() leaves literal
+# semicolons in the output. Collect everything as a real CMake list
+# first, then flatten it to a space-separated string right before
+# writing the .pc file.
+set(_ibsimu_pc_libs_list
+  ${FREETYPE_LDFLAGS}
+  ${FONTCONFIG_LDFLAGS}
+  ${LIBPNG_LDFLAGS}
+  -lz
+  ${CMAKE_THREAD_LIBS_INIT}
+)
+set(_ibsimu_pc_cflags_list
+  ${PTHREAD_CFLAGS}
+)
 if(IBSIMU_WITH_UMFPACK)
-  string(APPEND IBSIMU_PC_LIBS_EXTRA " -lumfpack")
+  list(APPEND _ibsimu_pc_libs_list -lumfpack)
+  list(APPEND _ibsimu_pc_cflags_list "-I${UMFPACK_INCLUDE_DIRS}")
 endif()
+
+list(REMOVE_DUPLICATES _ibsimu_pc_libs_list)
+string(REPLACE ";" " " IBSIMU_PC_LIBS_EXTRA "${_ibsimu_pc_libs_list}")
+string(REPLACE ";" " " IBSIMU_PC_CFLAGS_EXTRA "${_ibsimu_pc_cflags_list}")
 
 configure_file(
   "${CMAKE_SOURCE_DIR}/ibsimu.pc.in"
