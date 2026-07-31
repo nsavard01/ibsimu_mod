@@ -146,3 +146,13 @@ install(TARGETS ibsimu
 install(FILES ${IBSIMU_PUBLIC_HEADERS}
   DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/ibsimu
 )
+
+# config.h is generated (see configure_file() above), not part of the
+# glob -- install it alongside the public headers same as autotools did
+# (it was listed in src/Makefile.am's include_HEADERS). error.hpp and
+# others #include "config.h" directly, so consumers building against the
+# installed headers need this file present, not just available at
+# library-build time.
+install(FILES "${CMAKE_CURRENT_BINARY_DIR}/config.h"
+  DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/ibsimu
+)
