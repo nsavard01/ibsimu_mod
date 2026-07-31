@@ -1,0 +1,9 @@
+/* src/id.hpp.in -- processed by CMake's configure_file() into
+ * ${CMAKE_CURRENT_BINARY_DIR}/id.hpp at configure time.
+ *
+ * Used only by ibsimu.cpp's startup banner. Previously this was a
+ * hand-maintained, never-committed file (only present in the very first
+ * git commit, then dropped from tracking) -- generated from git log
+ * automatically now, see src/CMakeLists.txt.
+ */
+#define IBSIMU_GIT_ID "@IBSIMU_GIT_ID@"

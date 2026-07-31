@@ -1,8 +1,16 @@
+# CMake out-of-source build dir -- everything cmake/make produces lives
+# here, nothing generated should ever land inside src/ or tests/ again.
+build/
+build-*/
+
 *~
 *.o
 *.lo
+*.la
+*.pc
 
-ChangeLog
+# Old autotools cruft (kept here in case anyone still runs autoreconf
+# locally out of habit -- harmless if unused)
 Makefile
 Makefile.in
 aclocal.m4
@@ -12,36 +20,23 @@ config.log
 config.status
 config.sub
 configure
-debug.sh
 depcomp
 install-sh
-m4
 ltmain.sh
 libtool
-*.pc
-
 missing
+m4
 
 doc/Doxyfile
 doc/Doxyfile_web
-doc/Makefile
-doc/Makefile.in
 doc/html
 doc/webdoc
 
-src/Makefile
-src/Makefile.in
-src/.deps
-src/.libs
-src/id.hpp
-src/config.h
-src/config.h.in
-
-tests/Makefile
-tests/Makefile.in
-tests/.deps
-tests/.libs
+tests/*.log
+tests/*.trs
+tests/*.dat
 tests/*.png
 tests/*.ps
 tests/*.pdf
 tests/*_vout.txt
+tests/*_out.txt
