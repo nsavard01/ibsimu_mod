@@ -42,6 +42,7 @@
 
 
 #include <limits>
+#include <cmath>
 #include "mydxflwpolyline.hpp"
 
 
@@ -263,17 +264,56 @@ void MyDXFLWPolyline::set_end( const Vec3D &e )
 }
 
 
+/* Returns true only if the two polylines are geometrically identical,
+ * traversed in either direction -- the same contract MyDXFLine::geom_same()
+ * and MyDXFArc::geom_same() implement, and the one
+ * MyDXFEntities::selection_path_loop() relies on when it discards a
+ * candidate as a duplicate of the entity already on the stack.
+ *
+ * The previous version got this backwards twice: it returned 1 ("same")
+ * when the vertex COUNTS DIFFERED, and it returned 1 as soon as ANY SINGLE
+ * vertex matched rather than requiring all of them to. Two distinct
+ * polylines meeting end to end -- the normal case for a SolidWorks profile
+ * where a fillet run and a chamfer run share a vertex -- therefore looked
+ * identical, so selection_path_loop() silently dropped the second one as a
+ * duplicate, the chain could not continue past that junction, and the whole
+ * loop unwound entity by entity into "No match at ..., removing entity"
+ * followed by "No loops defined in layer". The profile itself was perfectly
+ * closed; only the duplicate test was wrong.
+ *
+ * Only the x and y components are compared. _p[a][2] carries the BULGE for
+ * an lwpolyline vertex, not a z coordinate (see the constructor's handling
+ * of group code 42), and reversing a polyline shifts the bulges by one
+ * vertex and negates them -- so folding them into a positional comparison
+ * would make the reversed test wrong. Position alone is what duplicate
+ * detection needs here.
+ */
 bool MyDXFLWPolyline::geom_same( const MyDXFLWPolyline &line, double eps ) const
 {
-    if( _p.size() != line._p.size() )
-	return( 1 );
+    uint32_t n = _p.size();
+    if( n != line._p.size() )
+	return( false );
 
-    for( uint32_t a = 0; a < _p.size(); a++ ) {
-	if( norm2( _p[a] - line._p[a] ) < eps )
-	    return( 1 );
+    bool same = true;
+    for( uint32_t a = 0; a < n; a++ ) {
+	double dx = _p[a][0] - line._p[a][0];
+	double dy = _p[a][1] - line._p[a][1];
+	if( sqrt( dx*dx + dy*dy ) >= eps ) {
+	    same = false;
+	    break;
+	}
+    }
+    if( same )
+	return( true );
+
+    for( uint32_t a = 0; a < n; a++ ) {
+	double dx = _p[a][0] - line._p[n-1-a][0];
+	double dy = _p[a][1] - line._p[n-1-a][1];
+	if( sqrt( dx*dx + dy*dy ) >= eps )
+	    return( false );
     }
 
-    return( 0 );
+    return( true );
 }
 
 
