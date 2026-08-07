@@ -300,6 +300,25 @@ double EpotMatrixSolver::vacuum_face_coefficient( int32_t i, int32_t j, int32_t 
 						   double eps_self ) const
 {
     uint32_t node_id = neighbor_mesh & SMESH_NODE_ID_MASK;
+
+    /* Neumann mask on the far side: this face carries no flux at all, so
+     * its coefficient is about to be cancelled by set_link()'s redirect
+     * (it sends the value to the row's own diagonal, where it exactly
+     * undoes the caller's cof += w). The returned number is therefore
+     * arbitrary -- but computing it properly is not merely wasted work,
+     * it is meaningless work: the code below would see nb_material == 0
+     * (dielectric_material_at() returns 0 for a mask, since a mask is not
+     * BOUND_DIELECTRIC), decide there is a genuine material interface, and
+     * bisect against the dielectric with bracket_ndist() from a point that
+     * may well be INSIDE it -- which violates that routine's stated
+     * precondition and returns a meaningless fraction.
+     *
+     * eps_self keeps it finite and dimensionally sane for anyone reading a
+     * matrix dump. It cannot affect the solution.
+     */
+    if( SMESH_NODE_IS_NEUMANN_MASK( neighbor_mesh ) )
+	return( eps_self );
+
     if( node_id == SMESH_NODE_ID_DIRICHLET ) {
 	uint32_t boundary_number = neighbor_mesh & SMESH_BOUNDARY_NUMBER_MASK;
 	if( boundary_number < 7 )
