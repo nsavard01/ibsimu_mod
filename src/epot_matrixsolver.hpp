@@ -294,6 +294,9 @@ private:
 
     void set_link( uint32_t a, uint32_t b, double val );
 
+    /*! \brief Neumann-mask solids are implemented here, via set_link(). */
+    virtual bool supports_neumann_mask( void ) const { return( true ); }
+
     /*! \brief Add the epot-dependent plasma contribution (rhs term and
      *  diagonal derivative) for free node \a a at mesh location
      *  (i,j,k)/x. Called once per Newton iteration for every free node,

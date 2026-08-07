@@ -158,6 +158,44 @@ void EpotMatrixSolver::set_link( uint32_t a, uint32_t b, double val )
     //std::cout << "set_link( a = " << a << ", b = " << b << ", val = " << val << ")\n";
 
     if( (b & N2D_TYPE_MASK) == N2D_TYPE_FIXED ) {
+
+	/* A link pointing INTO a Neumann-mask solid is a zero-flux face:
+	 * redirect it onto the row's own diagonal instead of moving it to
+	 * the right hand side.
+	 *
+	 * Why that is exactly right, and why it is done here rather than in
+	 * each stencil builder:
+	 *
+	 * Every stencil in this file has the shape
+	 *     sum_f w_f * phi_(neighbour f)  -  cof * phi_self ,  cof = sum_f w_f
+	 * with the caller accumulating cof face by face and emitting the
+	 * diagonal at the end as set_link(a, self, -cof). Homogeneous
+	 * Neumann on face f means the ghost value equals the node's own
+	 * value, phi_f = phi_self, so face f contributes
+	 *     w_f * phi_self  -  w_f * phi_self  =  0
+	 * i.e. the face must vanish from the off-diagonals AND from the
+	 * diagonal sum. Sending w_f to the diagonal does precisely that:
+	 * the diagonal becomes -cof + w_f = -(cof - w_f), which is the
+	 * stencil the caller would have built had it never seen face f.
+	 *
+	 * Doing it in set_link() means it applies to every stencil builder
+	 * at once -- add_vacuum_node(), add_neumann_node_1d/2d/cyl/3d(),
+	 * add_near_solid_node_1d/2d/cyl/3d() -- and to every geometry mode,
+	 * with no per-site changes and no risk of one branch being missed.
+	 * A masked neighbour cannot silently fall through to the Dirichlet
+	 * path below and inject its (meaningless) stored potential into the
+	 * right hand side.
+	 *
+	 * The masked node's own index is a MESH node index here: preprocess()
+	 * sets _n2d(a) = N2D_TYPE_FIXED | a for every fixed node, so the
+	 * index survives unchanged and _geom.mesh() can be queried directly.
+	 */
+	if( SMESH_NODE_IS_NEUMANN_MASK( _geom.mesh( (int32_t)(b & N2D_INDEX_MASK) ) ) ) {
+	    _row_entries[a & N2D_INDEX_MASK].push_back(
+		std::make_pair( (int32_t)(a & N2D_INDEX_MASK), val ) );
+	    return;
+	}
+
 	//std::cout << "epot = " << (*_epot)(b & N2D_INDEX_MASK) << "\n";
         (*_fd_vec)(a) += -val * (*_epot)(b & N2D_INDEX_MASK);
     } else {
@@ -1403,10 +1441,47 @@ void EpotMatrixSolver::build_mat_vec( void )
 	// pass is pure data movement (no stencil math, no plasma
 	// evaluation) over already-computed entries, so it stays cheap
 	// even though it runs single-threaded.
+	//
+	// Duplicate columns within a row are MERGED here rather than being
+	// handed to construct_add() twice. construct_add() appends
+	// unconditionally -- it does not look for an existing entry -- so
+	// duplicates would survive into the CSR arrays. A matrix-vector
+	// product sums them and so stays correct, but everything that
+	// SEARCHES for a particular entry sees only the first one:
+	// _fd_mat_diag_idx below (which get_resjac() uses to apply the
+	// nonlinear plasma term to the diagonal every Newton iteration),
+	// GMG_Precond::find_diagonals(), and the ILU/RBSOR preconditioners'
+	// diagonal handling would all then act on a fraction of the true
+	// diagonal.
+	//
+	// Set_link()'s Neumann-mask redirect is what makes this reachable:
+	// it emits an extra entry at (a,a) for every masked face, on top of
+	// the diagonal the stencil builder emits at the end. Merging here
+	// rather than relying on the builders always emitting the diagonal
+	// last keeps that independent of call order.
+	std::vector<double> rowacc;
+	std::vector<int32_t> rowcol;
 	for( uint32_t a = 0; a < _dof; a++ ) {
 	    const std::vector<std::pair<int32_t,double> > &row = _row_entries[a];
-	    for( size_t n = 0; n < row.size(); n++ )
-		_fd_mat->construct_add( a, row[n].first, row[n].second );
+
+	    rowacc.clear();
+	    rowcol.clear();
+	    for( size_t n = 0; n < row.size(); n++ ) {
+		size_t m = 0;
+		for( ; m < rowcol.size(); m++ ) {
+		    if( rowcol[m] == row[n].first ) {
+			rowacc[m] += row[n].second;
+			break;
+		    }
+		}
+		if( m == rowcol.size() ) {
+		    rowcol.push_back( row[n].first );
+		    rowacc.push_back( row[n].second );
+		}
+	    }
+
+	    for( size_t m = 0; m < rowcol.size(); m++ )
+		_fd_mat->construct_add( a, rowcol[m], rowacc[m] );
 	}
 
 	// Order matrix

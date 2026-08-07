@@ -307,8 +307,33 @@ void Geometry::set_boundary( uint32_t n, const Bound &b )
     // is not eliminated -- see BOUND_DIELECTRIC's doc comment in
     // types.hpp). Only the six simulation box boundaries (n <= 6) may
     // be Neumann.
-    if( n >= 7 && b.type() == BOUND_NEUMANN )
-	throw( Error( ERROR_LOCATION, "trying to set solid " + to_string(n) + " as Neumann boundary" ) );
+    // BOUND_NEUMANN on a SOLID (n >= 7) makes it a Neumann MASK: its nodes
+    // are removed from the solve and every face separating one of them from
+    // a live node carries a homogeneous Neumann (zero-flux) condition. This
+    // is not a boundary in the box-face sense -- it imposes no value and
+    // needs none -- it is a way of saying "do not solve here, and let
+    // nothing flow across".
+    //
+    // Its purpose is to shrink the active domain without inventing a
+    // potential for the surface that closes it. The motivating case: an
+    // axisymmetric plasma truncated radially to avoid emitting particles
+    // out to the real chamber wall. No Dirichlet value is correct there,
+    // because the potential at the truncation radius is partway down a
+    // self-consistent sheath whose depth depends on the locally deposited
+    // ion density -- the very quantity being solved for. dphi/dr = 0 is
+    // correct, being the symmetry statement for the uniform plasma section.
+    //
+    // It also saves memory: masked nodes carry no matrix row, which matters
+    // in 3D where an unused corner of the box can be a large fraction of
+    // the mesh.
+    //
+    // A Neumann mask must carry no value: nothing ever reads one, so a
+    // functor here would silently do nothing and mislead whoever set it.
+    if( n >= 7 && b.type() == BOUND_NEUMANN && !b.is_constant() )
+	throw( Error( ERROR_LOCATION, "Neumann-mask solid " + to_string(n) +
+		      " must not be given a value functor -- a mask imposes "
+		      "no potential" ) );
+
     if( n <= 6 && b.type() == BOUND_DIELECTRIC )
 	throw( Error( ERROR_LOCATION, "simulation box boundary " + to_string(n) + " can not be dielectric" ) );
 
@@ -1405,9 +1430,21 @@ void Geometry::build_mesh_parallel_thread_3d( void )
 	    // SMESH_NODE_ID_PURE_VACUUM does not have. See
 	    // add_vacuum_node() for where the permittivity actually
 	    // enters, at material boundaries.
-	    uint32_t nid = (_bound[a+6].type() == BOUND_DIELECTRIC ?
-			    SMESH_NODE_ID_PURE_VACUUM : SMESH_NODE_ID_DIRICHLET) |
-		(uint32_t)(a+7);
+	    // Three kinds of solid now:
+	    //   BOUND_DIELECTRIC -- interior stays a free node (a uniform
+	    //       permittivity cancels out of the homogeneous equation);
+	    //       the permittivity enters at material faces.
+	    //   BOUND_NEUMANN    -- interior is MASKED: eliminated from the
+	    //       matrix, with zero flux across every face to a live node.
+	    //       See set_boundary() and EpotMatrixSolver::set_link().
+	    //   otherwise        -- ordinary Dirichlet conductor.
+	    uint32_t nid;
+	    if( _bound[a+6].type() == BOUND_DIELECTRIC )
+		nid = SMESH_NODE_ID_PURE_VACUUM | (uint32_t)(a+7);
+	    else if( _bound[a+6].type() == BOUND_NEUMANN )
+		nid = SMESH_NODE_ID_NEUMANN_MASK | (uint32_t)(a+7);
+	    else
+		nid = SMESH_NODE_ID_DIRICHLET | (uint32_t)(a+7);
 
 	    // Restrict the sweep to the node range the solid's bbox
 	    // can possibly touch (falls back to the whole mesh when
@@ -1504,9 +1541,21 @@ void Geometry::build_mesh_parallel_thread_2d( void )
 
 	    // See the identical branch in build_mesh_parallel_thread_3d()
 	    // for the rationale.
-	    uint32_t nid = (_bound[a+6].type() == BOUND_DIELECTRIC ?
-			    SMESH_NODE_ID_PURE_VACUUM : SMESH_NODE_ID_DIRICHLET) |
-		(uint32_t)(a+7);
+	    // Three kinds of solid now:
+	    //   BOUND_DIELECTRIC -- interior stays a free node (a uniform
+	    //       permittivity cancels out of the homogeneous equation);
+	    //       the permittivity enters at material faces.
+	    //   BOUND_NEUMANN    -- interior is MASKED: eliminated from the
+	    //       matrix, with zero flux across every face to a live node.
+	    //       See set_boundary() and EpotMatrixSolver::set_link().
+	    //   otherwise        -- ordinary Dirichlet conductor.
+	    uint32_t nid;
+	    if( _bound[a+6].type() == BOUND_DIELECTRIC )
+		nid = SMESH_NODE_ID_PURE_VACUUM | (uint32_t)(a+7);
+	    else if( _bound[a+6].type() == BOUND_NEUMANN )
+		nid = SMESH_NODE_ID_NEUMANN_MASK | (uint32_t)(a+7);
+	    else
+		nid = SMESH_NODE_ID_DIRICHLET | (uint32_t)(a+7);
 
 	    int32_t imin, imax, jmin, jmax, kmin, kmax;
 	    solid_node_range( solid, imin, imax, jmin, jmax, kmin, kmax );
@@ -1578,10 +1627,12 @@ void Geometry::build_mesh_parallel_thread_1d( void )
 	double x = i*_h+_origo[0];
 	uint32_t nid = inside( Vec3D(x) );
 	if( nid ) {
-	    // See build_mesh_parallel_thread_3d() for the dielectric
-	    // rationale.
+	    // See build_mesh_parallel_thread_3d() for the dielectric and
+	    // Neumann-mask rationale.
 	    if( _bound[nid-1].type() == BOUND_DIELECTRIC )
 		mesh(i) = SMESH_NODE_ID_PURE_VACUUM | nid;
+	    else if( nid >= 7 && _bound[nid-1].type() == BOUND_NEUMANN )
+		mesh(i) = SMESH_NODE_ID_NEUMANN_MASK | nid;
 	    else
 		mesh(i) = SMESH_NODE_ID_DIRICHLET | nid;
 	    // nid here can also be 1-6 (a box face, from inside()'s own

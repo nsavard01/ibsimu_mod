@@ -167,6 +167,33 @@ public:
 #define SMESH_NODE_ID_DIRICHLET        0xC0000000 // 110...
 #define SMESH_NODE_ID_FINE_BOUNDARY    0xE0000000 // 111...
 
+/*! \brief Node inside a Neumann-mask solid: removed from the solve, with
+ *  a zero-flux (homogeneous Neumann) condition on every face separating it
+ *  from a live node.
+ *
+ *  Takes the FINE_BOUNDARY slot, which is declared above but referenced
+ *  nowhere else in the library -- so this costs no re-encoding. Sharing the
+ *  bit pattern is safe precisely because nothing ever tests for
+ *  FINE_BOUNDARY; if that ever changes, the two must be split and one of
+ *  them given a different id.
+ *
+ *  The SMESH_NODE_FIXED bit is set (0xE0000000 & 0x80000000 != 0), so
+ *  EpotMatrixSolver::preprocess() eliminates these nodes from the matrix
+ *  without any change there. What makes them a Neumann mask rather than a
+ *  Dirichlet block is EpotMatrixSolver::set_link(), which redirects a link
+ *  pointing AT one of these onto the row's own diagonal instead of moving
+ *  it to the right-hand side -- see the comment there for why that is
+ *  exactly a zero-flux face.
+ *
+ *  A masked solid is created by giving a solid BOUND_NEUMANN, which
+ *  set_boundary() accepts only for n >= 7.
+ */
+#define SMESH_NODE_ID_NEUMANN_MASK     0xE0000000 // 111...
+
+/*! \brief True if this node is inside a Neumann-mask solid. */
+#define SMESH_NODE_IS_NEUMANN_MASK(node) \
+    ( ((node) & SMESH_NODE_ID_MASK) == SMESH_NODE_ID_NEUMANN_MASK )
+
 #define SMESH_NODE_FIXED               0x80000000 // 100...
 
 

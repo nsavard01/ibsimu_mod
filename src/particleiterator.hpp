@@ -313,6 +313,14 @@ template <class PP> class ParticleIterator {
     uint32_t                   _trajdiv;       /*!< \brief Divisor for saved trajectories,
 					        * if 3, every third trajectory is saved. */
     bool                       _mirror[6];     /*!< \brief Is particle mirrored on boundary? */
+
+    /*! \brief Which user solids are Neumann masks, indexed by (n - 7).
+     *
+     *  Cached once in the constructor. Geometry::get_boundary() returns a
+     *  Bound by value and range-checks every call, which is the wrong shape
+     *  for a test in the trajectory inner loop.
+     */
+    std::vector<bool>          _mask_solid;
     bool                       _surface_collision;
 
     ParticleIteratorData       _pidata;        /*!< \brief User data provided to PP::get_derivatives(). */
@@ -659,6 +667,127 @@ template <class PP> class ParticleIterator {
 	return( _pidata._geom->material_check( i, j, k ) != 0 );
     }
 
+    /*! \brief Return if node (i,j) is inside a Neumann-mask solid. */
+    bool is_mask( int i, int j ) {
+	return( SMESH_NODE_IS_NEUMANN_MASK( _pidata._geom->mesh_check( i, j ) ) );
+    }
+
+    /*! \brief Return if node (i,j,k) is inside a Neumann-mask solid. */
+    bool is_mask( int i, int j, int k ) {
+	return( SMESH_NODE_IS_NEUMANN_MASK( _pidata._geom->mesh_check( i, j, k ) ) );
+    }
+
+    /*! \brief Is the cell the particle is about to enter masked?
+     *
+     *  Tests the same corner nodes, for the same crossing direction, that
+     *  the is_solid() checks in handle_trajectory_advance() use.
+     *
+     *  This is needed as a separate test because is_solid() deliberately
+     *  does NOT match mask nodes -- it must not, or they would trigger the
+     *  near-solid cut-cell machinery, and a mask is a staircase on the mesh
+     *  by construction. Without this check a particle would simply walk
+     *  into the masked region and keep integrating somewhere the field was
+     *  never solved.
+     */
+    bool entering_mask( int dir, const int i[3] ) {
+	if( PP::dim() == 2 ) {
+	    switch( dir ) {
+	    case -1: return( is_mask(i[0],  i[1]  ) || is_mask(i[0],  i[1]+1) );
+	    case +1: return( is_mask(i[0]+1,i[1]  ) || is_mask(i[0]+1,i[1]+1) );
+	    case -2: return( is_mask(i[0],  i[1]  ) || is_mask(i[0]+1,i[1]  ) );
+	    default: return( is_mask(i[0],  i[1]+1) || is_mask(i[0]+1,i[1]+1) );
+	    }
+	} else if( PP::dim() == 3 ) {
+	    switch( dir ) {
+	    case -1: return( is_mask(i[0],i[1],i[2]) || is_mask(i[0],i[1]+1,i[2]) ||
+			     is_mask(i[0],i[1],i[2]+1) || is_mask(i[0],i[1]+1,i[2]+1) );
+	    case +1: return( is_mask(i[0]+1,i[1],i[2]) || is_mask(i[0]+1,i[1]+1,i[2]) ||
+			     is_mask(i[0]+1,i[1],i[2]+1) || is_mask(i[0]+1,i[1]+1,i[2]+1) );
+	    case -2: return( is_mask(i[0],i[1],i[2]) || is_mask(i[0]+1,i[1],i[2]) ||
+			     is_mask(i[0],i[1],i[2]+1) || is_mask(i[0]+1,i[1],i[2]+1) );
+	    case +2: return( is_mask(i[0],i[1]+1,i[2]) || is_mask(i[0]+1,i[1]+1,i[2]) ||
+			     is_mask(i[0],i[1]+1,i[2]+1) || is_mask(i[0]+1,i[1]+1,i[2]+1) );
+	    case -3: return( is_mask(i[0],i[1],i[2]) || is_mask(i[0]+1,i[1],i[2]) ||
+			     is_mask(i[0],i[1]+1,i[2]) || is_mask(i[0]+1,i[1]+1,i[2]) );
+	    default: return( is_mask(i[0],i[1],i[2]+1) || is_mask(i[0]+1,i[1],i[2]+1) ||
+			     is_mask(i[0],i[1]+1,i[2]+1) || is_mask(i[0]+1,i[1]+1,i[2]+1) );
+	    }
+	}
+	return( false );
+    }
+
+    /*! \brief Is solid number \a n a Neumann mask?
+     *
+     *  Cached at construction rather than asking Geometry per test:
+     *  get_boundary() returns Bound BY VALUE and range-checks on every
+     *  call, and this sits in the trajectory inner loop.
+     */
+    bool is_mask_solid( uint32_t n ) const {
+	return( n >= 7 && n - 7 < _mask_solid.size() && _mask_solid[n-7] );
+    }
+
+    /*! \brief Reflect the particle if it is genuinely entering a mask.
+     *
+     *  A mask is a SYMMETRY surface, so a particle reaching it must be
+     *  reflected -- not absorbed (that would put an artificial loss channel
+     *  on a surface that is not physically there, which is one of the
+     *  things a mask exists to avoid) and not passed through (there is no
+     *  field solution on the far side).
+     *
+     *  Returns false, having done nothing, if the particle is not actually
+     *  crossing into the masked region. That matters: entering_mask() is
+     *  only a cheap GATE. It fires whenever any corner of the target cell
+     *  is masked, which includes a particle travelling ALONG the mask
+     *  boundary in a cell that merely touches it. Reflecting on the gate
+     *  alone would bounce particles that are doing nothing wrong. The
+     *  decision is therefore made by Geometry::inside() against the real
+     *  solid, exactly as check_collision_solid() decides for conductors.
+     *
+     *  handle_mirror() cannot be reused for this: it is hard-wired to the
+     *  box faces, taking its mirror plane from geom->origo(a)/max(a) and
+     *  remapping the mesh index by reflecting about the whole box. Here the
+     *  plane is an interior surface and the mesh index must not move -- the
+     *  particle stays in the cell it was in.
+     *
+     *  The crossing point is found by bisection against the solid
+     *  (bracket_surface(), the same routine check_collision_solid() uses),
+     *  so it is sub-cell accurate. The reflection is then about the
+     *  AXIS-ALIGNED plane through that point, normal taken from the mesh
+     *  direction being crossed. For an axis-aligned mask -- the usual case,
+     *  a radial or axial cut -- that is exact. For a curved or oblique mask
+     *  it approximates the normal, which is consistent with the staircase
+     *  the field stencil uses there; a smooth oblique reflector would need
+     *  the true surface normal computed here.
+     */
+    bool handle_mask_reflection( size_t c, int dir, PP &x2 ) {
+
+	Vec3D v2 = x2.location();
+	uint32_t bound = _pidata._geom->inside( v2 );
+	if( !is_mask_solid( bound ) )
+	    return( false );   // gate fired but the particle is not entering
+
+	DEBUG_MESSAGE( "Reflecting trajectory at Neumann mask " << bound << "\n" );
+
+	// Bisect between the last point outside and the point inside.
+	Vec3D vc;
+	Vec3D v1 = _coldata[c]._x.location();
+	_pidata._geom->bracket_surface( bound, v2, v1, vc );
+
+	const size_t a = (size_t)((dir < 0 ? -dir : dir) - 1);
+
+	save_trajectory_point( _coldata[c]._x );
+
+	x2[2*a+1] = 2.0*vc[a] - x2[2*a+1];
+	x2[2*a+2] *= -1.0;
+
+	// Coordinates changed discontinuously: the adaptive stepper's
+	// history no longer describes this trajectory.
+	gsl_odeiv2_step_reset( _step );
+	gsl_odeiv2_evolve_reset( _evolve );
+
+	return( true );
+    }
+
     /*! \brief Handle particle mesh intersection.
      *
      *  Particle mesh coordinates \a i are advanced through
@@ -672,6 +801,26 @@ template <class PP> class ParticleIterator {
 	bool surface_collision = false;
 	DEBUG_MESSAGE( "Handle trajectory advance\n" );
 	DEBUG_INC_INDENT();
+
+	// Neumann-mask reflection, BEFORE the solid checks and before the
+	// mesh index is advanced. The particle stays in the cell it was in
+	// with its normal velocity flipped, so i[] must not move -- hence
+	// the early return rather than falling through to the advance
+	// below.
+	// Neumann-mask reflection, BEFORE the solid checks and before the
+	// mesh index is advanced: a reflected particle stays in the cell it
+	// was in, so i[] must not move -- hence the early return rather than
+	// falling through to the advance below.
+	//
+	// entering_mask() is only a cheap gate; handle_mask_reflection()
+	// makes the real decision against the solid and returns false if the
+	// particle is merely travelling alongside the mask rather than into
+	// it, in which case this falls through to the normal handling.
+	if( entering_mask( _coldata[c]._dir, i ) &&
+	    handle_mask_reflection( c, _coldata[c]._dir, x2 ) ) {
+	    DEBUG_DEC_INDENT();
+	    return( true );
+	}
 
 	// Check for collisions with solids and advance coordinates i.
 	if( PP::dim() == 2 ) {
@@ -1157,6 +1306,16 @@ public:
 	  _thand_cb(0), _tend_cb(0), _tsur_cb(0), _bsup_cb(0), _pdb(0),
 	  _stat(geom->number_of_boundaries()),
 	  _time_ode(0.0), _time_trajhandle(0.0) {
+
+	// Cache which solids are Neumann masks -- see _mask_solid.
+	{
+	    uint32_t nb = geom->number_of_boundaries();
+	    if( nb > 6 ) {
+		_mask_solid.resize( nb - 6, false );
+		for( uint32_t n = 7; n <= nb; n++ )
+		    _mask_solid[n-7] = ( geom->get_boundary(n).type() == BOUND_NEUMANN );
+	    }
+	}
 
 	// Initialize mirroring
 	_mirror[0] = mirror[0];

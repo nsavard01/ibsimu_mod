@@ -321,6 +321,25 @@ protected:
      */
     void preprocess( MeshScalarField &epot );
 
+    /*! \brief Does this solver implement Neumann-mask solids?
+     *
+     *  A Neumann mask (a solid given BOUND_NEUMANN, see
+     *  Geometry::set_boundary()) removes its nodes from the solve and puts
+     *  a zero-flux condition on every face separating one of them from a
+     *  live node. In EpotMatrixSolver that falls out of set_link()
+     *  redirecting such a face onto the row's own diagonal, so every
+     *  stencil builder gets it for free.
+     *
+     *  The Gauss-Seidel and multigrid solvers do not go through set_link()
+     *  -- they carry their own hand-written stencils per node type -- so
+     *  they would silently treat a masked node as an ordinary fixed node
+     *  and read its (meaningless) stored potential into their neighbours'
+     *  right hand sides. Rather than let that happen quietly, preprocess()
+     *  refuses to run them on a geometry containing a mask. Override to
+     *  true once a solver actually handles it.
+     */
+    virtual bool supports_neumann_mask( void ) const { return( false ); }
+
     /*! \brief Do postprocessing action after solving.
      *
      *  Return near solid neumann points as near solid. Restore
