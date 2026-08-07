@@ -751,43 +751,58 @@ template <class PP> class ParticleIterator {
      *  boundary in a cell that merely touches it. Reflecting on the gate
      *  alone would bounce particles that are doing nothing wrong. The
      *  decision is therefore made by Geometry::inside() against the real
-     *  solid, exactly as check_collision_solid() decides for conductors.
+     *  solid, as check_collision_solid() decides for conductors.
      *
-     *  handle_mirror() cannot be reused for this: it is hard-wired to the
-     *  box faces, taking its mirror plane from geom->origo(a)/max(a) and
-     *  remapping the mesh index by reflecting about the whole box. Here the
-     *  plane is an interior surface and the mesh index must not move -- the
-     *  particle stays in the cell it was in.
+     *  THE MIRROR PLANE IS THE MESH FACE just crossed, _coldata[c], not the
+     *  analytic solid surface. Two reasons, and the first is not optional:
      *
-     *  The crossing point is found by bisection against the solid
-     *  (bracket_surface(), the same routine check_collision_solid() uses),
-     *  so it is sub-cell accurate. The reflection is then about the
-     *  AXIS-ALIGNED plane through that point, normal taken from the mesh
-     *  direction being crossed. For an axis-aligned mask -- the usual case,
-     *  a radial or axial cut -- that is exact. For a curved or oblique mask
-     *  it approximates the normal, which is consistent with the staircase
-     *  the field stencil uses there; a smooth oblique reflector would need
-     *  the true surface normal computed here.
+     *  - handle_trajectory() keeps walking the REMAINING _coldata entries
+     *    after this returns, and they describe the un-reflected path. They
+     *    must be mirrored too, exactly as handle_mirror() does for the box
+     *    faces. That is only exact if the mirror plane coincides with a
+     *    crossing point. An earlier version reflected about the bisected
+     *    analytic surface and left the rest of _coldata alone; the particle
+     *    then had its mesh index tracked against a trajectory that no
+     *    longer existed, wandered outside the field, and every subsequent
+     *    step was rejected with IBSIMU_DERIV_ERROR until the step size
+     *    collapsed to zero -- "too small step size", thrown a few thousand
+     *    particles into the run.
+     *
+     *  - It is also the more consistent choice. The field's zero-flux
+     *    surface is not the analytic one either: set_link() drops the face
+     *    between a live node and a masked node, which is a mesh-aligned
+     *    plane. Reflecting particles on a mesh-aligned plane keeps the two
+     *    within half a cell of each other instead of letting them disagree
+     *    arbitrarily.
+     *
+     *  The mesh index i[] is deliberately NOT advanced by the caller in
+     *  this path: a reflected particle stays in the cell it was in.
      */
     bool handle_mask_reflection( size_t c, int dir, PP &x2 ) {
 
-	Vec3D v2 = x2.location();
-	uint32_t bound = _pidata._geom->inside( v2 );
-	if( !is_mask_solid( bound ) )
+	if( !is_mask_solid( _pidata._geom->inside( x2.location() ) ) )
 	    return( false );   // gate fired but the particle is not entering
 
-	DEBUG_MESSAGE( "Reflecting trajectory at Neumann mask " << bound << "\n" );
-
-	// Bisect between the last point outside and the point inside.
-	Vec3D vc;
-	Vec3D v1 = _coldata[c]._x.location();
-	_pidata._geom->bracket_surface( bound, v2, v1, vc );
-
 	const size_t a = (size_t)((dir < 0 ? -dir : dir) - 1);
+	const double xmirror = _coldata[c]._x[2*a+1];
+
+	DEBUG_MESSAGE( "Reflecting trajectory at Neumann mask, plane "
+		       << xmirror << "\n" );
 
 	save_trajectory_point( _coldata[c]._x );
 
-	x2[2*a+1] = 2.0*vc[a] - x2[2*a+1];
+	// Mirror this and every later crossing about the same plane, and
+	// flip the direction of those along the reflected axis. Same as
+	// handle_mirror(), minus the box-index remapping.
+	for( size_t b = c; b < _coldata.size(); b++ ) {
+	    const int d = _coldata[b]._dir;
+	    if( (size_t)((d < 0 ? -d : d)) == a+1 )
+		_coldata[b]._dir = -d;
+	    _coldata[b]._x[2*a+1] = 2.0*xmirror - _coldata[b]._x[2*a+1];
+	    _coldata[b]._x[2*a+2] *= -1.0;
+	}
+
+	x2[2*a+1] = 2.0*xmirror - x2[2*a+1];
 	x2[2*a+2] *= -1.0;
 
 	// Coordinates changed discontinuously: the adaptive stepper's
