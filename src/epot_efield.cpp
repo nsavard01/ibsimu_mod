@@ -252,6 +252,30 @@ bool EpotEfield::dielectric_face_field( int32_t i1, int32_t j1, int32_t k1,
 }
 
 
+/* Is this face separating a live node from a Neumann-mask node?
+ *
+ * Such a face carries ZERO normal field, by the definition of the mask, and
+ * must be forced rather than differenced. Differencing it uses the masked
+ * node's STORED potential, which is not a solution of anything:
+ * EpotSolver::preprocess() deliberately leaves it alone and
+ * EpotMatrixSolver::set_solution() writes only free nodes, so it holds
+ * whatever was in the EpotField beforehand (zero for a fresh one). The
+ * resulting face value is garbage, and because the field seen by a particle
+ * is interpolated FROM face values, the error reaches a cell deep into the
+ * live region -- pushing particles off the boundary and thinning the
+ * deposited charge density right where it should be flat.
+ *
+ * Zero is not a patch. It is the same statement the matrix already makes:
+ * EpotMatrixSolver::set_link() drops that face from the row precisely
+ * because no flux crosses it. A face between two masked nodes is zero for
+ * the same reason.
+ */
+static inline bool neumann_mask_face( uint32_t node1, uint32_t node2 )
+{
+    return( SMESH_NODE_IS_NEUMANN_MASK( node1 ) ||
+            SMESH_NODE_IS_NEUMANN_MASK( node2 ) );
+}
+
 void EpotEfield::precalc_1d( void )
 {
     double h = _epot.h();
@@ -342,7 +366,15 @@ void EpotEfield::precalc_1d( void )
 	_F[0][n-1] = -_F[0][n-2];
     else
 	_F[0][n-1] = 2.0*_F[0][n-2]-_F[0][n-3];
+
+    // Zero normal field on faces touching a Neumann mask -- see
+    // neumann_mask_face(). Post-pass, same reasoning as precalc_2d().
+    for( uint32_t i = 1; i < n-1; i++ )
+	if( neumann_mask_face( _geom->mesh(i-1), _geom->mesh(i) ) )
+	    _F[0][i] = 0.0;
 }
+
+
 
 
 void EpotEfield::precalc_2d( void )
@@ -523,6 +555,27 @@ void EpotEfield::precalc_2d( void )
 	else
 	    _F[1][i+(m-1)*_epot.size(0)] = 2.0*_F[1][i+(m-2)*_epot.size(0)]-_F[1][i+(m-3)*_epot.size(0)];
     }
+
+    /* Force zero normal field on every face touching a Neumann mask.
+     *
+     * Done as a post-pass rather than as another branch in the if-chains
+     * above: those chains have several exits per face (near-solid,
+     * inside-solid, dielectric, free space) and a mask can co-occur with
+     * any of them, so a single sweep afterwards is both simpler and
+     * impossible to fall through.
+     *
+     * The i and j ranges match the loops above exactly, so the box-edge
+     * faces the extrapolation owns are left untouched.
+     */
+    for( uint32_t j = 0; j < m-1; j++ )
+	for( uint32_t i = 1; i < n-1; i++ )
+	    if( neumann_mask_face( _geom->mesh(i-1,j), _geom->mesh(i,j) ) )
+		_F[0][i+j*n] = 0.0;
+
+    for( uint32_t i = 0; i < n-1; i++ )
+	for( uint32_t j = 1; j < m-1; j++ )
+	    if( neumann_mask_face( _geom->mesh(i,j-1), _geom->mesh(i,j) ) )
+		_F[1][i+j*_epot.size(0)] = 0.0;
 }
 
 
@@ -803,6 +856,26 @@ void EpotEfield::precalc_3d( void )
 		    _F[2][i+(j+(o-3)*_epot.size(1))*_epot.size(0)];
 	}
     }
+
+    // Zero normal field on faces touching a Neumann mask -- see
+    // neumann_mask_face(). Post-pass, same reasoning as precalc_2d().
+    for( uint32_t k = 0; k < o-1; k++ )
+	for( uint32_t j = 0; j < m-1; j++ )
+	    for( uint32_t i = 1; i < n-1; i++ )
+		if( neumann_mask_face( _geom->mesh(i-1,j,k), _geom->mesh(i,j,k) ) )
+		    _F[0][i+(j+k*_epot.size(1))*n] = 0.0;
+
+    for( uint32_t k = 0; k < o-1; k++ )
+	for( uint32_t i = 0; i < n-1; i++ )
+	    for( uint32_t j = 1; j < m-1; j++ )
+		if( neumann_mask_face( _geom->mesh(i,j-1,k), _geom->mesh(i,j,k) ) )
+		    _F[1][i+(j+k*m)*_epot.size(0)] = 0.0;
+
+    for( uint32_t j = 0; j < m-1; j++ )
+	for( uint32_t i = 0; i < n-1; i++ )
+	    for( uint32_t k = 1; k < o-1; k++ )
+		if( neumann_mask_face( _geom->mesh(i,j,k-1), _geom->mesh(i,j,k) ) )
+		    _F[2][i+(j+k*_epot.size(1))*_epot.size(0)] = 0.0;
 }
 
 
