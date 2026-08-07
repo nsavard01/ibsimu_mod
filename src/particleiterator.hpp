@@ -321,6 +321,16 @@ template <class PP> class ParticleIterator {
      *  for a test in the trajectory inner loop.
      */
     std::vector<bool>          _mask_solid;
+
+    /*! \brief Does this geometry contain ANY Neumann mask?
+     *
+     *  Short-circuits the mask test in handle_trajectory_advance(). Without
+     *  it every mesh-face crossing in every simulation would pay for 4 (2D)
+     *  or 8 (3D) mesh_check() lookups that can only ever return false --
+     *  a small but unnecessary tax on the overwhelming majority of runs,
+     *  which have no mask at all.
+     */
+    bool                       _have_mask;
     bool                       _surface_collision;
 
     ParticleIteratorData       _pidata;        /*!< \brief User data provided to PP::get_derivatives(). */
@@ -816,7 +826,7 @@ template <class PP> class ParticleIterator {
 	// makes the real decision against the solid and returns false if the
 	// particle is merely travelling alongside the mask rather than into
 	// it, in which case this falls through to the normal handling.
-	if( entering_mask( _coldata[c]._dir, i ) &&
+	if( _have_mask && entering_mask( _coldata[c]._dir, i ) &&
 	    handle_mask_reflection( c, _coldata[c]._dir, x2 ) ) {
 	    DEBUG_DEC_INDENT();
 	    return( true );
@@ -1308,12 +1318,17 @@ public:
 	  _time_ode(0.0), _time_trajhandle(0.0) {
 
 	// Cache which solids are Neumann masks -- see _mask_solid.
+	_have_mask = false;
 	{
 	    uint32_t nb = geom->number_of_boundaries();
 	    if( nb > 6 ) {
 		_mask_solid.resize( nb - 6, false );
-		for( uint32_t n = 7; n <= nb; n++ )
-		    _mask_solid[n-7] = ( geom->get_boundary(n).type() == BOUND_NEUMANN );
+		for( uint32_t n = 7; n <= nb; n++ ) {
+		    bool m = ( geom->get_boundary(n).type() == BOUND_NEUMANN );
+		    _mask_solid[n-7] = m;
+		    if( m )
+			_have_mask = true;
+		}
 	    }
 	}
 

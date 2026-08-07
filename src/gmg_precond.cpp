@@ -440,12 +440,35 @@ void GMG_Precond::galerkin_coarsen( const Level &fine, Level &coarse ) const
  * rationale); duplicated here rather than shared so that GMG_Precond
  * has no compile-time dependency on RBSOR_Precond.
  */
-void GMG_Precond::color_graph( Level &lev ) const
+void GMG_Precond::color_graph( Level &lev, const std::vector<int32_t> *node_map ) const
 {
+    /* node_map, when non-NULL, is _node_map: rows whose mesh slot is
+     * eliminated (node_map < 0) are left OUT of the colour lists entirely,
+     * so the smoother never visits them.
+     *
+     * They are inert by construction, not merely unimportant. build_level0()
+     * gives an eliminated slot a single entry, the identity (m,m)=1, and
+     * maps every live row's columns through _row_to_node, which can only
+     * ever produce free nodes -- so nothing anywhere points AT an eliminated
+     * row. solve() fills their rhs with 0. Relaxing one therefore computes
+     *     x[m] <- (1-w)*x[m] + w*0
+     * from x[m] = 0, i.e. it does nothing at all, once per sweep, four
+     * sweeps per V-cycle, twice per BiCGSTAB iteration.
+     *
+     * They were previously visited because the existing skip in relax() is
+     * on inv_diag == 0, and an identity row's diagonal is 1, not 0.
+     *
+     * Only level 0 has eliminated slots -- coarser levels are pure Galerkin
+     * unknowns -- so node_map is passed there and NULL everywhere else. A
+     * coarse row that ends up entirely decoupled still gets zero diagonal
+     * and is still caught by relax()'s existing inv_diag test.
+     */
     int n = lev.n;
     std::vector<uint8_t> color( n, 0xFF );
 
     for( int i = 0; i < n; i++ ) {
+        if( node_map && (*node_map)[i] < 0 )
+            continue;
         bool red_taken = false, black_taken = false;
         for( int p = lev.ptr[i]; p < lev.ptr[i+1]; p++ ) {
             int j = lev.col[p];
@@ -460,6 +483,7 @@ void GMG_Precond::color_graph( Level &lev ) const
     }
 
     for( int i = 0; i < n; i++ ) {
+        if( node_map && (*node_map)[i] < 0 ) continue;
         if( color[i] == 2 ) continue;
         for( int p = lev.ptr[i]; p < lev.ptr[i+1]; p++ ) {
             int j = lev.col[p];
@@ -472,6 +496,7 @@ void GMG_Precond::color_graph( Level &lev ) const
 
     lev.red.clear(); lev.black.clear(); lev.leftover.clear();
     for( int i = 0; i < n; i++ ) {
+        if( node_map && (*node_map)[i] < 0 ) continue;
         if( color[i] == 0 ) lev.red.push_back( (uint32_t)i );
         else if( color[i] == 1 ) lev.black.push_back( (uint32_t)i );
         else lev.leftover.push_back( (uint32_t)i );
@@ -682,7 +707,7 @@ void GMG_Precond::prepare( const CRowMatrix &A )
     _level.clear();
 
     build_level0( A );
-    color_graph( _level[0] );
+    color_graph( _level[0], &_node_map );
     find_diagonals( _level[0] );
 
     uint32_t maxlevels = (_nlevels_req == 0 ? 0xFFFFFFFF : _nlevels_req);
@@ -703,7 +728,7 @@ void GMG_Precond::prepare( const CRowMatrix &A )
         const std::vector<int32_t> *fine_map = (_level.size() == 1 ? &_node_map : NULL);
         build_transfer_operators( fine, coarse, fine_map );
         galerkin_coarsen( fine, coarse );
-        color_graph( coarse );
+        color_graph( coarse, NULL );
         find_diagonals( coarse );
 
         _level.push_back( std::move(coarse) );
@@ -720,6 +745,21 @@ void GMG_Precond::prepare( const CRowMatrix &A )
         _x[l].assign( _level[l].n, 0.0 );
         _b[l].assign( _level[l].n, 0.0 );
         _r[l].assign( _level[l].n, 0.0 );
+    }
+
+    // Report how much of level 0 the smoother actually sweeps. Level 0 is
+    // full-mesh sized by construction (the geometric transfer operators
+    // need a structured grid), so on a geometry with many eliminated nodes
+    // -- Dirichlet electrodes, or a Neumann mask -- the gap between this
+    // and the level size is the work the colour lists now skip.
+    {
+        size_t swept = _level[0].red.size() + _level[0].black.size()
+                     + _level[0].leftover.size();
+        ibsimu.message( 1 ) << "GMG_Precond: smoother sweeps " << swept
+                            << " of " << _level[0].n << " level-0 rows ("
+                            << (100.0*swept/_level[0].n) << " %), "
+                            << (_level[0].n - swept)
+                            << " eliminated rows skipped\n";
     }
 
     ibsimu.message( 1 ) << "GMG_Precond: built " << _level.size() << " level(s), sizes:";

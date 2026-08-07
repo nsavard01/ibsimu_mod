@@ -320,7 +320,7 @@ private:
 
     void build_level0( const CRowMatrix &A );
     void refresh_level0_values( const CRowMatrix &A );
-    void color_graph( Level &lev ) const;
+    void color_graph( Level &lev, const std::vector<int32_t> *node_map = NULL ) const;
     void find_diagonals( Level &lev ) const;
     bool next_level_size( const Level &fine, uint32_t &cnx, uint32_t &cny, uint32_t &cnz ) const;
     void build_transfer_operators( const Level &fine, Level &coarse,
