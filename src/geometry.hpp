@@ -354,13 +354,6 @@ class Geometry : public Mesh
     VTriangleSurface           _surface;   /*!< \brief Triangulated surface. */
     std::vector<int32_t>       _triptr;    /*!< \brief Pointer from mesh cell to first triangle. */
     
-    /*! \brief Live nodes adjacent to a Neumann mask, with masked-face counts.
-     *
-     *  Built on first call after build_mesh() and reused thereafter. Empty
-     *  (and cheap) when the geometry has no Neumann-mask solid.
-     */
-    const std::vector<std::pair<uint32_t,uint8_t> > &mask_face_nodes( void ) const;
-
     /*! \brief Check if node is solid (n>=7).
      *
      *  Returns 0 if node is not solid (vacuum, outside mesh or
@@ -564,6 +557,21 @@ public:
     /*! \brief Returns a vector of boundary conditions.
      */
     std::vector<Bound> get_boundaries() const;
+
+    /*! \brief Live nodes adjacent to a Neumann mask, with masked-face counts.
+     *
+     *  Each entry is (node index, number of masked neighbours). A
+     *  node-centred Neumann mirror puts the symmetry plane ON the node, so
+     *  such a node owns a half control volume per masked face --
+     *  scharge_correct_neumann_mask() uses this to apply the same factor of
+     *  two that scharge_finalize_*() applies on the six box walls.
+     *
+     *  Built on first call after build_mesh() and reused thereafter, since
+     *  the answer cannot change once the mesh is built while the correction
+     *  is applied after every particle iteration. Empty, and free, when the
+     *  geometry has no Neumann-mask solid.
+     */
+    const std::vector<std::pair<uint32_t,uint8_t> > &mask_face_nodes( void ) const;
 
     /*! \brief Returns true if full solid data available.
      *
