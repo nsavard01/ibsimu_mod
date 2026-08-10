@@ -746,43 +746,42 @@ template <class PP> class ParticleIterator {
 	return( SMESH_NODE_IS_NEUMANN_MASK( _pidata._geom->mesh_check( i, j, k ) ) );
     }
 
-    /*! \brief Is the cell the particle is about to enter masked?
+    /*! \brief Is the particle crossing INTO a Neumann mask at _coldata[c]?
      *
-     *  Tests the same corner nodes, for the same crossing direction, that
-     *  the is_solid() checks in handle_trajectory_advance() use.
+     *  Decided ANALYTICALLY, by asking Geometry::inside() about a point just
+     *  past the crossing face -- NOT by the mesh node classification.
      *
-     *  This is needed as a separate test because is_solid() deliberately
-     *  does NOT match mask nodes -- it must not, or they would trigger the
-     *  near-solid cut-cell machinery, and a mask is a staircase on the mesh
-     *  by construction. Without this check a particle would simply walk
-     *  into the masked region and keep integrating somewhere the field was
-     *  never solved.
+     *  The mesh-node version this replaces caused a real and quiet bug.
+     *  Reflection was gated on SMESH_NODE_IS_NEUMANN_MASK, while absorption
+     *  in check_collision_solid() is decided by the analytic inside(). Those
+     *  two disagree everywhere between the mask surface and the first node
+     *  actually marked as masked, and when the gate said no,
+     *  handle_trajectory_advance() fell straight through to the absorbing
+     *  path -- so a SYMMETRY surface ate the beam. Measured in the ECR cut
+     *  run: 2.9 mA and 293 particles absorbed on solid 12, concentrated at
+     *  exactly the radius where the sheath was being measured, which is why
+     *  it showed up as space charge falling off towards the mask.
+     *
+     *  Testing the CROSSING POINT rather than the segment end x2 is
+     *  load-bearing, not stylistic. x2 is the same for every c, so a test on
+     *  it would fire on the FIRST face of a multi-crossing step and mirror
+     *  the trajectory about a plane it had not reached yet. The crossing
+     *  point identifies WHICH face is the entry face -- exactly what
+     *  handle_mask_reflection() needs for its mirror plane.
+     *
+     *  Cost is one inside() call per mesh crossing, and only when the
+     *  geometry has a mask at all (_have_mask). check_collision_solid()
+     *  performs the same call immediately afterwards in the non-mask case,
+     *  so this at worst doubles one test that was already being paid for.
      */
-    bool entering_mask( int dir, const int i[3] ) {
-	if( PP::dim() == 2 ) {
-	    switch( dir ) {
-	    case -1: return( is_mask(i[0],  i[1]  ) || is_mask(i[0],  i[1]+1) );
-	    case +1: return( is_mask(i[0]+1,i[1]  ) || is_mask(i[0]+1,i[1]+1) );
-	    case -2: return( is_mask(i[0],  i[1]  ) || is_mask(i[0]+1,i[1]  ) );
-	    default: return( is_mask(i[0],  i[1]+1) || is_mask(i[0]+1,i[1]+1) );
-	    }
-	} else if( PP::dim() == 3 ) {
-	    switch( dir ) {
-	    case -1: return( is_mask(i[0],i[1],i[2]) || is_mask(i[0],i[1]+1,i[2]) ||
-			     is_mask(i[0],i[1],i[2]+1) || is_mask(i[0],i[1]+1,i[2]+1) );
-	    case +1: return( is_mask(i[0]+1,i[1],i[2]) || is_mask(i[0]+1,i[1]+1,i[2]) ||
-			     is_mask(i[0]+1,i[1],i[2]+1) || is_mask(i[0]+1,i[1]+1,i[2]+1) );
-	    case -2: return( is_mask(i[0],i[1],i[2]) || is_mask(i[0]+1,i[1],i[2]) ||
-			     is_mask(i[0],i[1],i[2]+1) || is_mask(i[0]+1,i[1],i[2]+1) );
-	    case +2: return( is_mask(i[0],i[1]+1,i[2]) || is_mask(i[0]+1,i[1]+1,i[2]) ||
-			     is_mask(i[0],i[1]+1,i[2]+1) || is_mask(i[0]+1,i[1]+1,i[2]+1) );
-	    case -3: return( is_mask(i[0],i[1],i[2]) || is_mask(i[0]+1,i[1],i[2]) ||
-			     is_mask(i[0],i[1]+1,i[2]) || is_mask(i[0]+1,i[1]+1,i[2]) );
-	    default: return( is_mask(i[0],i[1],i[2]+1) || is_mask(i[0]+1,i[1],i[2]+1) ||
-			     is_mask(i[0],i[1]+1,i[2]+1) || is_mask(i[0]+1,i[1]+1,i[2]+1) );
-	    }
-	}
-	return( false );
+    bool entering_mask( size_t c, int dir ) {
+	const size_t a = (size_t)((dir < 0 ? -dir : dir) - 1);
+	Vec3D v = _coldata[c]._x.location();
+	// Step just past the face, into the cell being entered. Small
+	// compared with a cell, enormous compared with the ULP of a
+	// coordinate, so it cannot be lost to rounding.
+	v[a] += (dir < 0 ? -1.0 : 1.0) * 1.0e-3 * _pidata._geom->h();
+	return( is_mask_solid( _pidata._geom->inside( v ) ) );
     }
 
     /*! \brief Is solid number \a n a Neumann mask?
@@ -839,9 +838,11 @@ template <class PP> class ParticleIterator {
      */
     bool handle_mask_reflection( size_t c, int dir, PP &x2 ) {
 
-	if( !is_mask_solid( _pidata._geom->inside( x2.location() ) ) )
-	    return( false );   // gate fired but the particle is not entering
-
+	// NO re-test of x2 here. entering_mask() has already decided, and
+	// analytically, at the crossing point. Re-testing the segment END
+	// would reintroduce exactly the mesh-vs-analytic disagreement this
+	// was written to remove, and would reject a particle whose step
+	// happens to finish back outside the mask.
 	const size_t a = (size_t)((dir < 0 ? -dir : dir) - 1);
 	const double xmirror = _coldata[c]._x[2*a+1];
 
@@ -896,12 +897,13 @@ template <class PP> class ParticleIterator {
 	// was in, so i[] must not move -- hence the early return rather than
 	// falling through to the advance below.
 	//
-	// entering_mask() is only a cheap gate; handle_mask_reflection()
-	// makes the real decision against the solid and returns false if the
-	// particle is merely travelling alongside the mask rather than into
-	// it, in which case this falls through to the normal handling.
-	if( _have_mask && entering_mask( _coldata[c]._dir, i ) &&
-	    handle_mask_reflection( c, _coldata[c]._dir, x2 ) ) {
+	// entering_mask() is the whole decision now, taken analytically at
+	// the crossing point, so reflection ALWAYS precedes the absorbing
+	// solid checks below. That ordering is the fix: a Neumann mask is a
+	// symmetry surface and must never reach check_collision_solid(),
+	// which would happily absorb on it.
+	if( _have_mask && entering_mask( c, _coldata[c]._dir ) ) {
+	    handle_mask_reflection( c, _coldata[c]._dir, x2 );
 	    DEBUG_DEC_INDENT();
 	    return( true );
 	}

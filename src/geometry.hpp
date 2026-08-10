@@ -46,6 +46,7 @@
 
 #include <stdint.h>
 #include <vector>
+#include <utility>
 #include <iostream>
 #include "file.hpp"
 #include "vec3d.hpp"
@@ -325,10 +326,41 @@ class Geometry : public Mesh
      */
     std::vector<uint8_t>       _material;
 
+    /*! \brief Live nodes touching a Neumann mask, with their face count.
+     *
+     *  (node index, number of masked neighbours). A node-centred Neumann
+     *  mirror puts the symmetry plane ON the node, so such a node owns a
+     *  half control volume per masked face and its space charge needs a
+     *  factor of two per face -- see scharge_correct_neumann_mask().
+     *
+     *  CACHED because the answer is fixed once build_mesh() has run, while
+     *  the correction is applied after every particle iteration. Finding it
+     *  by sweeping is O(N) with 2*dim neighbour reads per node, which in 3D
+     *  is a large cost to repeat per major cycle for an answer that never
+     *  changes. The list itself is a SURFACE, so it is O(N^(2/3)) and
+     *  applying it is negligible.
+     *
+     *  A geometry with no mask caches an empty list and is then free
+     *  forever, so the common case pays one sweep for the whole run.
+     *
+     *  Mutable + lazily built: the consumers hold a const Geometry&, and
+     *  the build happens in the serial finalize section of
+     *  iterate_trajectories(), never from the threaded trajectory loop.
+     */
+    mutable std::vector<std::pair<uint32_t,uint8_t> > _mask_face_nodes;
+    mutable bool               _mask_face_nodes_valid = false;
+
     double                     _surface_eps; /*!< \brief Vertec matching tolerance. */
     VTriangleSurface           _surface;   /*!< \brief Triangulated surface. */
     std::vector<int32_t>       _triptr;    /*!< \brief Pointer from mesh cell to first triangle. */
     
+    /*! \brief Live nodes adjacent to a Neumann mask, with masked-face counts.
+     *
+     *  Built on first call after build_mesh() and reused thereafter. Empty
+     *  (and cheap) when the geometry has no Neumann-mask solid.
+     */
+    const std::vector<std::pair<uint32_t,uint8_t> > &mask_face_nodes( void ) const;
+
     /*! \brief Check if node is solid (n>=7).
      *
      *  Returns 0 if node is not solid (vacuum, outside mesh or

@@ -1686,8 +1686,63 @@ void Geometry::build_mesh_parallel( void )
 }
 
 
+const std::vector<std::pair<uint32_t,uint8_t> > &Geometry::mask_face_nodes( void ) const
+{
+    if( _mask_face_nodes_valid )
+	return( _mask_face_nodes );
+
+    _mask_face_nodes.clear();
+
+    // Cheap rejection first: no solid carries BOUND_NEUMANN, so there is
+    // nothing to find and the O(N) sweep below is skipped entirely. This is
+    // the common case and it should cost almost nothing.
+    bool any = false;
+    for( uint32_t n = 7; n <= _n+6 && !any; n++ )
+	any = ( _bound[n-1].type() == BOUND_NEUMANN );
+
+    if( any ) {
+	int32_t nx = _size[0], ny = _size[1], nz = _size[2];
+	for( int32_t k = 0; k < nz; k++ ) {
+	    for( int32_t j = 0; j < ny; j++ ) {
+		for( int32_t i = 0; i < nx; i++ ) {
+
+		    uint32_t idx = (uint32_t)(i + j*nx + k*nx*ny);
+		    if( _material[idx] != 0 )
+			continue;              // solid, dielectric or mask itself
+
+		    int c = 0;
+		    if( i > 0    && SMESH_NODE_IS_NEUMANN_MASK(_smesh[idx-1]) ) c++;
+		    if( i < nx-1 && SMESH_NODE_IS_NEUMANN_MASK(_smesh[idx+1]) ) c++;
+		    if( ny > 1 ) {
+			if( j > 0    && SMESH_NODE_IS_NEUMANN_MASK(_smesh[idx-nx]) ) c++;
+			if( j < ny-1 && SMESH_NODE_IS_NEUMANN_MASK(_smesh[idx+nx]) ) c++;
+		    }
+		    if( nz > 1 ) {
+			if( k > 0    && SMESH_NODE_IS_NEUMANN_MASK(_smesh[idx-nx*ny]) ) c++;
+			if( k < nz-1 && SMESH_NODE_IS_NEUMANN_MASK(_smesh[idx+nx*ny]) ) c++;
+		    }
+
+		    if( c )
+			_mask_face_nodes.push_back( std::make_pair( idx, (uint8_t)c ) );
+		}
+	    }
+	}
+	ibsimu.message( 1 ) << "Neumann-mask faces: " << _mask_face_nodes.size()
+			    << " live nodes touch a mask (cached)\n";
+    }
+
+    _mask_face_nodes_valid = true;
+    return( _mask_face_nodes );
+}
+
+
 void Geometry::build_mesh( void )
 {
+    // Node classification is about to change, so the derived mask-face
+    // list must be rebuilt on next use.
+    _mask_face_nodes_valid = false;
+    _mask_face_nodes.clear();
+
     Timer t;
     ibsimu.message( 1 ) << "Building mesh\n";
     ibsimu.inc_indent();

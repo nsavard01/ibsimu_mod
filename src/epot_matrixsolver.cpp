@@ -159,40 +159,72 @@ void EpotMatrixSolver::set_link( uint32_t a, uint32_t b, double val )
 
     if( (b & N2D_TYPE_MASK) == N2D_TYPE_FIXED ) {
 
-	/* A link pointing INTO a Neumann-mask solid is a zero-flux face:
-	 * redirect it onto the row's own diagonal instead of moving it to
-	 * the right hand side.
-	 *
-	 * Why that is exactly right, and why it is done here rather than in
-	 * each stencil builder:
-	 *
-	 * Every stencil in this file has the shape
-	 *     sum_f w_f * phi_(neighbour f)  -  cof * phi_self ,  cof = sum_f w_f
-	 * with the caller accumulating cof face by face and emitting the
-	 * diagonal at the end as set_link(a, self, -cof). Homogeneous
-	 * Neumann on face f means the ghost value equals the node's own
-	 * value, phi_f = phi_self, so face f contributes
-	 *     w_f * phi_self  -  w_f * phi_self  =  0
-	 * i.e. the face must vanish from the off-diagonals AND from the
-	 * diagonal sum. Sending w_f to the diagonal does precisely that:
-	 * the diagonal becomes -cof + w_f = -(cof - w_f), which is the
-	 * stencil the caller would have built had it never seen face f.
-	 *
-	 * Doing it in set_link() means it applies to every stencil builder
-	 * at once -- add_vacuum_node(), add_neumann_node_1d/2d/cyl/3d(),
-	 * add_near_solid_node_1d/2d/cyl/3d() -- and to every geometry mode,
-	 * with no per-site changes and no risk of one branch being missed.
-	 * A masked neighbour cannot silently fall through to the Dirichlet
-	 * path below and inject its (meaningless) stored potential into the
+	/* A link pointing INTO a Neumann-mask solid is a symmetry face:
+	 * redirect it onto the MIRROR-IMAGE node instead of moving it to the
 	 * right hand side.
+	 *
+	 * This matches what ibsimu already does on a Neumann BOX wall, which
+	 * is the convention the rest of the code is built around and which
+	 * should have been the starting point. add_neumann_node_2d() emits
+	 *     set_link( a, _n2d(i,j-1), 2.0*eps_self );   cof += 2.0*eps_self
+	 * -- weight 2*eps on the single INTERIOR neighbour. That is the
+	 * standard five-point stencil with the ghost eliminated by
+	 *     phi_(j+1) := phi_(j-1),
+	 * i.e. a NODE-CENTRED mirror whose zero-derivative plane lies exactly
+	 * ON the boundary node. The factor of two on one neighbour is its
+	 * signature.
+	 *
+	 * The mirror image of neighbour b about node a is 2a - b in linear
+	 * index space, for any axis and any geometry mode, because the mesh
+	 * index is affine: a neighbour is a +-1 or +-nx or +-nx*ny offset, so
+	 * negating the offset negates the index difference. Redirecting the
+	 * face weight there gives, for a node with mask on +y,
+	 *     w_m*phi_(j-1) + w_p*phi_(j-1) - (w_m+w_p)*phi_j
+	 * which for uniform eps is exactly 2*eps*phi_(j-1) - 2*eps*phi_j --
+	 * the box-wall stencil above. The duplicate-column merge in
+	 * build_mat_vec() folds the two entries on column (j-1) into one.
+	 *
+	 * The PREVIOUS version of this sent the weight to the row's own
+	 * diagonal, which imposes phi_ghost = phi_self. That is also a valid
+	 * zero-flux condition, but a FACE-centred one: its symmetry plane
+	 * sits half a cell OUTSIDE the last live node. Particles reflect off
+	 * the analytic solid surface at the node, so field and particles were
+	 * mirroring half a cell apart, leaving a half-cell the field treated
+	 * as symmetric but no particle ever entered. It also did not match
+	 * the *= 2.0 space-charge correction that scharge_finalize_*() applies
+	 * at box walls, which exists precisely because a node-centred mirror
+	 * node owns half a control volume.
+	 *
+	 * Doing it in set_link() still means it applies to every stencil
+	 * builder at once -- add_vacuum_node(), add_neumann_node_1d/2d/cyl/3d(),
+	 * add_near_solid_node_1d/2d/cyl/3d() -- with no per-site changes.
 	 *
 	 * The masked node's own index is a MESH node index here: preprocess()
 	 * sets _n2d(a) = N2D_TYPE_FIXED | a for every fixed node, so the
 	 * index survives unchanged and _geom.mesh() can be queried directly.
 	 */
 	if( SMESH_NODE_IS_NEUMANN_MASK( _geom.mesh( (int32_t)(b & N2D_INDEX_MASK) ) ) ) {
+
+	    const int32_t ai = (int32_t)(a & N2D_INDEX_MASK);
+	    const int32_t bi = (int32_t)(b & N2D_INDEX_MASK);
+	    const int32_t mi = 2*ai - bi;                 /* mirror of b about a */
+
+	    /* Fall back to the diagonal (face-centred mirror) when the image
+	     * node is unusable: off the end of the mesh, or itself masked or
+	     * fixed. The latter happens where the live region is one node
+	     * wide between two masks, or where a mask meets an electrode --
+	     * there is no meaningful image to reflect onto, and folding to
+	     * the diagonal at least keeps the row diagonally dominant instead
+	     * of referencing a node whose value means nothing. */
+	    bool usable = ( mi >= 0 && mi < (int32_t)_geom.nodecount() );
+	    if( usable ) {
+		uint32_t mn = _geom.mesh( mi );
+		usable = !SMESH_NODE_IS_NEUMANN_MASK( mn ) &&
+		         (_n2d(mi) & N2D_TYPE_MASK) != N2D_TYPE_FIXED;
+	    }
+
 	    _row_entries[a & N2D_INDEX_MASK].push_back(
-		std::make_pair( (int32_t)(a & N2D_INDEX_MASK), val ) );
+		std::make_pair( usable ? mi : ai, val ) );
 	    return;
 	}
 

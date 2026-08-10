@@ -857,6 +857,12 @@ public:
 	// scharge_clear_solid_nodes()'s doc comment. Strip out anything
 	// that leaked into a conductor or dielectric interior before this
 	// scharge map is handed to the potential solver.
+	// Half-control-volume correction on Neumann-mask faces. The
+	// equivalent for the six box walls is already inside
+	// scharge_finalize_*(), but those loops key on index 0 and size-1
+	// and so never see an interior mask.
+	scharge_correct_neumann_mask( scharge, _geom );
+
 	scharge_clear_solid_nodes( scharge, _geom );
 	t_scharge_finalize.stop();
 
