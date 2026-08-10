@@ -205,26 +205,41 @@ void EpotMatrixSolver::set_link( uint32_t a, uint32_t b, double val )
 	 */
 	if( SMESH_NODE_IS_NEUMANN_MASK( _geom.mesh( (int32_t)(b & N2D_INDEX_MASK) ) ) ) {
 
-	    const int32_t ai = (int32_t)(a & N2D_INDEX_MASK);
-	    const int32_t bi = (int32_t)(b & N2D_INDEX_MASK);
-	    const int32_t mi = 2*ai - bi;                 /* mirror of b about a */
+	    /* Mirror in MESH index space. The row index a is a DOF index and
+	     * b (being FIXED) carries a MESH index, so 2*a - b would subtract
+	     * one index space from the other and land on an arbitrary column.
+	     * _dof2node maps the row back to its mesh node first. */
+	    const int32_t dof_a  = (int32_t)(a & N2D_INDEX_MASK);
+	    const int32_t node_a = _dof2node[dof_a];
+	    const int32_t node_b = (int32_t)(b & N2D_INDEX_MASK);
+	    const int32_t node_m = 2*node_a - node_b;   /* image of b about a */
 
-	    /* Fall back to the diagonal (face-centred mirror) when the image
-	     * node is unusable: off the end of the mesh, or itself masked or
-	     * fixed. The latter happens where the live region is one node
-	     * wide between two masks, or where a mask meets an electrode --
-	     * there is no meaningful image to reflect onto, and folding to
-	     * the diagonal at least keeps the row diagonally dominant instead
-	     * of referencing a node whose value means nothing. */
-	    bool usable = ( mi >= 0 && mi < (int32_t)_geom.nodecount() );
-	    if( usable ) {
-		uint32_t mn = _geom.mesh( mi );
-		usable = !SMESH_NODE_IS_NEUMANN_MASK( mn ) &&
-		         (_n2d(mi) & N2D_TYPE_MASK) != N2D_TYPE_FIXED;
+	    if( node_m >= 0 && node_m < (int32_t)_geom.nodecount() ) {
+
+		uint32_t n2d_m = _n2d(node_m);
+
+		if( (n2d_m & N2D_TYPE_MASK) != N2D_TYPE_FIXED ) {
+		    /* Image is a free node: it carries a DOF index, which is
+		     * what a matrix column must be. */
+		    _row_entries[dof_a].push_back(
+			std::make_pair( (int32_t)(n2d_m & N2D_INDEX_MASK), val ) );
+		    return;
+		} else if( !SMESH_NODE_IS_NEUMANN_MASK( _geom.mesh( node_m ) ) ) {
+		    /* Image is a Dirichlet node: its potential is known, so
+		     * the term belongs on the right hand side, exactly as an
+		     * ordinary fixed neighbour would. */
+		    (*_fd_vec)(a) += -val * (*_epot)( node_m );
+		    return;
+		}
+		/* Image is itself masked -- fall through. */
 	    }
 
-	    _row_entries[a & N2D_INDEX_MASK].push_back(
-		std::make_pair( usable ? mi : ai, val ) );
+	    /* No usable image: off the mesh, or masked on both sides (a live
+	     * region one node wide). Fold onto the diagonal instead, which is
+	     * the face-centred mirror phi_ghost = phi_self. Less accurate,
+	     * but local and diagonally dominant rather than referencing a
+	     * node whose value means nothing. */
+	    _row_entries[dof_a].push_back( std::make_pair( dof_a, val ) );
 	    return;
 	}
 
@@ -1432,7 +1447,16 @@ void EpotMatrixSolver::preprocess( MeshScalarField &epot, const MeshScalarField 
     reset_matrix();
 
     // Build n2d array and calculate degrees of freedom.
+    //
+    // NOTE the two index spaces stored here, which are NOT interchangeable:
+    //   fixed node -> N2D_TYPE_FIXED | (MESH index)
+    //   free  node -> N2D_TYPE_FREE  | (DOF  index)
+    // set_link()'s row argument is a DOF index, its column argument for a
+    // fixed neighbour is a MESH index. Mixing them silently produces valid-
+    // looking but meaningless matrix columns.
     _n2d.resize( _geom.size() );
+    _dof2node.clear();
+    _dof2node.reserve( _geom.nodecount() );
     _dof = 0;
     for( int32_t a = 0; a < (int32_t)_geom.nodecount(); a++ ) {
 
@@ -1445,6 +1469,7 @@ void EpotMatrixSolver::preprocess( MeshScalarField &epot, const MeshScalarField 
 	else { 
 	    // Free node
 	    _n2d(a) = N2D_TYPE_FREE | _dof;
+	    _dof2node.push_back( a );          // inverse map, see set_link()
 	    _dof++;
 	}
     }

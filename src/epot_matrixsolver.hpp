@@ -107,6 +107,16 @@ protected:
 
     uint32_t               _dof;           /*!< \brief Degrees of freedom. */
     Node2DoF               _n2d;           /*!< \brief Nodes to degrees of freedom map. */
+
+    /*! \brief Inverse of _n2d for free nodes: DOF index -> mesh node index.
+     *
+     *  _n2d stores a MESH index for fixed nodes but a DOF index for free
+     *  ones, and set_link() receives its row as a DOF index and a fixed
+     *  neighbour as a MESH index. Anything that needs to do geometry on a
+     *  row -- currently the Neumann-mask mirror -- must convert back first;
+     *  arithmetic mixing the two spaces yields valid-looking, wrong columns.
+     */
+    std::vector<int32_t>   _dof2node;
     CRowMatrix            *_fd_mat;        /*!< \brief Finite Difference matrix. */
     Vector                *_fd_vec;        /*!< \brief Finite Difference vector. */
 
