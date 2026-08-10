@@ -309,6 +309,14 @@ template <class PP> class ParticleIterator {
     double                     _epsrel;        /*!< \brief Relative error limit. */
     uint32_t                   _maxsteps;      /*!< \brief Maximum number of simulation steps for particle. */
     double                     _maxt;          /*!< \brief Maximum particle lifetime. */
+    /*! \brief Zero-length collision brackets seen by this iterator.
+     *
+     *  Rate-limits the warning in check_collision_solid(). Particle
+     *  iteration is threaded and there is one iterator per thread, so a
+     *  plain member needs no locking. A default member initialiser is used
+     *  rather than an entry in the constructor's init list, which would
+     *  have to be kept in declaration order to avoid -Wreorder. */
+    uint32_t                   _degenerate_bracket = 0;
     bool                       _save_points;   /*!< \brief Save all points? */
     uint32_t                   _trajdiv;       /*!< \brief Divisor for saved trajectories,
 					        * if 3, every third trajectory is saved. */
@@ -543,7 +551,58 @@ template <class PP> class ParticleIterator {
 	}
 	Vec3D vc;
 	Vec3D v1 = x1.location();
-	double K = _pidata._geom->bracket_surface( bound, v2, v1, vc );
+
+	// DEGENERATE INTERVAL: x1 and x2 are the same point.
+	//
+	// bracket_surface() throws "xin and xout are the same point" on this,
+	// because its return value is a parametric fraction along the segment,
+	//     (xsurf[a] - xin[a]) / (xout[a] - xin[a])
+	// taken on the axis of largest coordinate difference -- and that axis
+	// has zero extent. K is then used just below to interpolate the FULL
+	// particle state (time and velocity included, not only position) onto
+	// the solid surface, which is what makes absorption sub-cell accurate.
+	//
+	// With a zero-length segment there is no fraction to find, but the
+	// answer is already known: the inside() test above returned bound >= 7,
+	// so this point lies in a real solid, and K = 0 (status_x = x2) is what
+	// a converged bisection returns when the inside point IS the surface.
+	//
+	// CAUSE NOT YET ESTABLISHED. It first appeared at h = 0.5*debye, having
+	// never occurred at 5*debye. Note what the condition actually requires:
+	// x1 == x2 AND that point inside a solid, which also means x1 was inside
+	// the solid -- violating this function's stated precondition that x1 is
+	// in vacuum. So something upstream handed it a segment it should not
+	// have. Two things worth knowing while diagnosing:
+	//
+	//   - Geometry::inside() scans solids BACKWARDS, so the highest-numbered
+	//     solid is tested first. In the cut driver that is 12, the Neumann
+	//     mask -- the newest and least-exercised path.
+	//   - handle_mask_reflection() mirrors about the crossing point with
+	//     x2[2a+1] = 2*xmirror - x2[2a+1]. If x2 already sits on that plane
+	//     the mirror is a no-op in POSITION and flips only the velocity,
+	//     leaving the particle where it was and still inside the mask.
+	//
+	// The warning below prints both endpoints, the solid and the velocity
+	// precisely so this can be settled from one run rather than reasoned
+	// about. If the reported solid is 12 and the location is at
+	// r ~ enclosed_r with x < 0, it is the mask reflection.
+	if( v1 == v2 && _degenerate_bracket < 10 ) {
+	    _degenerate_bracket++;
+	    ibsimu.message( MSG_WARNING, 1 )
+		<< "Warning: zero-length collision bracket, solid " << bound
+		<< " at " << v2 << "; treating as a collision there.\n"
+		<< "         x1 = " << x1 << "\n"
+		<< "         x2 = " << x2 << "\n"
+		<< ( _degenerate_bracket == 10
+		     ? "         Further occurrences on this thread suppressed.\n"
+		     : "" );
+	} else if( v1 == v2 ) {
+	    _degenerate_bracket++;
+	}
+
+	double K = ( v1 == v2 )
+	    ? 0.0
+	    : _pidata._geom->bracket_surface( bound, v2, v1, vc );
 
 	// Calculate new PP
 	for( size_t a = 0; a < PP::size(); a++ )
