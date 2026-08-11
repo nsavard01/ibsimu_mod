@@ -317,6 +317,12 @@ template <class PP> class ParticleIterator {
      *  rather than an entry in the constructor's init list, which would
      *  have to be kept in declaration order to avoid -Wreorder. */
     uint32_t                   _degenerate_bracket = 0;
+
+    /*! \brief Mask reflections whose image fell outside the mesh.
+     *
+     *  Rate-limits the warning in handle_mask_reflection(). One iterator
+     *  per thread, so no locking needed. */
+    uint32_t                   _deep_mask_reflect = 0;
     bool                       _save_points;   /*!< \brief Save all points? */
     uint32_t                   _trajdiv;       /*!< \brief Divisor for saved trajectories,
 					        * if 3, every third trajectory is saved. */
@@ -851,19 +857,71 @@ template <class PP> class ParticleIterator {
 
 	save_trajectory_point( _coldata[c]._x );
 
-	// Mirror this and every later crossing about the same plane, and
-	// flip the direction of those along the reflected axis. Same as
-	// handle_mirror(), minus the box-index remapping.
-	for( size_t b = c; b < _coldata.size(); b++ ) {
-	    const int d = _coldata[b]._dir;
-	    if( (size_t)((d < 0 ? -d : d)) == a+1 )
-		_coldata[b]._dir = -d;
-	    _coldata[b]._x[2*a+1] = 2.0*xmirror - _coldata[b]._x[2*a+1];
-	    _coldata[b]._x[2*a+2] *= -1.0;
-	}
+	// Is the mirror image still inside the mesh?
+	//
+	// This check has no counterpart in handle_mirror(), and does not need
+	// one: a BOX mirror reflects about a domain EDGE, so the image is
+	// always on the inside. A mask plane is INTERIOR, and 2*p - x can
+	// land anywhere. Radially it goes NEGATIVE as soon as the particle
+	// penetrated further than the plane's own radius, and then
+	// get_derivatives() returns IBSIMU_DERIV_ERROR for every subsequent
+	// step (it rejects r <= 0), dt halves until it underflows to zero,
+	// and the run dies with "too small step size" -- far from the mask,
+	// with nothing in the message to connect it back here.
+	const double mirrored = 2.0*xmirror - x2[2*a+1];
+	const double lo = ( _pidata._geom->geom_mode() == MODE_CYL && a == 1 )
+	                  ? 0.0                              // r must stay > 0
+	                  : _pidata._geom->origo( (int)a );
+	const bool safe = ( mirrored > lo && mirrored < _pidata._geom->max( (int)a ) );
 
-	x2[2*a+1] = 2.0*xmirror - x2[2*a+1];
-	x2[2*a+2] *= -1.0;
+	if( safe ) {
+
+	    // Mirror this and every later crossing about the same plane, and
+	    // flip the direction of those along the reflected axis. Same as
+	    // handle_mirror(), minus the box-index remapping.
+	    for( size_t b = c; b < _coldata.size(); b++ ) {
+		const int d = _coldata[b]._dir;
+		if( (size_t)((d < 0 ? -d : d)) == a+1 )
+		    _coldata[b]._dir = -d;
+		_coldata[b]._x[2*a+1] = 2.0*xmirror - _coldata[b]._x[2*a+1];
+		_coldata[b]._x[2*a+2] *= -1.0;
+	    }
+
+	    x2[2*a+1] = mirrored;
+	    x2[2*a+2] *= -1.0;
+
+	} else {
+
+	    // TRUNCATE instead. Put the particle on the reflection plane, a
+	    // hair back on the live side, with the normal velocity reversed,
+	    // and discard the rest of this step's crossings -- they describe
+	    // a path that no longer exists. The next ODE step continues
+	    // normally from the plane.
+	    //
+	    // This loses the post-reflection path length within this one
+	    // step, which is bounded by the step itself. That is a far
+	    // smaller error than the alternative, and unlike the alternative
+	    // it cannot kill the run.
+	    const double eps = 1.0e-3 * _pidata._geom->h();
+	    x2 = _coldata[c]._x;
+	    x2[2*a+1] = xmirror + ( dir < 0 ? eps : -eps );
+	    x2[2*a+2] *= -1.0;
+	    _coldata.resize( c+1 );      // ends handle_trajectory()'s loop
+
+	    if( _deep_mask_reflect < 10 ) {
+		_deep_mask_reflect++;
+		ibsimu.message( MSG_WARNING, 1 )
+		    << "Warning: mask reflection about plane " << xmirror
+		    << " on axis " << a << " would have left the mesh ("
+		    << mirrored << "); truncating at the plane instead. The"
+		    << " particle penetrated more than the plane's own offset"
+		    << " in one step -- if frequent, the step size is too"
+		    << " large near the mask."
+		    << ( _deep_mask_reflect == 10
+			 ? " Further occurrences on this thread suppressed.\n"
+			 : "\n" );
+	    }
+	}
 
 	// Coordinates changed discontinuously: the adaptive stepper's
 	// history no longer describes this trajectory.
