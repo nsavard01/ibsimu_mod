@@ -318,6 +318,22 @@ template <class PP> class ParticleIterator {
      *  have to be kept in declaration order to avoid -Wreorder. */
     uint32_t                   _degenerate_bracket = 0;
 
+    /*! \brief Reflect particles at Neumann masks, or absorb them?
+     *
+     *  A mask is a symmetry surface, so true is the physically correct
+     *  setting and the default. false restores the old (wrong) behaviour in
+     *  which a mask absorbed like any other solid.
+     *
+     *  It exists as a DIAGNOSTIC. Reflection closes what was an artificial
+     *  loss channel, which raises the space charge near the mask; if a run
+     *  becomes unstable after enabling it, this separates "the extra charge
+     *  is real and the parameter set is space-charge limited" from "the
+     *  reflection itself is misbehaving". The field-side treatment is
+     *  untouched either way -- the stencil stays Neumann -- so the two
+     *  halves of the change can be tested independently.
+     */
+    bool                       _mask_reflect = true;
+
     bool                       _save_points;   /*!< \brief Save all points? */
     uint32_t                   _trajdiv;       /*!< \brief Divisor for saved trajectories,
 					        * if 3, every third trajectory is saved. */
@@ -937,7 +953,7 @@ template <class PP> class ParticleIterator {
 	// solid checks below. That ordering is the fix: a Neumann mask is a
 	// symmetry surface and must never reach check_collision_solid(),
 	// which would happily absorb on it.
-	if( _have_mask && entering_mask( c, _coldata[c]._dir ) ) {
+	if( _have_mask && _mask_reflect && entering_mask( c, _coldata[c]._dir ) ) {
 	    handle_mask_reflection( c, _coldata[c]._dir, x2 );
 	    DEBUG_DEC_INDENT();
 	    return( true );
@@ -1496,6 +1512,14 @@ public:
 	_surface_collision = surface_collision;
     }
 
+
+    /*! \brief Reflect at Neumann masks (true, default) or absorb (false).
+     *
+     *  Diagnostic switch -- see _mask_reflect. Affects particles only; the
+     *  potential solve keeps its Neumann stencil either way, so the field
+     *  side and the particle side of a mask can be tested independently.
+     */
+    void set_mask_reflection( bool reflect ) { _mask_reflect = reflect; }
 
     /*! \brief Set trajectory handler callback. 
      */

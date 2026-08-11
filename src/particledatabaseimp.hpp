@@ -73,6 +73,7 @@ protected:
     uint32_t                   _trajdiv;      /*!< \brief Divisor for saved trajectories,
 					       * if 3, every third trajectory is saved. */
     bool                       _mirror[6];    /*!< \brief Boundary particle mirroring. */
+    bool                       _mask_reflect = true; /*!< \brief Reflect (true) or absorb (false) at Neumann masks. */
 
     double                     _rhosum;       /*!< \brief Sum of space charge density in defined beams (C/m3). */
 
@@ -145,6 +146,9 @@ public:
     uint32_t get_save_trajectories( void ) const;
 
     void set_mirror( const bool mirror[6] );
+
+    void set_mask_reflection( bool reflect ) { _mask_reflect = reflect; }
+    bool get_mask_reflection( void ) const { return( _mask_reflect ); }
 
     void get_mirror( bool mirror[6] ) const;
 
@@ -791,6 +795,7 @@ public:
 							   _intrp, _scharge_dep, _maxsteps, _maxt,
 							   _save_points, _trajdiv, _mirror, &scharge,
 							   &efield, &bfield, &_geom ) );
+	    iterators[a]->set_mask_reflection( _mask_reflect );
 	    iterators[a]->set_trajectory_handler_callback( _thand_cb );
 	    iterators[a]->set_trajectory_end_callback( _tend_cb, _pdb );
 	    iterators[a]->set_trajectory_surface_collision_callback( _tsur_cb );

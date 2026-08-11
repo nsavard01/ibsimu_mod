@@ -362,6 +362,16 @@ public:
      */
     void set_mirror( const bool mirror[6] );
 
+    /*! \brief Reflect at Neumann masks (true, default) or absorb (false).
+     *
+     *  A mask is a symmetry surface, so reflection is correct. Absorption
+     *  is offered only as a diagnostic: it reinstates the artificial loss
+     *  channel a mask exists to remove, which is useful for deciding
+     *  whether an instability comes from the extra retained space charge
+     *  or from the reflection machinery. The potential solve is unaffected.
+     */
+    void set_mask_reflection( bool reflect );
+
     /*! \brief Get particle mirroring on boundaries.
      *
      *  Mirroring is read for (xmin,xmax,ymin,ymax,zmin,zmax)
