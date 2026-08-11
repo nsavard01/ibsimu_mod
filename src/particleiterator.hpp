@@ -318,11 +318,6 @@ template <class PP> class ParticleIterator {
      *  have to be kept in declaration order to avoid -Wreorder. */
     uint32_t                   _degenerate_bracket = 0;
 
-    /*! \brief Mask reflections whose image fell outside the mesh.
-     *
-     *  Rate-limits the warning in handle_mask_reflection(). One iterator
-     *  per thread, so no locking needed. */
-    uint32_t                   _deep_mask_reflect = 0;
     bool                       _save_points;   /*!< \brief Save all points? */
     uint32_t                   _trajdiv;       /*!< \brief Divisor for saved trajectories,
 					        * if 3, every third trajectory is saved. */
@@ -808,36 +803,46 @@ template <class PP> class ParticleIterator {
      *  things a mask exists to avoid) and not passed through (there is no
      *  field solution on the far side).
      *
-     *  Returns false, having done nothing, if the particle is not actually
-     *  crossing into the masked region. That matters: entering_mask() is
-     *  only a cheap GATE. It fires whenever any corner of the target cell
-     *  is masked, which includes a particle travelling ALONG the mask
-     *  boundary in a cell that merely touches it. Reflecting on the gate
-     *  alone would bounce particles that are doing nothing wrong. The
-     *  decision is therefore made by Geometry::inside() against the real
-     *  solid, as check_collision_solid() decides for conductors.
+     *  The particle is STOPPED at the plane, not mirrored past it. It is
+     *  placed on the crossing point with the normal velocity reversed, and
+     *  the rest of this step's crossings are discarded. Because the
+     *  crossing point carries its own time, the next ODE step resumes at
+     *  the instant of contact, so the step is shortened rather than any
+     *  path being lost.
      *
-     *  THE MIRROR PLANE IS THE MESH FACE just crossed, _coldata[c], not the
-     *  analytic solid surface. Two reasons, and the first is not optional:
+     *  Mirroring the overshoot -- what handle_mirror() does for box faces --
+     *  was tried and removed. It relies on two properties a box wall has
+     *  and a mask does not:
      *
-     *  - handle_trajectory() keeps walking the REMAINING _coldata entries
-     *    after this returns, and they describe the un-reflected path. They
-     *    must be mirrored too, exactly as handle_mirror() does for the box
-     *    faces. That is only exact if the mirror plane coincides with a
-     *    crossing point. An earlier version reflected about the bisected
-     *    analytic surface and left the rest of _coldata alone; the particle
-     *    then had its mesh index tracked against a trajectory that no
-     *    longer existed, wandered outside the field, and every subsequent
-     *    step was rejected with IBSIMU_DERIV_ERROR until the step size
-     *    collapsed to zero -- "too small step size", thrown a few thousand
-     *    particles into the run.
+     *  - A box mirror plane IS the domain edge, so the image of an
+     *    overshoot is always back inside. A mask plane is interior, and
+     *    2*p - x lands wherever it lands; radially it goes NEGATIVE once
+     *    the particle penetrated further than the plane's own radius.
      *
-     *  - It is also the more consistent choice. The field's zero-flux
-     *    surface is not the analytic one either: set_link() drops the face
-     *    between a live node and a masked node, which is a mesh-aligned
-     *    plane. Reflecting particles on a mesh-aligned plane keeps the two
-     *    within half a cell of each other instead of letting them disagree
-     *    arbitrarily.
+     *  - get_derivatives() bounds a box overshoot to one cell: a step
+     *    ending beyond origo-h / max+h returns IBSIMU_DERIV_ERROR, so the
+     *    step is rejected and dt halved until it fits. Nothing does that
+     *    for a mask, because the masked region is INSIDE the mesh box.
+     *    Worse, the solver never writes a potential there (see
+     *    epot_solver.cpp: masked nodes are eliminated and keep stale
+     *    values), so a particle that dips in is pushed by a meaningless
+     *    field and can arrive tens of cells deep in one step. Mirroring
+     *    that gave r < 0, after which every step failed the r > 0 test and
+     *    the run died with "too small step size" far from the mask.
+     *
+     *  Stopping at the plane means the particle never samples the unsolved
+     *  region, which beats any quality of guess about what is in it. There
+     *  is also no single mirror direction to guess ALONG: a mask is a
+     *  staircase with axial and radial faces and corners, not one plane
+     *  with a normal, so set_extrapolation()'s per-box-face trick has no
+     *  analogue here.
+     *
+     *  THE PLANE IS THE MESH FACE just crossed, _coldata[c], not the
+     *  analytic solid surface. With both mask faces snapped to node planes
+     *  by the driver the two coincide; where they do not, the mesh face is
+     *  still the right choice, because set_link() drops the face between a
+     *  live node and a masked node, so the field's own zero-flux surface is
+     *  mesh-aligned too.
      *
      *  The mesh index i[] is deliberately NOT advanced by the caller in
      *  this path: a reflected particle stays in the cell it was in.
@@ -857,71 +862,43 @@ template <class PP> class ParticleIterator {
 
 	save_trajectory_point( _coldata[c]._x );
 
-	// Is the mirror image still inside the mesh?
+	// TRUNCATE at the surface. The particle is placed exactly on the
+	// reflection plane, a hair back on the live side, with the normal
+	// velocity reversed, and the remaining crossings for this step are
+	// discarded -- they describe a path that no longer exists.
 	//
-	// This check has no counterpart in handle_mirror(), and does not need
-	// one: a BOX mirror reflects about a domain EDGE, so the image is
-	// always on the inside. A mask plane is INTERIOR, and 2*p - x can
-	// land anywhere. Radially it goes NEGATIVE as soon as the particle
-	// penetrated further than the plane's own radius, and then
-	// get_derivatives() returns IBSIMU_DERIV_ERROR for every subsequent
-	// step (it rejects r <= 0), dt halves until it underflows to zero,
-	// and the run dies with "too small step size" -- far from the mask,
-	// with nothing in the message to connect it back here.
-	const double mirrored = 2.0*xmirror - x2[2*a+1];
-	const double lo = ( _pidata._geom->geom_mode() == MODE_CYL && a == 1 )
-	                  ? 0.0                              // r must stay > 0
-	                  : _pidata._geom->origo( (int)a );
-	const bool safe = ( mirrored > lo && mirrored < _pidata._geom->max( (int)a ) );
-
-	if( safe ) {
-
-	    // Mirror this and every later crossing about the same plane, and
-	    // flip the direction of those along the reflected axis. Same as
-	    // handle_mirror(), minus the box-index remapping.
-	    for( size_t b = c; b < _coldata.size(); b++ ) {
-		const int d = _coldata[b]._dir;
-		if( (size_t)((d < 0 ? -d : d)) == a+1 )
-		    _coldata[b]._dir = -d;
-		_coldata[b]._x[2*a+1] = 2.0*xmirror - _coldata[b]._x[2*a+1];
-		_coldata[b]._x[2*a+2] *= -1.0;
-	    }
-
-	    x2[2*a+1] = mirrored;
-	    x2[2*a+2] *= -1.0;
-
-	} else {
-
-	    // TRUNCATE instead. Put the particle on the reflection plane, a
-	    // hair back on the live side, with the normal velocity reversed,
-	    // and discard the rest of this step's crossings -- they describe
-	    // a path that no longer exists. The next ODE step continues
-	    // normally from the plane.
-	    //
-	    // This loses the post-reflection path length within this one
-	    // step, which is bounded by the step itself. That is a far
-	    // smaller error than the alternative, and unlike the alternative
-	    // it cannot kill the run.
-	    const double eps = 1.0e-3 * _pidata._geom->h();
-	    x2 = _coldata[c]._x;
-	    x2[2*a+1] = xmirror + ( dir < 0 ? eps : -eps );
-	    x2[2*a+2] *= -1.0;
-	    _coldata.resize( c+1 );      // ends handle_trajectory()'s loop
-
-	    if( _deep_mask_reflect < 10 ) {
-		_deep_mask_reflect++;
-		ibsimu.message( MSG_WARNING, 1 )
-		    << "Warning: mask reflection about plane " << xmirror
-		    << " on axis " << a << " would have left the mesh ("
-		    << mirrored << "); truncating at the plane instead. The"
-		    << " particle penetrated more than the plane's own offset"
-		    << " in one step -- if frequent, the step size is too"
-		    << " large near the mask."
-		    << ( _deep_mask_reflect == 10
-			 ? " Further occurrences on this thread suppressed.\n"
-			 : "\n" );
-	    }
-	}
+	// Nothing is lost by this. x2 = _coldata[c]._x copies the crossing
+	// point INCLUDING its time (index 0), so the particle's clock sits at
+	// the instant it met the plane and the next ODE step simply continues
+	// from there. The step is cut short, not skipped.
+	//
+	// The alternative -- mirroring the whole overshoot about the plane,
+	// as handle_mirror() does for box walls -- was tried and removed. It
+	// works for a box because the mirror plane IS the domain edge, so the
+	// image is always inside, and because get_derivatives() bounds the
+	// overshoot to one cell: a step landing further out returns
+	// IBSIMU_DERIV_ERROR, is rejected, and dt is halved until it fits.
+	//
+	// Neither holds at a mask. The masked region is INSIDE the mesh box,
+	// so nothing errors and nothing bounds the penetration; and the
+	// potential there is never written by the solver (see epot_solver.cpp
+	// -- masked nodes are eliminated and keep stale values), so a particle
+	// that dips in is accelerated by a meaningless field and can arrive
+	// tens of cells deep in a single step. Mirroring that overshoot sent
+	// it to NEGATIVE radius, after which every subsequent step failed the
+	// r > 0 test and the run died with "too small step size", far from the
+	// mask and with nothing pointing back at it.
+	//
+	// Truncating means the particle never samples the unsolved region at
+	// all, which is worth more than any quality of guess about what is in
+	// there. A mask is also a staircase, not a plane, so there is no
+	// single well-defined mirror direction to extrapolate along the way
+	// set_extrapolation() can for a box face.
+	const double eps = 1.0e-3 * _pidata._geom->h();
+	x2 = _coldata[c]._x;
+	x2[2*a+1] = xmirror + ( dir < 0 ? eps : -eps );
+	x2[2*a+2] *= -1.0;
+	_coldata.resize( c+1 );      // ends handle_trajectory()'s loop
 
 	// Coordinates changed discontinuously: the adaptive stepper's
 	// history no longer describes this trajectory.
