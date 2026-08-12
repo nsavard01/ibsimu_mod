@@ -74,7 +74,7 @@ protected:
 					       * if 3, every third trajectory is saved. */
     bool                       _mirror[6];    /*!< \brief Boundary particle mirroring. */
     bool                       _mask_reflect = true; /*!< \brief Reflect (true) or absorb (false) at Neumann masks. */
-    bool                       _deterministic_scharge = true; /*!< \brief Per-thread scharge buffers, merged in thread order. */
+    bool                       _deterministic_scharge = false; /*!< \brief Per-thread scharge buffers, merged in thread order. Off: see the note at the allocation site. */
 
     double                     _rhosum;       /*!< \brief Sum of space charge density in defined beams (C/m3). */
 
@@ -808,12 +808,26 @@ public:
 	 * downstream (solver comparisons, particle-count convergence,
 	 * parameter fitting) can be attributed to what it looks like.
 	 *
-	 * Each thread now owns a private field and they are summed in THREAD
-	 * ORDER afterwards, which is a fixed order independent of scheduling.
+	 * Each thread owns a private field and they are summed in THREAD
+	 * ORDER afterwards.
 	 *
-	 * Cost is nthreads * nodecount * 8 bytes. Set deterministic_scharge
-	 * false to go back to the shared+atomic version if that is too much
-	 * on a very fine mesh; the run is then faster and irreproducible.
+	 * DEFAULT OFF, because measurement says it does not deliver what it
+	 * promises. Fixing the MERGE order does not make the result
+	 * reproducible, because WHICH PARTICLES land in which thread's buffer
+	 * is still decided dynamically -- so each partial sum groups a
+	 * different set of contributions and rounds differently regardless of
+	 * the order the buffers are added in. It would only work if the
+	 * particle-to-thread partition were static too.
+	 *
+	 * Measured: with the GMG scatter made deterministic (which is what
+	 * actually fixed epot), scharge lands within 1 ULP either way --
+	 * 2.2e-16 relative on the total. The shared+atomic path gets the same
+	 * result for nthreads*nodecount*8 bytes less memory (870 MB at 3.4e6
+	 * nodes on 32 threads) and without a serial merge pass per cycle.
+	 *
+	 * Kept as a switch rather than deleted: combined with a static
+	 * particle partition it would give bit-exact deposition, which is
+	 * worth having if that last ULP ever matters.
 	 */
 	std::vector<MeshScalarField *> tscharge;
 	if( _deterministic_scharge ) {
