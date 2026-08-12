@@ -726,7 +726,22 @@ template <class PP> class ParticleIterator {
 	// Mirror calculation point
 	x2[2*a+1] = 2.0*xmirror - x2[2*a+1];
 	x2[2*a+2] *= -1.0;
-	
+
+	/* A mirror that lands EXACTLY on the plane is a stuck state in
+	 * MODE_CYL: the axis is r = 0, get_derivatives() rejects r <= 0, and
+	 * from then on every step fails whatever dt is -- the particle can
+	 * never leave. 2*xmirror - x is exactly xmirror whenever the particle
+	 * arrived exactly on the plane, which is not a rare accident on the
+	 * axis because trajectories are actively driven towards r = 0.
+	 *
+	 * Nudged to the live side by a small fraction of a cell. The size is
+	 * irrelevant physically -- it is far below the integration tolerance
+	 * -- and it only has to be enough to clear the strict inequality.
+	 */
+	if( _pidata._geom->geom_mode() == MODE_CYL && a == 1 &&
+	    x2[2*a+1] <= 0.0 )
+	    x2[2*a+1] = 1.0e-6 * _pidata._geom->h();
+
 	// Coordinates changed, reset integrator
 	gsl_odeiv2_step_reset( _step );
 	gsl_odeiv2_evolve_reset( _evolve );
@@ -1760,11 +1775,34 @@ public:
 	    if( nstp >= _maxsteps )
 	        break;
 	    if( x2[0] == x[0] ) {
-	        // Print failed trajectory
-		ibsimu.message( 1 ) << "Particle calculation failed. Coordinates:\n";
-		for( size_t a = 0; a < _traj.size(); a++ )
-		    ibsimu.message( 1 ) << a << " " << _traj[a] << "\n";
-	        throw( Error( ERROR_LOCATION, "too small step size calculating particle " + to_string(pi) ) );
+
+		/* The step was ACCEPTED but advanced time by zero, so the
+		 * particle cannot progress. Kill it rather than aborting the
+		 * run -- same reasoning as the underflow backstop above, and
+		 * the same trade: losing one particle's space charge beats
+		 * losing every completed cycle.
+		 *
+		 * The original also dumped the entire trajectory to the
+		 * message stream. That is worse than useless here: particle
+		 * iteration is threaded, so the dump interleaves with 31
+		 * other threads, and a long trajectory is thousands of lines.
+		 * One line with the location is the part that identifies
+		 * where it happened.
+		 */
+		if( _stuck_reported < 10 ) {
+		    _stuck_reported++;
+		    ibsimu.message( MSG_WARNING, 1 )
+			<< "Warning: particle " << pi << " made no progress (dt "
+			<< "accepted as zero) at " << x2.location()
+			<< ", killed as BADDEF."
+			<< ( _stuck_reported == 10
+			     ? " Further occurrences on this thread suppressed.\n"
+			     : "\n" );
+		}
+		particle->set_status( PARTICLE_BADDEF );
+		_stat.inc_end_baddef();
+		DEBUG_DEC_INDENT();
+		return;
 	    }
 	    
 	    // Increase step count.
