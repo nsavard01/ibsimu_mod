@@ -318,6 +318,11 @@ template <class PP> class ParticleIterator {
      *  have to be kept in declaration order to avoid -Wreorder. */
     uint32_t                   _degenerate_bracket = 0;
 
+    /*! \brief Particles killed by step-size underflow on this thread.
+     *
+     *  Rate-limits the warning. One iterator per thread, so no locking. */
+    uint32_t                   _stuck_reported = 0;
+
     /*! \brief Reflect particles at Neumann masks, or absorb them?
      *
      *  A mask is a symmetry surface, so true is the physically correct
@@ -1663,11 +1668,83 @@ public:
 			DEBUG_MESSAGE( "Step rejected\n" <<
 				       "  x2 = " << x2 << "\n" <<
 				       "  dt = " << dt << "\n" );
-			x2[0] = x[0]; // Reset time (this shouldn't be necessary - there
-				      // is a bug in GSL-1.12, report has been sent)
+			/* Restore the FULL state, not just the time.
+			 *
+			 * x2 = x is done once, above, OUTSIDE this retry loop.
+			 * gsl_odeiv2_evolve_apply() is handed &x2[0] as the
+			 * time and &x2[1] as the state, and on a rejected step
+			 * it can leave the state partially advanced -- the
+			 * original code here restored only x2[0], on the
+			 * suspicion (see the note it carried about GSL-1.12)
+			 * that the time was not being rolled back.
+			 *
+			 * The state has exactly the same problem and was not
+			 * being rolled back at all. So a step that overshoots
+			 * into an invalid region -- r <= 0 at the axis, say --
+			 * leaves x2 sitting THERE, and every retry then starts
+			 * from the invalid point instead of from x. The first
+			 * RK stage is evaluated at the start of the step, so
+			 * they all fail regardless of dt, and dt halves to zero:
+			 * "too small step size", thrown for a particle that was
+			 * never actually stuck.
+			 *
+			 * Restoring the whole state makes the retry mean what
+			 * it says -- take the same step again, smaller.
+			 */
+			x2 = x;
 			dt *= 0.5;
-			if( dt == 0.0 )
-			    throw( Error( ERROR_LOCATION, "too small step size" ) );
+			if( dt == 0.0 ) {
+
+			    /* STUCK PARTICLE -- kill it, do not abort the run.
+			     *
+			     * Halving only helps if the START of the step is a
+			     * valid sampling point: the first RK stage is
+			     * evaluated there. Once the current state itself
+			     * fails get_derivatives()'s range test -- r <= 0,
+			     * or outside the box by more than h -- every
+			     * candidate step is rejected however small, and dt
+			     * grinds to zero. It is a stuck state, not a step
+			     * size problem, and no dt can rescue it.
+			     *
+			     * With the state restored properly above, this
+			     * should now be unreachable in practice: a retry
+			     * from a valid x with a smaller dt has somewhere to
+			     * go. It is kept as a backstop, because throwing
+			     * was a poor trade -- one pathological particle out
+			     * of 192000 destroyed a 9000-second run at cycle 30
+			     * with nothing kept -- and because a genuinely
+			     * stuck state is still conceivable (a particle
+			     * placed outside the domain by a mirror, for
+			     * instance). If this fires, the state was already
+			     * bad on ENTRY to the step, which is a different
+			     * bug and the printed location says where.
+			     * Killing it as PARTICLE_BADDEF loses that
+			     * particle's contribution to the space charge --
+			     * one part in 1e5 -- and the run continues.
+			     *
+			     * Reported with its coordinates, rate-limited,
+			     * because WHERE it gets stuck is the diagnosis: r
+			     * at or below zero means the axis handling, x
+			     * beyond the box means a mirror or reflection put
+			     * it there. A steady trickle is tolerable; a burst
+			     * means something upstream is placing particles
+			     * outside the domain and should be fixed rather
+			     * than absorbed here.
+			     */
+			    if( _stuck_reported < 10 ) {
+				_stuck_reported++;
+				ibsimu.message( MSG_WARNING, 1 )
+				    << "Warning: particle stuck (step size underflow) at "
+				    << x2.location() << ", killed as BADDEF."
+				    << ( _stuck_reported == 10
+					 ? " Further occurrences on this thread suppressed.\n"
+					 : "\n" );
+			    }
+			    particle->set_status( PARTICLE_BADDEF );
+			    _stat.inc_end_baddef();
+			    DEBUG_DEC_INDENT();
+			    return;
+			}
 			//nstp++;
 			continue;
 		    } else if( retval == GSL_SUCCESS ) {
