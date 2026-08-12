@@ -683,17 +683,34 @@ void GMG_Precond::build_delta_update_tables( void )
      *
      * Sorting by destination lets each destination be summed by exactly one
      * thread, in a fixed index order. Deterministic, and faster -- the CAS
-     * loop is gone. stable_sort keeps the within-group order as built, and
-     * the build order is itself deterministic (per-thread buffers
-     * concatenated in thread order above), so the whole thing is
-     * reproducible end to end.
+     * loop is gone.
+     *
+     * The sort key is the FULL TRIPLE (dst, src, coef), not dst alone.
+     * An earlier version used stable_sort on dst only, reasoning that the
+     * build order was deterministic because the per-thread buffers are
+     * concatenated in thread order. That reasoning was wrong: the build
+     * loop above is schedule(dynamic,256), so WHICH rows land in which
+     * thread's buffer varies from run to run, and a stable sort faithfully
+     * preserves that varying order within each destination group. The
+     * summation order therefore still varied, and so did the result -- the
+     * bug survived the fix that was supposed to remove it.
+     *
+     * Ordering on the whole triple is canonical regardless of how the
+     * triples were generated, so it is robust to the schedule clause rather
+     * than dependent on it. Any triples identical in all three fields are
+     * interchangeable, so ties among them cannot affect the sum.
      */
     const size_t ntot = _delta_dst.size();
     std::vector<size_t> perm( ntot );
     std::iota( perm.begin(), perm.end(), (size_t)0 );
-    std::stable_sort( perm.begin(), perm.end(),
-                      [&]( size_t a, size_t b )
-                      { return( _delta_dst[a] < _delta_dst[b] ); } );
+    std::sort( perm.begin(), perm.end(),
+               [&]( size_t a, size_t b ) {
+                   if( _delta_dst[a] != _delta_dst[b] )
+                       return( _delta_dst[a] < _delta_dst[b] );
+                   if( _delta_src[a] != _delta_src[b] )
+                       return( _delta_src[a] < _delta_src[b] );
+                   return( _delta_coef[a] < _delta_coef[b] );
+               } );
 
     std::vector<int32_t> s2( ntot ), d2( ntot );
     std::vector<double>  c2( ntot );
