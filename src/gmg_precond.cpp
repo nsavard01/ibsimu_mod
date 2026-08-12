@@ -18,6 +18,7 @@
  */
 
 #include <algorithm>
+#include <numeric>
 #include <unordered_map>
 #include <cmath>
 #include <cstring>
@@ -117,6 +118,7 @@ void GMG_Precond::clear( void )
     _delta_src.clear();
     _delta_dst.clear();
     _delta_coef.clear();
+    _delta_group.clear();
 }
 
 
@@ -587,6 +589,7 @@ void GMG_Precond::build_delta_update_tables( void )
     _delta_src.clear();
     _delta_dst.clear();
     _delta_coef.clear();
+    _delta_group.clear();
 
     if( _level.size() < 2 )
         return; // no coarser level exists to update this way
@@ -660,6 +663,58 @@ void GMG_Precond::build_delta_update_tables( void )
         _delta_dst.insert( _delta_dst.end(), dst_buf[t].begin(), dst_buf[t].end() );
         _delta_coef.insert( _delta_coef.end(), coef_buf[t].begin(), coef_buf[t].end() );
     }
+
+    /* GROUP THE TRIPLES BY DESTINATION.
+     *
+     * The apply loop used to scatter these with atomic_add_double(), which
+     * is correct but NOT reproducible: floating-point addition is not
+     * associative, so the value landing in lev1.val depended on the order
+     * the threads happened to arrive in. That made the preconditioner --
+     * and therefore epot -- differ in its last bits between two runs of the
+     * same binary on the same input.
+     *
+     * That is not a harmless last-bit difference. It is the first link in a
+     * chain: the trajectory integrator's step controller drives the local
+     * error estimate to sit AT its tolerance by construction, so an
+     * arbitrarily small change in the field flips accept/reject decisions.
+     * Measured on the ECR cut case, two runs of one binary differed by
+     * hundreds of ODE steps out of two million in cycle 0 alone, and the
+     * iteration then amplified that over cycles.
+     *
+     * Sorting by destination lets each destination be summed by exactly one
+     * thread, in a fixed index order. Deterministic, and faster -- the CAS
+     * loop is gone. stable_sort keeps the within-group order as built, and
+     * the build order is itself deterministic (per-thread buffers
+     * concatenated in thread order above), so the whole thing is
+     * reproducible end to end.
+     */
+    const size_t ntot = _delta_dst.size();
+    std::vector<size_t> perm( ntot );
+    std::iota( perm.begin(), perm.end(), (size_t)0 );
+    std::stable_sort( perm.begin(), perm.end(),
+                      [&]( size_t a, size_t b )
+                      { return( _delta_dst[a] < _delta_dst[b] ); } );
+
+    std::vector<int32_t> s2( ntot ), d2( ntot );
+    std::vector<double>  c2( ntot );
+    for( size_t i = 0; i < ntot; i++ ) {
+        s2[i] = _delta_src[ perm[i] ];
+        d2[i] = _delta_dst[ perm[i] ];
+        c2[i] = _delta_coef[ perm[i] ];
+    }
+    _delta_src.swap( s2 );
+    _delta_dst.swap( d2 );
+    _delta_coef.swap( c2 );
+
+    _delta_group.clear();
+    for( size_t i = 0; i < ntot; ) {
+        size_t j = i;
+        while( j < ntot && _delta_dst[j] == _delta_dst[i] )
+            j++;
+        _delta_group.push_back( i );
+        i = j;
+    }
+    _delta_group.push_back( ntot );
 }
 
 
@@ -822,15 +877,25 @@ void GMG_Precond::construct( const CRowMatrix &A )
         const Level &lev0 = _level[0];
         size_t ntriples = _delta_src.size();
 
+        // One destination per iteration, summed in fixed index order -- no
+        // atomics, and bit-reproducible. See the grouping in
+        // build_delta_triples().
+        (void)ntriples;
+        const size_t ngroup = _delta_group.size() - 1;
         #pragma omp parallel for schedule(static)
-        for( size_t k = 0; k < ntriples; k++ ) {
-            int m = _delta_src[k];
-            int di = lev0.diag_idx[m];
-            double curdiag = (di >= 0 ? lev0.val[di] : 0.0);
-            double delta = curdiag - _lvl0_diag_ref[m];
-            if( delta == 0.0 )
-                continue;
-            atomic_add_double( lev1.val[ _delta_dst[k] ], delta*_delta_coef[k] );
+        for( size_t g = 0; g < ngroup; g++ ) {
+            double acc = 0.0;
+            for( size_t k = _delta_group[g]; k < _delta_group[g+1]; k++ ) {
+                int m = _delta_src[k];
+                int di = lev0.diag_idx[m];
+                double curdiag = (di >= 0 ? lev0.val[di] : 0.0);
+                double delta = curdiag - _lvl0_diag_ref[m];
+                if( delta == 0.0 )
+                    continue;
+                acc += delta*_delta_coef[k];
+            }
+            if( acc != 0.0 )
+                lev1.val[ _delta_dst[ _delta_group[g] ] ] += acc;
         }
 
         find_diagonals( lev1 );
