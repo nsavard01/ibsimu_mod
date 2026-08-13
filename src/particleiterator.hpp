@@ -50,6 +50,7 @@
 #include <iomanip>
 #include <chrono>
 #include <gsl/gsl_odeiv2.h>
+#include <gsl/gsl_errno.h>
 #include <gsl/gsl_poly.h>
 #include "geometry.hpp"
 #include "mat3d.hpp"
@@ -1707,7 +1708,21 @@ public:
 			 * it says -- take the same step again, smaller.
 			 */
 			x2 = x;
-			dt *= 0.5;
+
+			/* GSL zeroes *h on some failure paths, and 0*0.5 is
+			 * still 0 -- which would look like an underflow on the
+			 * FIRST rejection rather than after a genuine sequence
+			 * of halvings. Re-seed from the geometric estimate in
+			 * that case so the retry has something to work with,
+			 * and let the counter below decide when to give up. */
+			if( dt == 0.0 ) {
+			    double dxdt_rs[PP::size()-1];
+			    if( PP::get_derivatives( 0.0, &x[1], dxdt_rs,
+						     (void *)&_pidata ) == GSL_SUCCESS )
+				dt = 0.5*calculate_dt( x, dxdt_rs );
+			} else {
+			    dt *= 0.5;
+			}
 			if( dt == 0.0 ) {
 
 			    /* STUCK PARTICLE -- kill it, do not abort the run.
@@ -1765,7 +1780,43 @@ public:
 		    } else if( retval == GSL_SUCCESS ) {
 			break;
 		    } else {
-			throw( Error( ERROR_LOCATION, "gsl_odeiv2_evolve_apply failed" ) );
+
+			/* A THIRD return value: neither success nor our own
+			 * IBSIMU_DERIV_ERROR (201). GSL has its own failure
+			 * modes here -- notably it can decide the step size
+			 * cannot be reduced further and return GSL_ENOPROG or
+			 * GSL_FAILURE, and on some paths it ZEROES *h before
+			 * returning, which is why a run can reach this branch
+			 * rather than the underflow one above.
+			 *
+			 * This used to throw, discarding the code without ever
+			 * saying which one it was -- so the message named the
+			 * symptom and hid the diagnosis. It now prints the code
+			 * and gsl_strerror(), and kills the particle instead of
+			 * the run, consistent with the other two exits.
+			 *
+			 * If these appear in numbers, the code is the thing to
+			 * report: ENOPROG means GSL gave up on the step size
+			 * (same pathology as the underflow path, detected
+			 * inside GSL), while EBADFUNC would mean the derivative
+			 * function is returning something GSL cannot interpret,
+			 * which would be a different bug entirely.
+			 */
+			if( _stuck_reported < 10 ) {
+			    _stuck_reported++;
+			    ibsimu.message( MSG_WARNING, 1 )
+				<< "Warning: gsl_odeiv2_evolve_apply returned "
+				<< retval << " (" << gsl_strerror( retval )
+				<< ") for particle " << pi << " at "
+				<< x2.location() << ", killed as BADDEF."
+				<< ( _stuck_reported == 10
+				     ? " Further occurrences on this thread suppressed.\n"
+				     : "\n" );
+			}
+			particle->set_status( PARTICLE_BADDEF );
+			_stat.inc_end_baddef();
+			DEBUG_DEC_INDENT();
+			return;
 		    }
 		}
 		_time_ode += std::chrono::duration<double>( Clock::now()-time_t0 ).count();
