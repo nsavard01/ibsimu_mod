@@ -230,6 +230,20 @@ protected:
     CallbackFunctorB_V *_init_plasma_func; /*!< \brief Initial plasma region function. */
     CallbackFunctorB_V *_plasma_calc_func; /*!< \brief Definition of plasma calculation region. */
 
+    /* --- Beam space-charge compensation by trapped electrons -------------
+     *
+     * ADDITIVE, not a plasma_mode_e. Compensation coexists with the source
+     * plasma model rather than replacing it: pexp supplies the electrons in
+     * the source, this supplies the ones trapped in the beam's own well
+     * downstream, and a run needs BOTH at once. It therefore carries its own
+     * enable flag and its own region function, independent of _plasma and
+     * _plasma_calc_func. */
+    bool                _comp;             /*!< \brief Compensation model enabled. */
+    double              _compTe;           /*!< \brief Trapped-electron temperature (eV). */
+    double              _compVref;         /*!< \brief Wall/electrode potential (V). */
+    double              _compRhoMin;       /*!< \brief Ion-density floor (C/m3). */
+    CallbackFunctorB_V *_comp_region_func; /*!< \brief Compensation region, NULL = everywhere. */
+
     double              _plA;              /*!< \brief Plasma parameter.
 				            *   For positive ion extraction: rho_th * h^2 / epsilon_0,
 				            *   for negative ion extraction: rho_f * h^2 / epsilon_0 
@@ -263,6 +277,12 @@ protected:
      *  positive ion extraction case.
      */
     void pexp_newton( double &rhs, double &drhs, double epot ) const;
+
+    /*! \brief Compensation shape function g and dg/dphi.
+     *
+     *  Returns the DIMENSIONLESS g in [0,1); the caller multiplies by the
+     *  local rho_i*h^2/epsilon_0, exactly as the shield model does. */
+    void comp_newton( double &g, double &dg, double epot ) const;
 
     /*! \brief Return non-linear right-hand-side and it's derivative
         for vacuum node in negative ion plasma.
@@ -485,6 +505,48 @@ public:
      *  BOUND_NEUMANN with gradient of zero V/m.
      */
     void set_pexp_plasma( double rhoe, double Te, double Up );
+
+    /*! \brief Enable beam space-charge compensation by trapped electrons.
+     *
+     *  Adds, at every node of \a region carrying at least \a rho_min of ion
+     *  charge, a compensating electron density
+     *
+     *    rho_e = -rho_i * ( 1 - exp( -(phi - Vref)/Te ) ),   phi > Vref
+     *
+     *  and zero below Vref. \a rho_i is read from the space charge passed to
+     *  solve(), so that field must contain the ION charge only -- the
+     *  compensating charge is generated here and must not also be supplied.
+     *
+     *  Unlike set_pexp_plasma(), whose prefactor is a single constant, the
+     *  prefactor is the LOCAL ion density; the term is therefore bounded by
+     *  rho_i rather than growing without limit, which is what keeps Newton
+     *  well behaved.
+     *
+     *  This is ADDITIVE: it does not disturb whatever plasma_mode_e is set,
+     *  and both are evaluated at every node. A run modelling an extraction
+     *  system needs the source plasma AND the compensated drift at once.
+     *
+     *  \a region MUST exclude the source plasma and the acceleration gap.
+     *  There phi - Vref runs up to the full extraction voltage, the model
+     *  reads that as an arbitrarily deep trap, and any beam inside it is
+     *  reported as fully compensated -- while the source plasma's electrons
+     *  are ALREADY supplied by set_pexp_plasma(), so it would double-count
+     *  them where the ion density is largest. NULL means "everywhere", which
+     *  is only correct if no beam exists outside the compensated drift.
+     *
+     *  \param Te      trapped-electron temperature (eV), > 0
+     *  \param Vref    wall/electrode potential the barrier is measured from
+     *  \param rho_min ion-density floor; nodes below it get no compensation
+     *  \param region  spatial predicate, or NULL for the whole mesh
+     */
+    void set_beam_compensation( double Te, double Vref, double rho_min = 0.0,
+                                CallbackFunctorB_V *region = NULL );
+
+    /*! \brief Disable beam space-charge compensation. */
+    void unset_beam_compensation( void );
+
+    /*! \brief Is the compensation model enabled? */
+    bool get_beam_compensation( void ) const { return _comp; }
 
     /*! \brief Define initial plasma boundary location to negative ion
      *  extraction problem.

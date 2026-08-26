@@ -60,7 +60,9 @@ EpotSolver::EpotSolver( Geometry &geom )
     : _geom(geom), _plasma(PLASMA_NONE), 
       _rhoe(0.0), _Te(0.0), _Up(0.0), 
       _force_pot(0.0), _force_pot_func(0), _force_pot_func2(0), 
-      _init_plasma_func(0), _plasma_calc_func(0)
+      _init_plasma_func(0), _plasma_calc_func(0),
+      _comp(false), _compTe(1.0), _compVref(0.0), _compRhoMin(0.0),
+      _comp_region_func(0)
 {
 
 }
@@ -73,7 +75,10 @@ EpotSolver::EpotSolver( const EpotSolver &epsolver, Geometry &geom )
       _force_pot(epsolver._force_pot), _force_pot_func(epsolver._force_pot_func),
       _force_pot_func2(epsolver._force_pot_func2),
       _init_plasma_func(epsolver._init_plasma_func),
-      _plasma_calc_func(epsolver._plasma_calc_func)
+      _plasma_calc_func(epsolver._plasma_calc_func),
+      _comp(epsolver._comp), _compTe(epsolver._compTe),
+      _compVref(epsolver._compVref), _compRhoMin(epsolver._compRhoMin),
+      _comp_region_func(epsolver._comp_region_func)
 {
 
 }
@@ -104,6 +109,11 @@ void EpotSolver::set_parameters( const EpotSolver &epsolver )
     _force_pot_func2 = epsolver._force_pot_func2;
     _init_plasma_func = epsolver._init_plasma_func;
     _plasma_calc_func = epsolver._plasma_calc_func;
+    _comp             = epsolver._comp;
+    _compTe           = epsolver._compTe;
+    _compVref         = epsolver._compVref;
+    _compRhoMin       = epsolver._compRhoMin;
+    _comp_region_func = epsolver._comp_region_func;
 }
 
 
@@ -287,6 +297,58 @@ void EpotSolver::pexp_newton( double &rhs, double &drhs, double epot ) const
 {
     rhs  = _plA*exp( _plB*epot - _plC );
     drhs = _plB*rhs;
+}
+
+
+/* Compensation shape function.
+ *
+ *   g(phi)  = 1 - exp( -(phi - Vref)/Te )   for phi > Vref, else 0
+ *   dg/dphi = (1/Te) exp( -(phi - Vref)/Te ) for phi > Vref, else 0
+ *
+ * Two properties matter for Newton. g is BOUNDED in [0,1), so the term can
+ * never exceed the local ion charge -- it neutralises, it cannot overshoot,
+ * unlike pexp which grows without limit. And g is monotone, so the Jacobian
+ * contribution keeps a consistent sign.
+ *
+ * g is continuous at phi = Vref but its derivative jumps from 0 to 1/Te
+ * there. That kink sits exactly at the edge of the compensated region. It is
+ * left in rather than smoothed because the discontinuity is in the SECOND
+ * derivative of the residual, which Newton tolerates, and smoothing it would
+ * blur the transition the model exists to predict.
+ */
+void EpotSolver::comp_newton( double &g, double &dg, double epot ) const
+{
+    double u = (epot - _compVref) / _compTe;
+    if( u <= 0.0 ) {
+        g = 0.0;
+        dg = 0.0;
+        return;
+    }
+    double e = exp( -u );
+    g  = 1.0 - e;
+    dg = e / _compTe;
+}
+
+
+void EpotSolver::set_beam_compensation( double Te, double Vref, double rho_min,
+                                        CallbackFunctorB_V *region )
+{
+    if( Te <= 0.0 )
+        throw( Error( ERROR_LOCATION, "compensation temperature must be positive" ) );
+    _comp             = true;
+    _compTe           = Te;
+    _compVref         = Vref;
+    _compRhoMin       = rho_min;
+    _comp_region_func = region;
+    reset_problem();
+}
+
+
+void EpotSolver::unset_beam_compensation( void )
+{
+    _comp = false;
+    _comp_region_func = NULL;
+    reset_problem();
 }
 
 
@@ -629,6 +691,13 @@ void EpotSolver::postprocess( void )
 
 bool EpotSolver::linear( void ) const
 {
+    // The compensation model is nonlinear in phi in its own right, so a
+    // problem carrying it is nonlinear even with no plasma_mode_e set.
+    // Without this the Newton loop is skipped and the term is silently
+    // never evaluated -- the solve converges, to the uncompensated answer.
+    if( _comp )
+	return( false );
+
     switch( _plasma ) {
     case PLASMA_NONE:
     case PLASMA_PEXP_INITIAL:

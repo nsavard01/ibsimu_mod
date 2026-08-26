@@ -267,7 +267,9 @@ void EpotMatrixSolver::set_link( uint32_t a, uint32_t b, double val )
  */
 void EpotMatrixSolver::update_nonlinear_node( uint32_t a, uint32_t i, uint32_t j, uint32_t k, const Vec3D &x )
 {
-    if( _plasma != PLASMA_PEXP && _plasma != PLASMA_NSIMP && _plasma != PLASMA_SHIELD )
+    const bool have_plasma = ( _plasma == PLASMA_PEXP || _plasma == PLASMA_NSIMP ||
+                               _plasma == PLASMA_SHIELD );
+    if( !have_plasma && !_comp )
 	return;
 
     // A dielectric solid's interior is a fixed, chargeless medium --
@@ -290,33 +292,62 @@ void EpotMatrixSolver::update_nonlinear_node( uint32_t a, uint32_t i, uint32_t j
     // this function runs every Newton iteration (and every step-size
     // backtracking re-evaluation) for every free node, so it matters
     // that this isn't a Geometry::inside() query repeated on every call.
-    bool inplasma = _geom.dielectric_material_at( i, j, k ) == 0;
-    if( inplasma && _plasma_calc_func )
-	// Test if within plasma calculation region
-	inplasma = (*_plasma_calc_func)(x);
+    const bool dielectric_free = ( _geom.dielectric_material_at( i, j, k ) == 0 );
 
-    if( !inplasma ) {
-	_d_vec(a) = 0; // No plasma calculation
-    } else if( _plasma == PLASMA_PEXP ) {
-	double p = (*_sol)(a);
-	double rhst, drhst;
-	pexp_newton( rhst, drhst, p );
-	(*_fd_vec)(a) += rhst;
-	_d_vec(a) = drhst;
-    } else if( _plasma == PLASMA_NSIMP ) {
-	double p = (*_sol)(a);
-	double rhst, drhst;
-	nsimp_newton( rhst, drhst, p );
-	(*_fd_vec)(a) += rhst;
-	_d_vec(a) = drhst;
-    } else if( _plasma == PLASMA_SHIELD ) {
-	double p = (*_sol)(a);
-	double rhst, drhst;
-	shield_newton( rhst, drhst, p );
-	double R = -(*_scharge)(i,j,k)*_geom.h()*_geom.h()/EPSILON0;
-	(*_fd_vec)(a) += R*rhst;
-	_d_vec(a) = R*drhst;
+    // The two models are ACCUMULATED, not selected between. A source plasma
+    // and a compensated drift coexist in one mesh and a run needs both; they
+    // are gated by SEPARATE region functions because they occupy different
+    // parts of it.
+    double fd = 0.0, d = 0.0;
+
+    if( dielectric_free && have_plasma ) {
+	bool inplasma = true;
+	if( _plasma_calc_func )
+	    inplasma = (*_plasma_calc_func)(x);
+	if( inplasma ) {
+	    double p = (*_sol)(a);
+	    double rhst, drhst;
+	    if( _plasma == PLASMA_PEXP ) {
+		pexp_newton( rhst, drhst, p );
+		fd += rhst;
+		d  += drhst;
+	    } else if( _plasma == PLASMA_NSIMP ) {
+		nsimp_newton( rhst, drhst, p );
+		fd += rhst;
+		d  += drhst;
+	    } else {
+		shield_newton( rhst, drhst, p );
+		double R = -(*_scharge)(i,j,k)*_geom.h()*_geom.h()/EPSILON0;
+		fd += R*rhst;
+		d  += R*drhst;
+	    }
+	}
     }
+
+    if( dielectric_free && _comp ) {
+	bool incomp = true;
+	if( _comp_region_func )
+	    incomp = (*_comp_region_func)(x);
+	if( incomp ) {
+	    // Prefactor is the LOCAL ion density, exactly as the shield model
+	    // takes its own -- so _scharge must hold ION charge only, with the
+	    // compensating charge generated here rather than supplied.
+	    double rho_i = (*_scharge)(i,j,k);
+	    if( rho_i > _compRhoMin ) {
+		double p = (*_sol)(a);
+		double g, dg;
+		comp_newton( g, dg, p );
+		// rho_e = -rho_i*g contributes -rho_e*h^2/eps0 = +rho_i*g*h^2/eps0,
+		// the same sign convention the other models use.
+		double R = rho_i*_geom.h()*_geom.h()/EPSILON0;
+		fd += R*g;
+		d  += R*dg;
+	    }
+	}
+    }
+
+    (*_fd_vec)(a) += fd;
+    _d_vec(a) = d;
 }
 
 
@@ -1680,7 +1711,8 @@ void EpotMatrixSolver::build_mat_vec( void )
     // of the stencil/boundary bookkeeping the linear build does -- just
     // a mesh scan plus, for plasma-active nodes, the actual nonlinear
     // evaluation (pexp_newton/nsimp_newton/shield_newton).
-    if( _plasma == PLASMA_PEXP || _plasma == PLASMA_NSIMP || _plasma == PLASMA_SHIELD ) {
+    if( _plasma == PLASMA_PEXP || _plasma == PLASMA_NSIMP ||
+	_plasma == PLASMA_SHIELD || _comp ) {
 
 	auto time_t0 = Clock::now();
 

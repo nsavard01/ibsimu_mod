@@ -185,6 +185,15 @@ void EpotMGSubSolver::defect( MeshScalarField *defect, MeshScalarField *epot, co
 
 void EpotMGSubSolver::preprocess( MeshScalarField &epot )
 {
+    // The compensation term is implemented in EpotMatrixSolver only. This
+    // smoother carries its own copies of the nonlinear evaluation, one per
+    // stencil case, and none of them know about it -- so a GMG-preconditioned
+    // solve would smooth a system that silently omits the compensating
+    // charge, converging happily to the wrong answer. Refuse instead.
+    if( get_beam_compensation() )
+	throw( Error( ERROR_LOCATION, "beam compensation is not implemented in "
+		      "the geometric multigrid smoother -- use a different "
+		      "preconditioner (e.g. ILU0) with EpotBiCGSTABSolver" ) );
     EpotSolver::preprocess( epot );
 }
 
