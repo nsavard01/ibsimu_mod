@@ -158,6 +158,91 @@ void EpotMatrixSolver::set_link( uint32_t a, uint32_t b, double val )
     //std::cout << "set_link( a = " << a << ", b = " << b << ", val = " << val << ")\n";
 
     if( (b & N2D_TYPE_MASK) == N2D_TYPE_FIXED ) {
+
+	/* A link pointing INTO a Neumann-mask solid is a symmetry face:
+	 * redirect it onto the MIRROR-IMAGE node instead of moving it to the
+	 * right hand side.
+	 *
+	 * This matches what ibsimu already does on a Neumann BOX wall, which
+	 * is the convention the rest of the code is built around and which
+	 * should have been the starting point. add_neumann_node_2d() emits
+	 *     set_link( a, _n2d(i,j-1), 2.0*eps_self );   cof += 2.0*eps_self
+	 * -- weight 2*eps on the single INTERIOR neighbour. That is the
+	 * standard five-point stencil with the ghost eliminated by
+	 *     phi_(j+1) := phi_(j-1),
+	 * i.e. a NODE-CENTRED mirror whose zero-derivative plane lies exactly
+	 * ON the boundary node. The factor of two on one neighbour is its
+	 * signature.
+	 *
+	 * The mirror image of neighbour b about node a is 2a - b in linear
+	 * index space, for any axis and any geometry mode, because the mesh
+	 * index is affine: a neighbour is a +-1 or +-nx or +-nx*ny offset, so
+	 * negating the offset negates the index difference. Redirecting the
+	 * face weight there gives, for a node with mask on +y,
+	 *     w_m*phi_(j-1) + w_p*phi_(j-1) - (w_m+w_p)*phi_j
+	 * which for uniform eps is exactly 2*eps*phi_(j-1) - 2*eps*phi_j --
+	 * the box-wall stencil above. The duplicate-column merge in
+	 * build_mat_vec() folds the two entries on column (j-1) into one.
+	 *
+	 * The PREVIOUS version of this sent the weight to the row's own
+	 * diagonal, which imposes phi_ghost = phi_self. That is also a valid
+	 * zero-flux condition, but a FACE-centred one: its symmetry plane
+	 * sits half a cell OUTSIDE the last live node. Particles reflect off
+	 * the analytic solid surface at the node, so field and particles were
+	 * mirroring half a cell apart, leaving a half-cell the field treated
+	 * as symmetric but no particle ever entered. It also did not match
+	 * the *= 2.0 space-charge correction that scharge_finalize_*() applies
+	 * at box walls, which exists precisely because a node-centred mirror
+	 * node owns half a control volume.
+	 *
+	 * Doing it in set_link() still means it applies to every stencil
+	 * builder at once -- add_vacuum_node(), add_neumann_node_1d/2d/cyl/3d(),
+	 * add_near_solid_node_1d/2d/cyl/3d() -- with no per-site changes.
+	 *
+	 * The masked node's own index is a MESH node index here: preprocess()
+	 * sets _n2d(a) = N2D_TYPE_FIXED | a for every fixed node, so the
+	 * index survives unchanged and _geom.mesh() can be queried directly.
+	 */
+	if( SMESH_NODE_IS_NEUMANN_MASK( _geom.mesh( (int32_t)(b & N2D_INDEX_MASK) ) ) ) {
+
+	    /* Mirror in MESH index space. The row index a is a DOF index and
+	     * b (being FIXED) carries a MESH index, so 2*a - b would subtract
+	     * one index space from the other and land on an arbitrary column.
+	     * _dof2node maps the row back to its mesh node first. */
+	    const int32_t dof_a  = (int32_t)(a & N2D_INDEX_MASK);
+	    const int32_t node_a = _dof2node[dof_a];
+	    const int32_t node_b = (int32_t)(b & N2D_INDEX_MASK);
+	    const int32_t node_m = 2*node_a - node_b;   /* image of b about a */
+
+	    if( node_m >= 0 && node_m < (int32_t)_geom.nodecount() ) {
+
+		uint32_t n2d_m = _n2d(node_m);
+
+		if( (n2d_m & N2D_TYPE_MASK) != N2D_TYPE_FIXED ) {
+		    /* Image is a free node: it carries a DOF index, which is
+		     * what a matrix column must be. */
+		    _row_entries[dof_a].push_back(
+			std::make_pair( (int32_t)(n2d_m & N2D_INDEX_MASK), val ) );
+		    return;
+		} else if( !SMESH_NODE_IS_NEUMANN_MASK( _geom.mesh( node_m ) ) ) {
+		    /* Image is a Dirichlet node: its potential is known, so
+		     * the term belongs on the right hand side, exactly as an
+		     * ordinary fixed neighbour would. */
+		    (*_fd_vec)(a) += -val * (*_epot)( node_m );
+		    return;
+		}
+		/* Image is itself masked -- fall through. */
+	    }
+
+	    /* No usable image: off the mesh, or masked on both sides (a live
+	     * region one node wide). Fold onto the diagonal instead, which is
+	     * the face-centred mirror phi_ghost = phi_self. Less accurate,
+	     * but local and diagonally dominant rather than referencing a
+	     * node whose value means nothing. */
+	    _row_entries[dof_a].push_back( std::make_pair( dof_a, val ) );
+	    return;
+	}
+
 	//std::cout << "epot = " << (*_epot)(b & N2D_INDEX_MASK) << "\n";
         (*_fd_vec)(a) += -val * (*_epot)(b & N2D_INDEX_MASK);
     } else {
@@ -262,6 +347,25 @@ double EpotMatrixSolver::vacuum_face_coefficient( int32_t i, int32_t j, int32_t 
 						   double eps_self ) const
 {
     uint32_t node_id = neighbor_mesh & SMESH_NODE_ID_MASK;
+
+    /* Neumann mask on the far side: this face carries no flux at all, so
+     * its coefficient is about to be cancelled by set_link()'s redirect
+     * (it sends the value to the row's own diagonal, where it exactly
+     * undoes the caller's cof += w). The returned number is therefore
+     * arbitrary -- but computing it properly is not merely wasted work,
+     * it is meaningless work: the code below would see nb_material == 0
+     * (dielectric_material_at() returns 0 for a mask, since a mask is not
+     * BOUND_DIELECTRIC), decide there is a genuine material interface, and
+     * bisect against the dielectric with bracket_ndist() from a point that
+     * may well be INSIDE it -- which violates that routine's stated
+     * precondition and returns a meaningless fraction.
+     *
+     * eps_self keeps it finite and dimensionally sane for anyone reading a
+     * matrix dump. It cannot affect the solution.
+     */
+    if( SMESH_NODE_IS_NEUMANN_MASK( neighbor_mesh ) )
+	return( eps_self );
+
     if( node_id == SMESH_NODE_ID_DIRICHLET ) {
 	uint32_t boundary_number = neighbor_mesh & SMESH_BOUNDARY_NUMBER_MASK;
 	if( boundary_number < 7 )
@@ -702,29 +806,91 @@ void EpotMatrixSolver::add_near_solid_node_cyl( uint32_t i, uint32_t j, const Ve
 	ptr++;
     }
 
-    // Factors for Y axis (radial, with cylindrical curvature terms
-    // baked directly into the on-axis "4.0"/regular 1/j-dependent
-    // coefficients below -- unlike every other axis in this file,
-    // these are NOT a simple flat Shortley-Weller form, so they are
-    // NOT extended with a dielectric-aware fallback here. KNOWN
-    // LIMITATION: a conductor-near-solid node whose radial neighbour
-    // is a dielectric (rather than plain vacuum), with neither radial
-    // side near a conductor, still silently assumes vacuum on that
-    // face. Re-deriving these formulas for a dielectric radial
-    // neighbour has not been done.
+    // Factors for Y axis (radial). The cylindrical curvature terms are
+    // baked into these coefficients, so unlike the other axes they are not
+    // a flat Shortley-Weller form and the dielectric-aware version had to
+    // be derived rather than copied.
+    //
+    // DERIVATION (conservative / finite-volume, which is what a material
+    // interface requires -- flux must be continuous across it):
+    //
+    //   Control volume for node j spans the inner face at
+    //   r_- = r_j - alpha*h/2 and the outer face at r_+ = r_j + beta*h/2.
+    //   The radial flux through a face is eps_face * r_face * dphi/dr, so
+    //   in this file's row scaling (a uniform vacuum node has cof = 4 and
+    //   rhs = -rho h^2 / eps0) each face coefficient is
+    //
+    //       w = eps_face * (r_face / r_j) / (face distance in units of h)
+    //
+    //   giving  w_m = eps_m * (j - alpha/2) / (j*alpha)
+    //           w_p = eps_p * (j + beta /2) / (j*beta )
+    //
+    // Checked in three limits:
+    //   alpha=beta=1  -> eps_m*(1-1/(2j)), eps_p*(1+1/(2j)), i.e. exactly
+    //                    add_vacuum_node()'s cylindrical form;
+    //   j -> infinity -> eps_m/alpha, eps_p/beta, i.e. exactly the axial
+    //                    dielectric branch above;
+    //   eps = 1       -> (alpha+beta)/2 times the Taylor form kept below.
+    //
+    // That last ratio is not an error: it is the same relationship the
+    // AXIAL axis already has between its plain branch (2/((alpha+beta)*alpha),
+    // a Taylor expansion, more accurate for smooth coefficients) and its
+    // dielectric branch (1/alpha, conservative, exact in flux). They agree
+    // for uniform spacing and differ only in cut cells, and the
+    // conservative one is the correct choice when eps jumps.
+    //
+    // Validated against the analytic coaxial two-layer dielectric solution
+    // phi = C - (A/eps) ln r: this form converges at second order, whereas
+    // ignoring eps on the radial faces leaves a ~24% error that does NOT
+    // shrink with the mesh -- a wrong equation rather than a resolution
+    // problem.
     if( bindex & EPOT_SOLVER_BYMIN ) {
-	// On-axis
+	// On-axis. The factor 4 is the coordinate-singularity limit of the
+	// radial operator, not an ordinary face, so -- as in
+	// add_neumann_node_cyl() -- no cut-cell or interface treatment is
+	// attempted for a dielectric sitting exactly on the axis.
 	cof += 4.0;
 	set_link( a, _n2d(i,j+1), 4.0 );
     } else if( bindex & EPOT_SOLVER_BYMAX ) {
+	// Node on the rmax face. Left as the vacuum form: reaching here
+	// needs a node that is simultaneously on the outer box face and
+	// within a cell of a conductor, and the box face is a boundary
+	// condition rather than a material interface.
 	cof += 2.0/(alpha*alpha);
 	set_link( a, _n2d(i,j-1), 2.0/(alpha*alpha) );
 	(*_fd_vec)(a) += (1.0)/(2.0*alpha)*(2.0/alpha+1.0/j)*
 	    2.0*_geom.h()*_geom.get_boundary(4).value(x) / alpha;
     } else {
-	cof += 2.0/(alpha*beta);
-	set_link( a, _n2d(i,j-1), 1.0/(alpha+beta)*(2.0/alpha-1.0/j) );
-	set_link( a, _n2d(i,j+1), 1.0/(alpha+beta)*(2.0/beta+1.0/j) );
+	bool ym_conductor = sflag & 0x04;
+	bool yp_conductor = sflag & 0x08;
+	bool ym_dielectric = !ym_conductor && _geom.dielectric_material_at(i,j-1,0) != 0;
+	bool yp_dielectric = !yp_conductor && _geom.dielectric_material_at(i,j+1,0) != 0;
+
+	if( ym_dielectric || yp_dielectric ) {
+
+	    // A near-solid node is by definition a vacuum node next to a
+	    // conductor, so self is vacuum (self_material 0, eps_self 1)
+	    // and a conductor face contributes eps = 1 with its distance
+	    // already carried by alpha/beta -- passing it through
+	    // vacuum_face_coefficient() would apply that distance twice.
+	    double rj = (double)j;
+	    double em = ym_conductor ? 1.0 :
+		vacuum_face_coefficient( i,j,0, i,j-1,0, -1,1, _geom.mesh(i,j-1), 0, 1.0 );
+	    double ep = yp_conductor ? 1.0 :
+		vacuum_face_coefficient( i,j,0, i,j+1,0, +1,1, _geom.mesh(i,j+1), 0, 1.0 );
+
+	    double wm = em*(rj - 0.5*alpha)/(rj*alpha);
+	    double wp = ep*(rj + 0.5*beta )/(rj*beta );
+
+	    set_link( a, _n2d(i,j-1), wm );
+	    set_link( a, _n2d(i,j+1), wp );
+	    cof += wm+wp;
+
+	} else {
+	    cof += 2.0/(alpha*beta);
+	    set_link( a, _n2d(i,j-1), 1.0/(alpha+beta)*(2.0/alpha-1.0/j) );
+	    set_link( a, _n2d(i,j+1), 1.0/(alpha+beta)*(2.0/beta+1.0/j) );
+	}
     }
 
     // Middle node
@@ -1281,7 +1447,16 @@ void EpotMatrixSolver::preprocess( MeshScalarField &epot, const MeshScalarField 
     reset_matrix();
 
     // Build n2d array and calculate degrees of freedom.
+    //
+    // NOTE the two index spaces stored here, which are NOT interchangeable:
+    //   fixed node -> N2D_TYPE_FIXED | (MESH index)
+    //   free  node -> N2D_TYPE_FREE  | (DOF  index)
+    // set_link()'s row argument is a DOF index, its column argument for a
+    // fixed neighbour is a MESH index. Mixing them silently produces valid-
+    // looking but meaningless matrix columns.
     _n2d.resize( _geom.size() );
+    _dof2node.clear();
+    _dof2node.reserve( _geom.nodecount() );
     _dof = 0;
     for( int32_t a = 0; a < (int32_t)_geom.nodecount(); a++ ) {
 
@@ -1294,6 +1469,7 @@ void EpotMatrixSolver::preprocess( MeshScalarField &epot, const MeshScalarField 
 	else { 
 	    // Free node
 	    _n2d(a) = N2D_TYPE_FREE | _dof;
+	    _dof2node.push_back( a );          // inverse map, see set_link()
 	    _dof++;
 	}
     }
@@ -1403,10 +1579,47 @@ void EpotMatrixSolver::build_mat_vec( void )
 	// pass is pure data movement (no stencil math, no plasma
 	// evaluation) over already-computed entries, so it stays cheap
 	// even though it runs single-threaded.
+	//
+	// Duplicate columns within a row are MERGED here rather than being
+	// handed to construct_add() twice. construct_add() appends
+	// unconditionally -- it does not look for an existing entry -- so
+	// duplicates would survive into the CSR arrays. A matrix-vector
+	// product sums them and so stays correct, but everything that
+	// SEARCHES for a particular entry sees only the first one:
+	// _fd_mat_diag_idx below (which get_resjac() uses to apply the
+	// nonlinear plasma term to the diagonal every Newton iteration),
+	// GMG_Precond::find_diagonals(), and the ILU/RBSOR preconditioners'
+	// diagonal handling would all then act on a fraction of the true
+	// diagonal.
+	//
+	// Set_link()'s Neumann-mask redirect is what makes this reachable:
+	// it emits an extra entry at (a,a) for every masked face, on top of
+	// the diagonal the stencil builder emits at the end. Merging here
+	// rather than relying on the builders always emitting the diagonal
+	// last keeps that independent of call order.
+	std::vector<double> rowacc;
+	std::vector<int32_t> rowcol;
 	for( uint32_t a = 0; a < _dof; a++ ) {
 	    const std::vector<std::pair<int32_t,double> > &row = _row_entries[a];
-	    for( size_t n = 0; n < row.size(); n++ )
-		_fd_mat->construct_add( a, row[n].first, row[n].second );
+
+	    rowacc.clear();
+	    rowcol.clear();
+	    for( size_t n = 0; n < row.size(); n++ ) {
+		size_t m = 0;
+		for( ; m < rowcol.size(); m++ ) {
+		    if( rowcol[m] == row[n].first ) {
+			rowacc[m] += row[n].second;
+			break;
+		    }
+		}
+		if( m == rowcol.size() ) {
+		    rowcol.push_back( row[n].first );
+		    rowacc.push_back( row[n].second );
+		}
+	    }
+
+	    for( size_t m = 0; m < rowcol.size(); m++ )
+		_fd_mat->construct_add( a, rowcol[m], rowacc[m] );
 	}
 
 	// Order matrix

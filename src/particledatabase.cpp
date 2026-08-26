@@ -183,6 +183,18 @@ uint32_t ParticleDataBase::get_save_trajectories( void ) const
 }
 
 
+void ParticleDataBase::set_mask_reflection( bool reflect )
+{
+    _imp->set_mask_reflection( reflect );
+}
+
+
+void ParticleDataBase::set_deterministic_scharge( bool deterministic )
+{
+    _imp->set_deterministic_scharge( deterministic );
+}
+
+
 void ParticleDataBase::set_mirror( const bool mirror[6] )
 {
     _imp->set_mirror( mirror );

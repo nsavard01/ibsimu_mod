@@ -107,6 +107,16 @@ protected:
 
     uint32_t               _dof;           /*!< \brief Degrees of freedom. */
     Node2DoF               _n2d;           /*!< \brief Nodes to degrees of freedom map. */
+
+    /*! \brief Inverse of _n2d for free nodes: DOF index -> mesh node index.
+     *
+     *  _n2d stores a MESH index for fixed nodes but a DOF index for free
+     *  ones, and set_link() receives its row as a DOF index and a fixed
+     *  neighbour as a MESH index. Anything that needs to do geometry on a
+     *  row -- currently the Neumann-mask mirror -- must convert back first;
+     *  arithmetic mixing the two spaces yields valid-looking, wrong columns.
+     */
+    std::vector<int32_t>   _dof2node;
     CRowMatrix            *_fd_mat;        /*!< \brief Finite Difference matrix. */
     Vector                *_fd_vec;        /*!< \brief Finite Difference vector. */
 
@@ -293,6 +303,9 @@ private:
     void build_mat_vec( void );
 
     void set_link( uint32_t a, uint32_t b, double val );
+
+    /*! \brief Neumann-mask solids are implemented here, via set_link(). */
+    virtual bool supports_neumann_mask( void ) const { return( true ); }
 
     /*! \brief Add the epot-dependent plasma contribution (rhs term and
      *  diagonal derivative) for free node \a a at mesh location

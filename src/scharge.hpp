@@ -91,6 +91,23 @@ void scharge_finalize_pic( MeshScalarField &scharge );
 void scharge_clear_solid_nodes( MeshScalarField &scharge, const Geometry &geom );
 
 
+/*! \brief Apply the half-control-volume correction on Neumann-mask faces.
+ *
+ *  A Neumann mask is a node-centred mirror, so the last live node beside it
+ *  sits ON the symmetry plane and owns half a control volume. Deposition
+ *  reaches it from one side only while scharge_finalize_*() divided by a
+ *  whole cell, leaving its density a factor of two low.
+ *
+ *  This is the same correction scharge_finalize_*() already applies on the
+ *  six box walls; those loops key on index 0 and size-1, so an interior
+ *  mask staircase is missed entirely.
+ *
+ *  Call after scharge_finalize_*() and before or after
+ *  scharge_clear_solid_nodes() -- it only touches live nodes.
+ */
+void scharge_correct_neumann_mask( MeshScalarField &scharge, const Geometry &geom );
+
+
 /*! \brief Function for adding charge to space charge density map from
  *  particle trajectory in 2d simulation.
  *

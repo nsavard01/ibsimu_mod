@@ -314,13 +314,14 @@ private:
     std::vector<double>  _lvl1_lin_val;   // level 1 operator values with delta==0, i.e. as built by galerkin_coarsen() in prepare(); same layout as _level[1].val
     std::vector<int32_t> _delta_src;      // fine row m for each precomputed triple
     std::vector<int32_t> _delta_dst;      // matching index into _level[1].val
+    std::vector<size_t>  _delta_group;    // offsets into the triples, one entry per distinct dst (+1 terminator)
     std::vector<double>  _delta_coef;     // contribution is _delta_coef[k] * (current diag[m] - _lvl0_diag_ref[m])
 
     void build_delta_update_tables( void );
 
     void build_level0( const CRowMatrix &A );
     void refresh_level0_values( const CRowMatrix &A );
-    void color_graph( Level &lev ) const;
+    void color_graph( Level &lev, const std::vector<int32_t> *node_map = NULL ) const;
     void find_diagonals( Level &lev ) const;
     bool next_level_size( const Level &fine, uint32_t &cnx, uint32_t &cny, uint32_t &cnz ) const;
     void build_transfer_operators( const Level &fine, Level &coarse,

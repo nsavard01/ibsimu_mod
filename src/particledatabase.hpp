@@ -362,6 +362,33 @@ public:
      */
     void set_mirror( const bool mirror[6] );
 
+    /*! \brief Reflect at Neumann masks (true, default) or absorb (false).
+     *
+     *  A mask is a symmetry surface, so reflection is correct. Absorption
+     *  is offered only as a diagnostic: it reinstates the artificial loss
+     *  channel a mask exists to remove, which is useful for deciding
+     *  whether an instability comes from the extra retained space charge
+     *  or from the reflection machinery. The potential solve is unaffected.
+     */
+    void set_mask_reflection( bool reflect );
+
+    /*! \brief Deterministic space-charge deposition (default true).
+     *
+     *  true  : each thread deposits into a private field, merged in thread
+     *          order afterwards -- bit-reproducible run to run.
+     *  false : all threads share one field via atomic adds -- faster and
+     *          uses less memory, but floating-point addition is not
+     *          associative so the result depends on thread arrival order.
+     *
+     *  Reproducibility matters more than it looks: the trajectory
+     *  integrator's step controller operates at its error tolerance, so any
+     *  last-bit change in the field flips accept/reject decisions and the
+     *  self-consistent iteration amplifies the difference over cycles.
+     *
+     *  Cost of true is nthreads * nodecount * 8 bytes.
+     */
+    void set_deterministic_scharge( bool deterministic );
+
     /*! \brief Get particle mirroring on boundaries.
      *
      *  Mirroring is read for (xmin,xmax,ymin,ymax,zmin,zmax)

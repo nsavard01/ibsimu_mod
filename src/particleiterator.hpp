@@ -50,6 +50,7 @@
 #include <iomanip>
 #include <chrono>
 #include <gsl/gsl_odeiv2.h>
+#include <gsl/gsl_errno.h>
 #include <gsl/gsl_poly.h>
 #include "geometry.hpp"
 #include "mat3d.hpp"
@@ -309,10 +310,58 @@ template <class PP> class ParticleIterator {
     double                     _epsrel;        /*!< \brief Relative error limit. */
     uint32_t                   _maxsteps;      /*!< \brief Maximum number of simulation steps for particle. */
     double                     _maxt;          /*!< \brief Maximum particle lifetime. */
+    /*! \brief Zero-length collision brackets seen by this iterator.
+     *
+     *  Rate-limits the warning in check_collision_solid(). Particle
+     *  iteration is threaded and there is one iterator per thread, so a
+     *  plain member needs no locking. A default member initialiser is used
+     *  rather than an entry in the constructor's init list, which would
+     *  have to be kept in declaration order to avoid -Wreorder. */
+    uint32_t                   _degenerate_bracket = 0;
+
+    /*! \brief Particles killed by step-size underflow on this thread.
+     *
+     *  Rate-limits the warning. One iterator per thread, so no locking. */
+    uint32_t                   _stuck_reported = 0;
+
+    /*! \brief Reflect particles at Neumann masks, or absorb them?
+     *
+     *  A mask is a symmetry surface, so true is the physically correct
+     *  setting and the default. false restores the old (wrong) behaviour in
+     *  which a mask absorbed like any other solid.
+     *
+     *  It exists as a DIAGNOSTIC. Reflection closes what was an artificial
+     *  loss channel, which raises the space charge near the mask; if a run
+     *  becomes unstable after enabling it, this separates "the extra charge
+     *  is real and the parameter set is space-charge limited" from "the
+     *  reflection itself is misbehaving". The field-side treatment is
+     *  untouched either way -- the stencil stays Neumann -- so the two
+     *  halves of the change can be tested independently.
+     */
+    bool                       _mask_reflect = true;
+
     bool                       _save_points;   /*!< \brief Save all points? */
     uint32_t                   _trajdiv;       /*!< \brief Divisor for saved trajectories,
 					        * if 3, every third trajectory is saved. */
     bool                       _mirror[6];     /*!< \brief Is particle mirrored on boundary? */
+
+    /*! \brief Which user solids are Neumann masks, indexed by (n - 7).
+     *
+     *  Cached once in the constructor. Geometry::get_boundary() returns a
+     *  Bound by value and range-checks every call, which is the wrong shape
+     *  for a test in the trajectory inner loop.
+     */
+    std::vector<bool>          _mask_solid;
+
+    /*! \brief Does this geometry contain ANY Neumann mask?
+     *
+     *  Short-circuits the mask test in handle_trajectory_advance(). Without
+     *  it every mesh-face crossing in every simulation would pay for 4 (2D)
+     *  or 8 (3D) mesh_check() lookups that can only ever return false --
+     *  a small but unnecessary tax on the overwhelming majority of runs,
+     *  which have no mask at all.
+     */
+    bool                       _have_mask;
     bool                       _surface_collision;
 
     ParticleIteratorData       _pidata;        /*!< \brief User data provided to PP::get_derivatives(). */
@@ -525,7 +574,58 @@ template <class PP> class ParticleIterator {
 	}
 	Vec3D vc;
 	Vec3D v1 = x1.location();
-	double K = _pidata._geom->bracket_surface( bound, v2, v1, vc );
+
+	// DEGENERATE INTERVAL: x1 and x2 are the same point.
+	//
+	// bracket_surface() throws "xin and xout are the same point" on this,
+	// because its return value is a parametric fraction along the segment,
+	//     (xsurf[a] - xin[a]) / (xout[a] - xin[a])
+	// taken on the axis of largest coordinate difference -- and that axis
+	// has zero extent. K is then used just below to interpolate the FULL
+	// particle state (time and velocity included, not only position) onto
+	// the solid surface, which is what makes absorption sub-cell accurate.
+	//
+	// With a zero-length segment there is no fraction to find, but the
+	// answer is already known: the inside() test above returned bound >= 7,
+	// so this point lies in a real solid, and K = 0 (status_x = x2) is what
+	// a converged bisection returns when the inside point IS the surface.
+	//
+	// CAUSE NOT YET ESTABLISHED. It first appeared at h = 0.5*debye, having
+	// never occurred at 5*debye. Note what the condition actually requires:
+	// x1 == x2 AND that point inside a solid, which also means x1 was inside
+	// the solid -- violating this function's stated precondition that x1 is
+	// in vacuum. So something upstream handed it a segment it should not
+	// have. Two things worth knowing while diagnosing:
+	//
+	//   - Geometry::inside() scans solids BACKWARDS, so the highest-numbered
+	//     solid is tested first. In the cut driver that is 12, the Neumann
+	//     mask -- the newest and least-exercised path.
+	//   - handle_mask_reflection() mirrors about the crossing point with
+	//     x2[2a+1] = 2*xmirror - x2[2a+1]. If x2 already sits on that plane
+	//     the mirror is a no-op in POSITION and flips only the velocity,
+	//     leaving the particle where it was and still inside the mask.
+	//
+	// The warning below prints both endpoints, the solid and the velocity
+	// precisely so this can be settled from one run rather than reasoned
+	// about. If the reported solid is 12 and the location is at
+	// r ~ enclosed_r with x < 0, it is the mask reflection.
+	if( v1 == v2 && _degenerate_bracket < 10 ) {
+	    _degenerate_bracket++;
+	    ibsimu.message( MSG_WARNING, 1 )
+		<< "Warning: zero-length collision bracket, solid " << bound
+		<< " at " << v2 << "; treating as a collision there.\n"
+		<< "         x1 = " << x1 << "\n"
+		<< "         x2 = " << x2 << "\n"
+		<< ( _degenerate_bracket == 10
+		     ? "         Further occurrences on this thread suppressed.\n"
+		     : "" );
+	} else if( v1 == v2 ) {
+	    _degenerate_bracket++;
+	}
+
+	double K = ( v1 == v2 )
+	    ? 0.0
+	    : _pidata._geom->bracket_surface( bound, v2, v1, vc );
 
 	// Calculate new PP
 	for( size_t a = 0; a < PP::size(); a++ )
@@ -627,7 +727,22 @@ template <class PP> class ParticleIterator {
 	// Mirror calculation point
 	x2[2*a+1] = 2.0*xmirror - x2[2*a+1];
 	x2[2*a+2] *= -1.0;
-	
+
+	/* A mirror that lands EXACTLY on the plane is a stuck state in
+	 * MODE_CYL: the axis is r = 0, get_derivatives() rejects r <= 0, and
+	 * from then on every step fails whatever dt is -- the particle can
+	 * never leave. 2*xmirror - x is exactly xmirror whenever the particle
+	 * arrived exactly on the plane, which is not a rare accident on the
+	 * axis because trajectories are actively driven towards r = 0.
+	 *
+	 * Nudged to the live side by a small fraction of a cell. The size is
+	 * irrelevant physically -- it is far below the integration tolerance
+	 * -- and it only has to be enough to clear the strict inequality.
+	 */
+	if( _pidata._geom->geom_mode() == MODE_CYL && a == 1 &&
+	    x2[2*a+1] <= 0.0 )
+	    x2[2*a+1] = 1.0e-6 * _pidata._geom->h();
+
 	// Coordinates changed, reset integrator
 	gsl_odeiv2_step_reset( _step );
 	gsl_odeiv2_evolve_reset( _evolve );
@@ -659,6 +774,177 @@ template <class PP> class ParticleIterator {
 	return( _pidata._geom->material_check( i, j, k ) != 0 );
     }
 
+    /*! \brief Return if node (i,j) is inside a Neumann-mask solid. */
+    bool is_mask( int i, int j ) {
+	return( SMESH_NODE_IS_NEUMANN_MASK( _pidata._geom->mesh_check( i, j ) ) );
+    }
+
+    /*! \brief Return if node (i,j,k) is inside a Neumann-mask solid. */
+    bool is_mask( int i, int j, int k ) {
+	return( SMESH_NODE_IS_NEUMANN_MASK( _pidata._geom->mesh_check( i, j, k ) ) );
+    }
+
+    /*! \brief Is the particle crossing INTO a Neumann mask at _coldata[c]?
+     *
+     *  Decided ANALYTICALLY, by asking Geometry::inside() about a point just
+     *  past the crossing face -- NOT by the mesh node classification.
+     *
+     *  The mesh-node version this replaces caused a real and quiet bug.
+     *  Reflection was gated on SMESH_NODE_IS_NEUMANN_MASK, while absorption
+     *  in check_collision_solid() is decided by the analytic inside(). Those
+     *  two disagree everywhere between the mask surface and the first node
+     *  actually marked as masked, and when the gate said no,
+     *  handle_trajectory_advance() fell straight through to the absorbing
+     *  path -- so a SYMMETRY surface ate the beam. Measured in the ECR cut
+     *  run: 2.9 mA and 293 particles absorbed on solid 12, concentrated at
+     *  exactly the radius where the sheath was being measured, which is why
+     *  it showed up as space charge falling off towards the mask.
+     *
+     *  Testing the CROSSING POINT rather than the segment end x2 is
+     *  load-bearing, not stylistic. x2 is the same for every c, so a test on
+     *  it would fire on the FIRST face of a multi-crossing step and mirror
+     *  the trajectory about a plane it had not reached yet. The crossing
+     *  point identifies WHICH face is the entry face -- exactly what
+     *  handle_mask_reflection() needs for its mirror plane.
+     *
+     *  Cost is one inside() call per mesh crossing, and only when the
+     *  geometry has a mask at all (_have_mask). check_collision_solid()
+     *  performs the same call immediately afterwards in the non-mask case,
+     *  so this at worst doubles one test that was already being paid for.
+     */
+    bool entering_mask( size_t c, int dir ) {
+	const size_t a = (size_t)((dir < 0 ? -dir : dir) - 1);
+	Vec3D v = _coldata[c]._x.location();
+	// Step just past the face, into the cell being entered. Small
+	// compared with a cell, enormous compared with the ULP of a
+	// coordinate, so it cannot be lost to rounding.
+	v[a] += (dir < 0 ? -1.0 : 1.0) * 1.0e-3 * _pidata._geom->h();
+	return( is_mask_solid( _pidata._geom->inside( v ) ) );
+    }
+
+    /*! \brief Is solid number \a n a Neumann mask?
+     *
+     *  Cached at construction rather than asking Geometry per test:
+     *  get_boundary() returns Bound BY VALUE and range-checks on every
+     *  call, and this sits in the trajectory inner loop.
+     */
+    bool is_mask_solid( uint32_t n ) const {
+	return( n >= 7 && n - 7 < _mask_solid.size() && _mask_solid[n-7] );
+    }
+
+    /*! \brief Reflect the particle if it is genuinely entering a mask.
+     *
+     *  A mask is a SYMMETRY surface, so a particle reaching it must be
+     *  reflected -- not absorbed (that would put an artificial loss channel
+     *  on a surface that is not physically there, which is one of the
+     *  things a mask exists to avoid) and not passed through (there is no
+     *  field solution on the far side).
+     *
+     *  The particle is STOPPED at the plane, not mirrored past it. It is
+     *  placed on the crossing point with the normal velocity reversed, and
+     *  the rest of this step's crossings are discarded. Because the
+     *  crossing point carries its own time, the next ODE step resumes at
+     *  the instant of contact, so the step is shortened rather than any
+     *  path being lost.
+     *
+     *  Mirroring the overshoot -- what handle_mirror() does for box faces --
+     *  was tried and removed. It relies on two properties a box wall has
+     *  and a mask does not:
+     *
+     *  - A box mirror plane IS the domain edge, so the image of an
+     *    overshoot is always back inside. A mask plane is interior, and
+     *    2*p - x lands wherever it lands; radially it goes NEGATIVE once
+     *    the particle penetrated further than the plane's own radius.
+     *
+     *  - get_derivatives() bounds a box overshoot to one cell: a step
+     *    ending beyond origo-h / max+h returns IBSIMU_DERIV_ERROR, so the
+     *    step is rejected and dt halved until it fits. Nothing does that
+     *    for a mask, because the masked region is INSIDE the mesh box.
+     *    Worse, the solver never writes a potential there (see
+     *    epot_solver.cpp: masked nodes are eliminated and keep stale
+     *    values), so a particle that dips in is pushed by a meaningless
+     *    field and can arrive tens of cells deep in one step. Mirroring
+     *    that gave r < 0, after which every step failed the r > 0 test and
+     *    the run died with "too small step size" far from the mask.
+     *
+     *  Stopping at the plane means the particle never samples the unsolved
+     *  region, which beats any quality of guess about what is in it. There
+     *  is also no single mirror direction to guess ALONG: a mask is a
+     *  staircase with axial and radial faces and corners, not one plane
+     *  with a normal, so set_extrapolation()'s per-box-face trick has no
+     *  analogue here.
+     *
+     *  THE PLANE IS THE MESH FACE just crossed, _coldata[c], not the
+     *  analytic solid surface. With both mask faces snapped to node planes
+     *  by the driver the two coincide; where they do not, the mesh face is
+     *  still the right choice, because set_link() drops the face between a
+     *  live node and a masked node, so the field's own zero-flux surface is
+     *  mesh-aligned too.
+     *
+     *  The mesh index i[] is deliberately NOT advanced by the caller in
+     *  this path: a reflected particle stays in the cell it was in.
+     */
+    bool handle_mask_reflection( size_t c, int dir, PP &x2 ) {
+
+	// NO re-test of x2 here. entering_mask() has already decided, and
+	// analytically, at the crossing point. Re-testing the segment END
+	// would reintroduce exactly the mesh-vs-analytic disagreement this
+	// was written to remove, and would reject a particle whose step
+	// happens to finish back outside the mask.
+	const size_t a = (size_t)((dir < 0 ? -dir : dir) - 1);
+	const double xmirror = _coldata[c]._x[2*a+1];
+
+	DEBUG_MESSAGE( "Reflecting trajectory at Neumann mask, plane "
+		       << xmirror << "\n" );
+
+	save_trajectory_point( _coldata[c]._x );
+
+	// TRUNCATE at the surface. The particle is placed exactly on the
+	// reflection plane, a hair back on the live side, with the normal
+	// velocity reversed, and the remaining crossings for this step are
+	// discarded -- they describe a path that no longer exists.
+	//
+	// Nothing is lost by this. x2 = _coldata[c]._x copies the crossing
+	// point INCLUDING its time (index 0), so the particle's clock sits at
+	// the instant it met the plane and the next ODE step simply continues
+	// from there. The step is cut short, not skipped.
+	//
+	// The alternative -- mirroring the whole overshoot about the plane,
+	// as handle_mirror() does for box walls -- was tried and removed. It
+	// works for a box because the mirror plane IS the domain edge, so the
+	// image is always inside, and because get_derivatives() bounds the
+	// overshoot to one cell: a step landing further out returns
+	// IBSIMU_DERIV_ERROR, is rejected, and dt is halved until it fits.
+	//
+	// Neither holds at a mask. The masked region is INSIDE the mesh box,
+	// so nothing errors and nothing bounds the penetration; and the
+	// potential there is never written by the solver (see epot_solver.cpp
+	// -- masked nodes are eliminated and keep stale values), so a particle
+	// that dips in is accelerated by a meaningless field and can arrive
+	// tens of cells deep in a single step. Mirroring that overshoot sent
+	// it to NEGATIVE radius, after which every subsequent step failed the
+	// r > 0 test and the run died with "too small step size", far from the
+	// mask and with nothing pointing back at it.
+	//
+	// Truncating means the particle never samples the unsolved region at
+	// all, which is worth more than any quality of guess about what is in
+	// there. A mask is also a staircase, not a plane, so there is no
+	// single well-defined mirror direction to extrapolate along the way
+	// set_extrapolation() can for a box face.
+	const double eps = 1.0e-3 * _pidata._geom->h();
+	x2 = _coldata[c]._x;
+	x2[2*a+1] = xmirror + ( dir < 0 ? eps : -eps );
+	x2[2*a+2] *= -1.0;
+	_coldata.resize( c+1 );      // ends handle_trajectory()'s loop
+
+	// Coordinates changed discontinuously: the adaptive stepper's
+	// history no longer describes this trajectory.
+	gsl_odeiv2_step_reset( _step );
+	gsl_odeiv2_evolve_reset( _evolve );
+
+	return( true );
+    }
+
     /*! \brief Handle particle mesh intersection.
      *
      *  Particle mesh coordinates \a i are advanced through
@@ -672,6 +958,27 @@ template <class PP> class ParticleIterator {
 	bool surface_collision = false;
 	DEBUG_MESSAGE( "Handle trajectory advance\n" );
 	DEBUG_INC_INDENT();
+
+	// Neumann-mask reflection, BEFORE the solid checks and before the
+	// mesh index is advanced. The particle stays in the cell it was in
+	// with its normal velocity flipped, so i[] must not move -- hence
+	// the early return rather than falling through to the advance
+	// below.
+	// Neumann-mask reflection, BEFORE the solid checks and before the
+	// mesh index is advanced: a reflected particle stays in the cell it
+	// was in, so i[] must not move -- hence the early return rather than
+	// falling through to the advance below.
+	//
+	// entering_mask() is the whole decision now, taken analytically at
+	// the crossing point, so reflection ALWAYS precedes the absorbing
+	// solid checks below. That ordering is the fix: a Neumann mask is a
+	// symmetry surface and must never reach check_collision_solid(),
+	// which would happily absorb on it.
+	if( _have_mask && _mask_reflect && entering_mask( c, _coldata[c]._dir ) ) {
+	    handle_mask_reflection( c, _coldata[c]._dir, x2 );
+	    DEBUG_DEC_INDENT();
+	    return( true );
+	}
 
 	// Check for collisions with solids and advance coordinates i.
 	if( PP::dim() == 2 ) {
@@ -1158,6 +1465,21 @@ public:
 	  _stat(geom->number_of_boundaries()),
 	  _time_ode(0.0), _time_trajhandle(0.0) {
 
+	// Cache which solids are Neumann masks -- see _mask_solid.
+	_have_mask = false;
+	{
+	    uint32_t nb = geom->number_of_boundaries();
+	    if( nb > 6 ) {
+		_mask_solid.resize( nb - 6, false );
+		for( uint32_t n = 7; n <= nb; n++ ) {
+		    bool m = ( geom->get_boundary(n).type() == BOUND_NEUMANN );
+		    _mask_solid[n-7] = m;
+		    if( m )
+			_have_mask = true;
+		}
+	    }
+	}
+
 	// Initialize mirroring
 	_mirror[0] = mirror[0];
 	_mirror[1] = mirror[1];
@@ -1211,6 +1533,14 @@ public:
 	_surface_collision = surface_collision;
     }
 
+
+    /*! \brief Reflect at Neumann masks (true, default) or absorb (false).
+     *
+     *  Diagnostic switch -- see _mask_reflect. Affects particles only; the
+     *  potential solve keeps its Neumann stencil either way, so the field
+     *  side and the particle side of a mask can be tested independently.
+     */
+    void set_mask_reflection( bool reflect ) { _mask_reflect = reflect; }
 
     /*! \brief Set trajectory handler callback. 
      */
@@ -1354,17 +1684,139 @@ public:
 			DEBUG_MESSAGE( "Step rejected\n" <<
 				       "  x2 = " << x2 << "\n" <<
 				       "  dt = " << dt << "\n" );
-			x2[0] = x[0]; // Reset time (this shouldn't be necessary - there
-				      // is a bug in GSL-1.12, report has been sent)
-			dt *= 0.5;
-			if( dt == 0.0 )
-			    throw( Error( ERROR_LOCATION, "too small step size" ) );
+			/* Restore the FULL state, not just the time.
+			 *
+			 * x2 = x is done once, above, OUTSIDE this retry loop.
+			 * gsl_odeiv2_evolve_apply() is handed &x2[0] as the
+			 * time and &x2[1] as the state, and on a rejected step
+			 * it can leave the state partially advanced -- the
+			 * original code here restored only x2[0], on the
+			 * suspicion (see the note it carried about GSL-1.12)
+			 * that the time was not being rolled back.
+			 *
+			 * The state has exactly the same problem and was not
+			 * being rolled back at all. So a step that overshoots
+			 * into an invalid region -- r <= 0 at the axis, say --
+			 * leaves x2 sitting THERE, and every retry then starts
+			 * from the invalid point instead of from x. The first
+			 * RK stage is evaluated at the start of the step, so
+			 * they all fail regardless of dt, and dt halves to zero:
+			 * "too small step size", thrown for a particle that was
+			 * never actually stuck.
+			 *
+			 * Restoring the whole state makes the retry mean what
+			 * it says -- take the same step again, smaller.
+			 */
+			x2 = x;
+
+			/* GSL zeroes *h on some failure paths, and 0*0.5 is
+			 * still 0 -- which would look like an underflow on the
+			 * FIRST rejection rather than after a genuine sequence
+			 * of halvings. Re-seed from the geometric estimate in
+			 * that case so the retry has something to work with,
+			 * and let the counter below decide when to give up. */
+			if( dt == 0.0 ) {
+			    double dxdt_rs[PP::size()-1];
+			    if( PP::get_derivatives( 0.0, &x[1], dxdt_rs,
+						     (void *)&_pidata ) == GSL_SUCCESS )
+				dt = 0.5*calculate_dt( x, dxdt_rs );
+			} else {
+			    dt *= 0.5;
+			}
+			if( dt == 0.0 ) {
+
+			    /* STUCK PARTICLE -- kill it, do not abort the run.
+			     *
+			     * Halving only helps if the START of the step is a
+			     * valid sampling point: the first RK stage is
+			     * evaluated there. Once the current state itself
+			     * fails get_derivatives()'s range test -- r <= 0,
+			     * or outside the box by more than h -- every
+			     * candidate step is rejected however small, and dt
+			     * grinds to zero. It is a stuck state, not a step
+			     * size problem, and no dt can rescue it.
+			     *
+			     * With the state restored properly above, this
+			     * should now be unreachable in practice: a retry
+			     * from a valid x with a smaller dt has somewhere to
+			     * go. It is kept as a backstop, because throwing
+			     * was a poor trade -- one pathological particle out
+			     * of 192000 destroyed a 9000-second run at cycle 30
+			     * with nothing kept -- and because a genuinely
+			     * stuck state is still conceivable (a particle
+			     * placed outside the domain by a mirror, for
+			     * instance). If this fires, the state was already
+			     * bad on ENTRY to the step, which is a different
+			     * bug and the printed location says where.
+			     * Killing it as PARTICLE_BADDEF loses that
+			     * particle's contribution to the space charge --
+			     * one part in 1e5 -- and the run continues.
+			     *
+			     * Reported with its coordinates, rate-limited,
+			     * because WHERE it gets stuck is the diagnosis: r
+			     * at or below zero means the axis handling, x
+			     * beyond the box means a mirror or reflection put
+			     * it there. A steady trickle is tolerable; a burst
+			     * means something upstream is placing particles
+			     * outside the domain and should be fixed rather
+			     * than absorbed here.
+			     */
+			    if( _stuck_reported < 10 ) {
+				_stuck_reported++;
+				ibsimu.message( MSG_WARNING, 1 )
+				    << "Warning: particle stuck (step size underflow) at "
+				    << x2.location() << ", killed as BADDEF."
+				    << ( _stuck_reported == 10
+					 ? " Further occurrences on this thread suppressed.\n"
+					 : "\n" );
+			    }
+			    particle->set_status( PARTICLE_BADDEF );
+			    _stat.inc_end_baddef();
+			    DEBUG_DEC_INDENT();
+			    return;
+			}
 			//nstp++;
 			continue;
 		    } else if( retval == GSL_SUCCESS ) {
 			break;
 		    } else {
-			throw( Error( ERROR_LOCATION, "gsl_odeiv2_evolve_apply failed" ) );
+
+			/* A THIRD return value: neither success nor our own
+			 * IBSIMU_DERIV_ERROR (201). GSL has its own failure
+			 * modes here -- notably it can decide the step size
+			 * cannot be reduced further and return GSL_ENOPROG or
+			 * GSL_FAILURE, and on some paths it ZEROES *h before
+			 * returning, which is why a run can reach this branch
+			 * rather than the underflow one above.
+			 *
+			 * This used to throw, discarding the code without ever
+			 * saying which one it was -- so the message named the
+			 * symptom and hid the diagnosis. It now prints the code
+			 * and gsl_strerror(), and kills the particle instead of
+			 * the run, consistent with the other two exits.
+			 *
+			 * If these appear in numbers, the code is the thing to
+			 * report: ENOPROG means GSL gave up on the step size
+			 * (same pathology as the underflow path, detected
+			 * inside GSL), while EBADFUNC would mean the derivative
+			 * function is returning something GSL cannot interpret,
+			 * which would be a different bug entirely.
+			 */
+			if( _stuck_reported < 10 ) {
+			    _stuck_reported++;
+			    ibsimu.message( MSG_WARNING, 1 )
+				<< "Warning: gsl_odeiv2_evolve_apply returned "
+				<< retval << " (" << gsl_strerror( retval )
+				<< ") for particle " << pi << " at "
+				<< x2.location() << ", killed as BADDEF."
+				<< ( _stuck_reported == 10
+				     ? " Further occurrences on this thread suppressed.\n"
+				     : "\n" );
+			}
+			particle->set_status( PARTICLE_BADDEF );
+			_stat.inc_end_baddef();
+			DEBUG_DEC_INDENT();
+			return;
 		    }
 		}
 		_time_ode += std::chrono::duration<double>( Clock::now()-time_t0 ).count();
@@ -1374,11 +1826,34 @@ public:
 	    if( nstp >= _maxsteps )
 	        break;
 	    if( x2[0] == x[0] ) {
-	        // Print failed trajectory
-		ibsimu.message( 1 ) << "Particle calculation failed. Coordinates:\n";
-		for( size_t a = 0; a < _traj.size(); a++ )
-		    ibsimu.message( 1 ) << a << " " << _traj[a] << "\n";
-	        throw( Error( ERROR_LOCATION, "too small step size calculating particle " + to_string(pi) ) );
+
+		/* The step was ACCEPTED but advanced time by zero, so the
+		 * particle cannot progress. Kill it rather than aborting the
+		 * run -- same reasoning as the underflow backstop above, and
+		 * the same trade: losing one particle's space charge beats
+		 * losing every completed cycle.
+		 *
+		 * The original also dumped the entire trajectory to the
+		 * message stream. That is worse than useless here: particle
+		 * iteration is threaded, so the dump interleaves with 31
+		 * other threads, and a long trajectory is thousands of lines.
+		 * One line with the location is the part that identifies
+		 * where it happened.
+		 */
+		if( _stuck_reported < 10 ) {
+		    _stuck_reported++;
+		    ibsimu.message( MSG_WARNING, 1 )
+			<< "Warning: particle " << pi << " made no progress (dt "
+			<< "accepted as zero) at " << x2.location()
+			<< ", killed as BADDEF."
+			<< ( _stuck_reported == 10
+			     ? " Further occurrences on this thread suppressed.\n"
+			     : "\n" );
+		}
+		particle->set_status( PARTICLE_BADDEF );
+		_stat.inc_end_baddef();
+		DEBUG_DEC_INDENT();
+		return;
 	    }
 	    
 	    // Increase step count.

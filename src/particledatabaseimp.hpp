@@ -73,6 +73,8 @@ protected:
     uint32_t                   _trajdiv;      /*!< \brief Divisor for saved trajectories,
 					       * if 3, every third trajectory is saved. */
     bool                       _mirror[6];    /*!< \brief Boundary particle mirroring. */
+    bool                       _mask_reflect = true; /*!< \brief Reflect (true) or absorb (false) at Neumann masks. */
+    bool                       _deterministic_scharge = false; /*!< \brief Per-thread scharge buffers, merged in thread order. Off: see the note at the allocation site. */
 
     double                     _rhosum;       /*!< \brief Sum of space charge density in defined beams (C/m3). */
 
@@ -145,6 +147,12 @@ public:
     uint32_t get_save_trajectories( void ) const;
 
     void set_mirror( const bool mirror[6] );
+
+    void set_mask_reflection( bool reflect ) { _mask_reflect = reflect; }
+
+    void set_deterministic_scharge( bool d ) { _deterministic_scharge = d; }
+    bool get_deterministic_scharge( void ) const { return( _deterministic_scharge ); }
+    bool get_mask_reflection( void ) const { return( _mask_reflect ); }
 
     void get_mirror( bool mirror[6] ) const;
 
@@ -783,14 +791,60 @@ public:
 	    return;
 	}
 
+	/* PER-THREAD SPACE CHARGE BUFFERS, for bit-reproducibility.
+	 *
+	 * Deposition used to go straight into the shared scharge through
+	 * atomic_add_double(). Correct, but not reproducible: floating-point
+	 * addition is not associative, so the value in a cell depended on the
+	 * order threads happened to arrive. Two runs of the same binary on
+	 * the same input then differed in scharge's last bits.
+	 *
+	 * That is not cosmetic here. The trajectory integrator's step
+	 * controller sits AT its error tolerance by construction, so any
+	 * change in the field flips accept/reject decisions -- measured at
+	 * hundreds of differing ODE steps out of two million in a single
+	 * cycle -- and the fixed-point iteration amplifies the difference
+	 * from there. Reproducibility has to come first, or nothing
+	 * downstream (solver comparisons, particle-count convergence,
+	 * parameter fitting) can be attributed to what it looks like.
+	 *
+	 * Each thread owns a private field and they are summed in THREAD
+	 * ORDER afterwards.
+	 *
+	 * DEFAULT OFF, because measurement says it does not deliver what it
+	 * promises. Fixing the MERGE order does not make the result
+	 * reproducible, because WHICH PARTICLES land in which thread's buffer
+	 * is still decided dynamically -- so each partial sum groups a
+	 * different set of contributions and rounds differently regardless of
+	 * the order the buffers are added in. It would only work if the
+	 * particle-to-thread partition were static too.
+	 *
+	 * Measured: with the GMG scatter made deterministic (which is what
+	 * actually fixed epot), scharge lands within 1 ULP either way --
+	 * 2.2e-16 relative on the total. The shared+atomic path gets the same
+	 * result for nthreads*nodecount*8 bytes less memory (870 MB at 3.4e6
+	 * nodes on 32 threads) and without a serial merge pass per cycle.
+	 *
+	 * Kept as a switch rather than deleted: combined with a static
+	 * particle partition it would give bit-exact deposition, which is
+	 * worth having if that last ULP ever matters.
+	 */
+	std::vector<MeshScalarField *> tscharge;
+	if( _deterministic_scharge ) {
+	    for( uint32_t a = 0; a < ibsimu.get_thread_count(); a++ )
+		tscharge.push_back( new MeshScalarField( _geom ) );
+	}
+
 	// Make solvers
 	std::vector<ParticleIterator<PP> *>  iterators;
 	for( uint32_t a = 0; a < ibsimu.get_thread_count(); a++ ) {
 
+	    MeshScalarField *sc_target = _deterministic_scharge ? tscharge[a] : &scharge;
 	    iterators.push_back( new ParticleIterator<PP>( PARTICLE_ITERATOR_ADAPTIVE, _epsabs, _epsrel,
 							   _intrp, _scharge_dep, _maxsteps, _maxt,
-							   _save_points, _trajdiv, _mirror, &scharge,
+							   _save_points, _trajdiv, _mirror, sc_target,
 							   &efield, &bfield, &_geom ) );
+	    iterators[a]->set_mask_reflection( _mask_reflect );
 	    iterators[a]->set_trajectory_handler_callback( _thand_cb );
 	    iterators[a]->set_trajectory_end_callback( _tend_cb, _pdb );
 	    iterators[a]->set_trajectory_surface_collision_callback( _tsur_cb );
@@ -848,6 +902,21 @@ public:
 	// once, serially, after all trajectories are done -- cheap enough
 	// to time directly with the heavier Timer class.
 	Timer t_scharge_finalize;
+
+	// Merge the per-thread buffers in THREAD ORDER -- a fixed order, so
+	// the result does not depend on how the scheduler interleaved them.
+	if( _deterministic_scharge ) {
+	    const uint32_t nn = scharge.nodecount();
+	    for( uint32_t a = 0; a < (uint32_t)tscharge.size(); a++ ) {
+		const MeshScalarField &t = *tscharge[a];
+		for( uint32_t i = 0; i < nn; i++ )
+		    scharge( (int32_t)i ) += t( (int32_t)i );
+	    }
+	    for( uint32_t a = 0; a < (uint32_t)tscharge.size(); a++ )
+		delete tscharge[a];
+	    tscharge.clear();
+	}
+
 	if( _scharge_dep == SCHARGE_DEPOSITION_LINEAR )
 	    scharge_finalize_linear( scharge );
 	else
@@ -857,6 +926,12 @@ public:
 	// scharge_clear_solid_nodes()'s doc comment. Strip out anything
 	// that leaked into a conductor or dielectric interior before this
 	// scharge map is handed to the potential solver.
+	// Half-control-volume correction on Neumann-mask faces. The
+	// equivalent for the six box walls is already inside
+	// scharge_finalize_*(), but those loops key on index 0 and size-1
+	// and so never see an interior mask.
+	scharge_correct_neumann_mask( scharge, _geom );
+
 	scharge_clear_solid_nodes( scharge, _geom );
 	t_scharge_finalize.stop();
 

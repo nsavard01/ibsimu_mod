@@ -324,6 +324,22 @@ void EpotSolver::nsimp_newton( double &rhs, double &drhs, double epot ) const
 
 void EpotSolver::preprocess( MeshScalarField &epot )
 {
+    // Refuse to run a solver that does not implement Neumann masks on a
+    // geometry that contains one. See supports_neumann_mask()'s doc
+    // comment: the failure would otherwise be silent and physical-looking
+    // (the mask would act as a Dirichlet block at whatever potential
+    // happened to be stored there), which is exactly the kind of thing
+    // that gets mistaken for a real result.
+    if( !supports_neumann_mask() ) {
+	for( uint32_t n = 7; n <= _geom.number_of_boundaries(); n++ ) {
+	    if( _geom.get_boundary(n).type() == BOUND_NEUMANN )
+		throw( Error( ERROR_LOCATION, "solid " + to_string(n) +
+			      " is a Neumann mask, which this solver does not "
+			      "implement -- use EpotBiCGSTABSolver (or another "
+			      "EpotMatrixSolver) for geometries containing one" ) );
+	}
+    }
+
     if( _plasma == PLASMA_PEXP ) {
 	// Calculate plasma parameters for positive ion extraction. 
 	// Calculation done as rhs + A*exp(B*x-C)
@@ -484,10 +500,28 @@ void EpotSolver::preprocess( MeshScalarField &epot )
 		    }
 
 		} else if( node_id == SMESH_NODE_ID_DIRICHLET ) {
-		    
+
 		    // Dirichlet
 		    uint32_t boundary = mesh & SMESH_BOUNDARY_NUMBER_MASK;
 		    epot(i,j,k) = _geom.get_boundary( boundary ).value( x );
+
+		} else if( node_id == SMESH_NODE_ID_NEUMANN_MASK ) {
+
+		    // Inside a Neumann-mask solid: no equation and no value.
+		    //
+		    // Deliberately does NOT write epot here. The node carries
+		    // the SMESH_NODE_FIXED bit so it is eliminated from the
+		    // matrix, but unlike a Dirichlet node its stored potential
+		    // is never read back into any live row --
+		    // EpotMatrixSolver::set_link() diverts links pointing at
+		    // it onto the row's own diagonal instead of onto the right
+		    // hand side. Whatever epot holds here is therefore inert.
+		    //
+		    // It is left at its previous value rather than zeroed so
+		    // that a masked region plots as a smooth continuation of
+		    // its surroundings instead of a hole, and so that nothing
+		    // downstream mistakes a zero for a solved value. Nothing
+		    // in the solve depends on it either way.
 
 		} else {
 

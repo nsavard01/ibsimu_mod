@@ -18,6 +18,7 @@
  */
 
 #include <algorithm>
+#include <numeric>
 #include <unordered_map>
 #include <cmath>
 #include <cstring>
@@ -117,6 +118,7 @@ void GMG_Precond::clear( void )
     _delta_src.clear();
     _delta_dst.clear();
     _delta_coef.clear();
+    _delta_group.clear();
 }
 
 
@@ -440,12 +442,35 @@ void GMG_Precond::galerkin_coarsen( const Level &fine, Level &coarse ) const
  * rationale); duplicated here rather than shared so that GMG_Precond
  * has no compile-time dependency on RBSOR_Precond.
  */
-void GMG_Precond::color_graph( Level &lev ) const
+void GMG_Precond::color_graph( Level &lev, const std::vector<int32_t> *node_map ) const
 {
+    /* node_map, when non-NULL, is _node_map: rows whose mesh slot is
+     * eliminated (node_map < 0) are left OUT of the colour lists entirely,
+     * so the smoother never visits them.
+     *
+     * They are inert by construction, not merely unimportant. build_level0()
+     * gives an eliminated slot a single entry, the identity (m,m)=1, and
+     * maps every live row's columns through _row_to_node, which can only
+     * ever produce free nodes -- so nothing anywhere points AT an eliminated
+     * row. solve() fills their rhs with 0. Relaxing one therefore computes
+     *     x[m] <- (1-w)*x[m] + w*0
+     * from x[m] = 0, i.e. it does nothing at all, once per sweep, four
+     * sweeps per V-cycle, twice per BiCGSTAB iteration.
+     *
+     * They were previously visited because the existing skip in relax() is
+     * on inv_diag == 0, and an identity row's diagonal is 1, not 0.
+     *
+     * Only level 0 has eliminated slots -- coarser levels are pure Galerkin
+     * unknowns -- so node_map is passed there and NULL everywhere else. A
+     * coarse row that ends up entirely decoupled still gets zero diagonal
+     * and is still caught by relax()'s existing inv_diag test.
+     */
     int n = lev.n;
     std::vector<uint8_t> color( n, 0xFF );
 
     for( int i = 0; i < n; i++ ) {
+        if( node_map && (*node_map)[i] < 0 )
+            continue;
         bool red_taken = false, black_taken = false;
         for( int p = lev.ptr[i]; p < lev.ptr[i+1]; p++ ) {
             int j = lev.col[p];
@@ -460,6 +485,7 @@ void GMG_Precond::color_graph( Level &lev ) const
     }
 
     for( int i = 0; i < n; i++ ) {
+        if( node_map && (*node_map)[i] < 0 ) continue;
         if( color[i] == 2 ) continue;
         for( int p = lev.ptr[i]; p < lev.ptr[i+1]; p++ ) {
             int j = lev.col[p];
@@ -472,6 +498,7 @@ void GMG_Precond::color_graph( Level &lev ) const
 
     lev.red.clear(); lev.black.clear(); lev.leftover.clear();
     for( int i = 0; i < n; i++ ) {
+        if( node_map && (*node_map)[i] < 0 ) continue;
         if( color[i] == 0 ) lev.red.push_back( (uint32_t)i );
         else if( color[i] == 1 ) lev.black.push_back( (uint32_t)i );
         else lev.leftover.push_back( (uint32_t)i );
@@ -562,6 +589,7 @@ void GMG_Precond::build_delta_update_tables( void )
     _delta_src.clear();
     _delta_dst.clear();
     _delta_coef.clear();
+    _delta_group.clear();
 
     if( _level.size() < 2 )
         return; // no coarser level exists to update this way
@@ -635,6 +663,75 @@ void GMG_Precond::build_delta_update_tables( void )
         _delta_dst.insert( _delta_dst.end(), dst_buf[t].begin(), dst_buf[t].end() );
         _delta_coef.insert( _delta_coef.end(), coef_buf[t].begin(), coef_buf[t].end() );
     }
+
+    /* GROUP THE TRIPLES BY DESTINATION.
+     *
+     * The apply loop used to scatter these with atomic_add_double(), which
+     * is correct but NOT reproducible: floating-point addition is not
+     * associative, so the value landing in lev1.val depended on the order
+     * the threads happened to arrive in. That made the preconditioner --
+     * and therefore epot -- differ in its last bits between two runs of the
+     * same binary on the same input.
+     *
+     * That is not a harmless last-bit difference. It is the first link in a
+     * chain: the trajectory integrator's step controller drives the local
+     * error estimate to sit AT its tolerance by construction, so an
+     * arbitrarily small change in the field flips accept/reject decisions.
+     * Measured on the ECR cut case, two runs of one binary differed by
+     * hundreds of ODE steps out of two million in cycle 0 alone, and the
+     * iteration then amplified that over cycles.
+     *
+     * Sorting by destination lets each destination be summed by exactly one
+     * thread, in a fixed index order. Deterministic, and faster -- the CAS
+     * loop is gone.
+     *
+     * The sort key is the FULL TRIPLE (dst, src, coef), not dst alone.
+     * An earlier version used stable_sort on dst only, reasoning that the
+     * build order was deterministic because the per-thread buffers are
+     * concatenated in thread order. That reasoning was wrong: the build
+     * loop above is schedule(dynamic,256), so WHICH rows land in which
+     * thread's buffer varies from run to run, and a stable sort faithfully
+     * preserves that varying order within each destination group. The
+     * summation order therefore still varied, and so did the result -- the
+     * bug survived the fix that was supposed to remove it.
+     *
+     * Ordering on the whole triple is canonical regardless of how the
+     * triples were generated, so it is robust to the schedule clause rather
+     * than dependent on it. Any triples identical in all three fields are
+     * interchangeable, so ties among them cannot affect the sum.
+     */
+    const size_t ntot = _delta_dst.size();
+    std::vector<size_t> perm( ntot );
+    std::iota( perm.begin(), perm.end(), (size_t)0 );
+    std::sort( perm.begin(), perm.end(),
+               [&]( size_t a, size_t b ) {
+                   if( _delta_dst[a] != _delta_dst[b] )
+                       return( _delta_dst[a] < _delta_dst[b] );
+                   if( _delta_src[a] != _delta_src[b] )
+                       return( _delta_src[a] < _delta_src[b] );
+                   return( _delta_coef[a] < _delta_coef[b] );
+               } );
+
+    std::vector<int32_t> s2( ntot ), d2( ntot );
+    std::vector<double>  c2( ntot );
+    for( size_t i = 0; i < ntot; i++ ) {
+        s2[i] = _delta_src[ perm[i] ];
+        d2[i] = _delta_dst[ perm[i] ];
+        c2[i] = _delta_coef[ perm[i] ];
+    }
+    _delta_src.swap( s2 );
+    _delta_dst.swap( d2 );
+    _delta_coef.swap( c2 );
+
+    _delta_group.clear();
+    for( size_t i = 0; i < ntot; ) {
+        size_t j = i;
+        while( j < ntot && _delta_dst[j] == _delta_dst[i] )
+            j++;
+        _delta_group.push_back( i );
+        i = j;
+    }
+    _delta_group.push_back( ntot );
 }
 
 
@@ -682,7 +779,7 @@ void GMG_Precond::prepare( const CRowMatrix &A )
     _level.clear();
 
     build_level0( A );
-    color_graph( _level[0] );
+    color_graph( _level[0], &_node_map );
     find_diagonals( _level[0] );
 
     uint32_t maxlevels = (_nlevels_req == 0 ? 0xFFFFFFFF : _nlevels_req);
@@ -703,7 +800,7 @@ void GMG_Precond::prepare( const CRowMatrix &A )
         const std::vector<int32_t> *fine_map = (_level.size() == 1 ? &_node_map : NULL);
         build_transfer_operators( fine, coarse, fine_map );
         galerkin_coarsen( fine, coarse );
-        color_graph( coarse );
+        color_graph( coarse, NULL );
         find_diagonals( coarse );
 
         _level.push_back( std::move(coarse) );
@@ -720,6 +817,21 @@ void GMG_Precond::prepare( const CRowMatrix &A )
         _x[l].assign( _level[l].n, 0.0 );
         _b[l].assign( _level[l].n, 0.0 );
         _r[l].assign( _level[l].n, 0.0 );
+    }
+
+    // Report how much of level 0 the smoother actually sweeps. Level 0 is
+    // full-mesh sized by construction (the geometric transfer operators
+    // need a structured grid), so on a geometry with many eliminated nodes
+    // -- Dirichlet electrodes, or a Neumann mask -- the gap between this
+    // and the level size is the work the colour lists now skip.
+    {
+        size_t swept = _level[0].red.size() + _level[0].black.size()
+                     + _level[0].leftover.size();
+        ibsimu.message( 1 ) << "GMG_Precond: smoother sweeps " << swept
+                            << " of " << _level[0].n << " level-0 rows ("
+                            << (100.0*swept/_level[0].n) << " %), "
+                            << (_level[0].n - swept)
+                            << " eliminated rows skipped\n";
     }
 
     ibsimu.message( 1 ) << "GMG_Precond: built " << _level.size() << " level(s), sizes:";
@@ -782,15 +894,25 @@ void GMG_Precond::construct( const CRowMatrix &A )
         const Level &lev0 = _level[0];
         size_t ntriples = _delta_src.size();
 
+        // One destination per iteration, summed in fixed index order -- no
+        // atomics, and bit-reproducible. See the grouping in
+        // build_delta_triples().
+        (void)ntriples;
+        const size_t ngroup = _delta_group.size() - 1;
         #pragma omp parallel for schedule(static)
-        for( size_t k = 0; k < ntriples; k++ ) {
-            int m = _delta_src[k];
-            int di = lev0.diag_idx[m];
-            double curdiag = (di >= 0 ? lev0.val[di] : 0.0);
-            double delta = curdiag - _lvl0_diag_ref[m];
-            if( delta == 0.0 )
-                continue;
-            atomic_add_double( lev1.val[ _delta_dst[k] ], delta*_delta_coef[k] );
+        for( size_t g = 0; g < ngroup; g++ ) {
+            double acc = 0.0;
+            for( size_t k = _delta_group[g]; k < _delta_group[g+1]; k++ ) {
+                int m = _delta_src[k];
+                int di = lev0.diag_idx[m];
+                double curdiag = (di >= 0 ? lev0.val[di] : 0.0);
+                double delta = curdiag - _lvl0_diag_ref[m];
+                if( delta == 0.0 )
+                    continue;
+                acc += delta*_delta_coef[k];
+            }
+            if( acc != 0.0 )
+                lev1.val[ _delta_dst[ _delta_group[g] ] ] += acc;
         }
 
         find_diagonals( lev1 );

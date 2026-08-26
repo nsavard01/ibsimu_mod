@@ -46,6 +46,7 @@
 
 #include <stdint.h>
 #include <vector>
+#include <utility>
 #include <iostream>
 #include "file.hpp"
 #include "vec3d.hpp"
@@ -166,6 +167,33 @@ public:
 #define SMESH_NODE_ID_NEAR_SOLID_FIX   0xA0000000 // 101...
 #define SMESH_NODE_ID_DIRICHLET        0xC0000000 // 110...
 #define SMESH_NODE_ID_FINE_BOUNDARY    0xE0000000 // 111...
+
+/*! \brief Node inside a Neumann-mask solid: removed from the solve, with
+ *  a zero-flux (homogeneous Neumann) condition on every face separating it
+ *  from a live node.
+ *
+ *  Takes the FINE_BOUNDARY slot, which is declared above but referenced
+ *  nowhere else in the library -- so this costs no re-encoding. Sharing the
+ *  bit pattern is safe precisely because nothing ever tests for
+ *  FINE_BOUNDARY; if that ever changes, the two must be split and one of
+ *  them given a different id.
+ *
+ *  The SMESH_NODE_FIXED bit is set (0xE0000000 & 0x80000000 != 0), so
+ *  EpotMatrixSolver::preprocess() eliminates these nodes from the matrix
+ *  without any change there. What makes them a Neumann mask rather than a
+ *  Dirichlet block is EpotMatrixSolver::set_link(), which redirects a link
+ *  pointing AT one of these onto the row's own diagonal instead of moving
+ *  it to the right-hand side -- see the comment there for why that is
+ *  exactly a zero-flux face.
+ *
+ *  A masked solid is created by giving a solid BOUND_NEUMANN, which
+ *  set_boundary() accepts only for n >= 7.
+ */
+#define SMESH_NODE_ID_NEUMANN_MASK     0xE0000000 // 111...
+
+/*! \brief True if this node is inside a Neumann-mask solid. */
+#define SMESH_NODE_IS_NEUMANN_MASK(node) \
+    ( ((node) & SMESH_NODE_ID_MASK) == SMESH_NODE_ID_NEUMANN_MASK )
 
 #define SMESH_NODE_FIXED               0x80000000 // 100...
 
@@ -297,6 +325,30 @@ class Geometry : public Mesh
      *  needing its own cache or living with the tag's blind spots.
      */
     std::vector<uint8_t>       _material;
+
+    /*! \brief Live nodes touching a Neumann mask, with their face count.
+     *
+     *  (node index, number of masked neighbours). A node-centred Neumann
+     *  mirror puts the symmetry plane ON the node, so such a node owns a
+     *  half control volume per masked face and its space charge needs a
+     *  factor of two per face -- see scharge_correct_neumann_mask().
+     *
+     *  CACHED because the answer is fixed once build_mesh() has run, while
+     *  the correction is applied after every particle iteration. Finding it
+     *  by sweeping is O(N) with 2*dim neighbour reads per node, which in 3D
+     *  is a large cost to repeat per major cycle for an answer that never
+     *  changes. The list itself is a SURFACE, so it is O(N^(2/3)) and
+     *  applying it is negligible.
+     *
+     *  A geometry with no mask caches an empty list and is then free
+     *  forever, so the common case pays one sweep for the whole run.
+     *
+     *  Mutable + lazily built: the consumers hold a const Geometry&, and
+     *  the build happens in the serial finalize section of
+     *  iterate_trajectories(), never from the threaded trajectory loop.
+     */
+    mutable std::vector<std::pair<uint32_t,uint8_t> > _mask_face_nodes;
+    mutable bool               _mask_face_nodes_valid = false;
 
     double                     _surface_eps; /*!< \brief Vertec matching tolerance. */
     VTriangleSurface           _surface;   /*!< \brief Triangulated surface. */
@@ -505,6 +557,21 @@ public:
     /*! \brief Returns a vector of boundary conditions.
      */
     std::vector<Bound> get_boundaries() const;
+
+    /*! \brief Live nodes adjacent to a Neumann mask, with masked-face counts.
+     *
+     *  Each entry is (node index, number of masked neighbours). A
+     *  node-centred Neumann mirror puts the symmetry plane ON the node, so
+     *  such a node owns a half control volume per masked face --
+     *  scharge_correct_neumann_mask() uses this to apply the same factor of
+     *  two that scharge_finalize_*() applies on the six box walls.
+     *
+     *  Built on first call after build_mesh() and reused thereafter, since
+     *  the answer cannot change once the mesh is built while the correction
+     *  is applied after every particle iteration. Empty, and free, when the
+     *  geometry has no Neumann-mask solid.
+     */
+    const std::vector<std::pair<uint32_t,uint8_t> > &mask_face_nodes( void ) const;
 
     /*! \brief Returns true if full solid data available.
      *

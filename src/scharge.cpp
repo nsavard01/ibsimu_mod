@@ -212,6 +212,55 @@ void scharge_finalize_pic( MeshScalarField &scharge )
  * cache needed at all -- correct everywhere, including the box edge,
  * at no extra cost.
  */
+void scharge_correct_neumann_mask( MeshScalarField &scharge, const Geometry &geom )
+{
+    /* A Neumann mask is a node-centred mirror: set_link() eliminates the
+     * ghost with phi_ghost := phi_mirror, so the symmetry plane lies exactly
+     * ON the last live node -- the same convention add_neumann_node_2d()
+     * uses on a box wall.
+     *
+     * A node on a symmetry plane owns HALF a control volume. Deposition
+     * reaches it from the live side only, while scharge_finalize_*() divided
+     * by a whole cell, so its density comes out a factor of two low. That is
+     * precisely why scharge_finalize_*() already ends with
+     *     scharge( i, 0 ) *= 2.0;
+     *     scharge( i, scharge.size(1)-1 ) *= 2.0;
+     * on the six box walls. A mask is the same boundary condition on an
+     * interior staircase, so it needs the same correction -- and gets it
+     * nowhere else, because those loops key on index 0 and size-1.
+     *
+     * Without this the space charge sags towards the mask, which looks
+     * exactly like particles being lost there.
+     *
+     * Applied once per masked NEIGHBOUR, so a node with mask on two sides
+     * is multiplied by four. That matches the box code, where the i-loop
+     * and the j-loop both hit a corner node, which correspondingly owns a
+     * quarter of a control volume.
+     *
+     * No charge needs folding back from inside the mask: particles reflect
+     * AT the plane and never cross it, so masked nodes receive essentially
+     * nothing to fold. (Under a face-centred mirror they would, which is
+     * one more reason the node-centred convention is the simpler one.)
+     */
+    // The node list is CACHED in the Geometry, built once after
+    // build_mesh() and reused for the rest of the run. Finding it by
+    // sweeping would be O(N) with 2*dim neighbour reads per node -- fine
+    // in 2D, but a real cost to repeat every major cycle on a large 3D
+    // mesh, for an answer that cannot change once the mesh is built.
+    //
+    // What is left here is O(number of mask-adjacent nodes), i.e. a
+    // SURFACE rather than a volume, so it is negligible. A geometry with
+    // no mask gets an empty list and does no work at all.
+    const std::vector<std::pair<uint32_t,uint8_t> > &faces = geom.mask_face_nodes();
+    for( size_t a = 0; a < faces.size(); a++ ) {
+	double f = 1.0;
+	for( uint8_t m = 0; m < faces[a].second; m++ )
+	    f *= 2.0;
+	scharge( (int32_t)faces[a].first ) *= f;
+    }
+}
+
+
 void scharge_clear_solid_nodes( MeshScalarField &scharge, const Geometry &geom )
 {
     switch( geom.geom_mode() ) {
