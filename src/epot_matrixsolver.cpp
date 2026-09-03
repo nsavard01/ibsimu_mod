@@ -121,7 +121,8 @@ EpotMatrixSolver::EpotMatrixSolver( Geometry &geom )
     : EpotSolver(geom), _dof(0), _fd_mat(0), _fd_vec(0),
       _sol(0),
       _linear_built(false), _fd_vec_base(0),
-      _time_linbuild(0.0), _time_nonlin(0.0)
+      _time_linbuild(0.0), _time_nonlin(0.0),
+      _cm_i0(0), _cm_j0(0), _cm_k0(0), _cm_ni(0), _cm_nj(0), _cm_nk(0)
 {
 
 }
@@ -265,6 +266,119 @@ void EpotMatrixSolver::set_link( uint32_t a, uint32_t b, double val )
  * is the one part of matrix/rhs construction that genuinely depends on
  * the current solution guess X via _sol.
  */
+void EpotMatrixSolver::get_comp_mask( MeshScalarField &out ) const
+{
+    const uint32_t nx = _geom.size(0), ny = _geom.size(1), nz = _geom.size(2);
+    for( uint32_t k = 0; k < nz; k++ )
+	for( uint32_t j = 0; j < ny; j++ )
+	    for( uint32_t i = 0; i < nx; i++ ) {
+		double v = 0.0;
+		if( i >= _cm_i0 && i < _cm_i0+_cm_ni && j >= _cm_j0 && j < _cm_j0+_cm_nj &&
+		    k >= _cm_k0 && k < _cm_k0+_cm_nk ) {
+		    size_t a = ((size_t)(k-_cm_k0)*_cm_nj + (j-_cm_j0))*_cm_ni + (i-_cm_i0);
+		    if( a < _comp_mask.size() && _comp_mask[a] ) v = 1.0;
+		}
+		out( i, j, k ) = v;
+	    }
+}
+
+
+void EpotMatrixSolver::update_comp_mask( void )
+{
+    const uint32_t nx = _geom.size(0), ny = _geom.size(1), nz = _geom.size(2);
+    const double h = _geom.h();
+
+    // Node-index window. Cost and memory scale with the COMPENSATED VOLUME
+    // rather than the mesh -- which is what makes this usable in 3D, where a
+    // mesh-wide next[] would run to hundreds of MB for a region occupying a
+    // few percent of the domain.
+    int64_t i0 = 0, j0 = 0, k0 = 0, i1 = (int64_t)nx-1, j1 = (int64_t)ny-1, k1 = (int64_t)nz-1;
+    if( _comp_bbox_set ) {
+	const uint32_t n[3] = { nx, ny, nz };
+	int64_t lo[3], hi[3];
+	for( int a = 0; a < 3; a++ ) {
+	    lo[a] = (int64_t)std::floor( (_comp_bmin[a] - _geom.origo(a)) / h );
+	    hi[a] = (int64_t)std::ceil ( (_comp_bmax[a] - _geom.origo(a)) / h );
+	    if( lo[a] < 0 ) lo[a] = 0;
+	    if( hi[a] > (int64_t)n[a]-1 ) hi[a] = (int64_t)n[a]-1;
+	}
+	i0=lo[0]; i1=hi[0]; j0=lo[1]; j1=hi[1]; k0=lo[2]; k1=hi[2];
+	if( i1 < i0 || j1 < j0 || k1 < k0 ) { _comp_mask.clear(); _cm_ni=_cm_nj=_cm_nk=0; return; }
+    }
+    _cm_i0 = (uint32_t)i0; _cm_j0 = (uint32_t)j0; _cm_k0 = (uint32_t)k0;
+    _cm_ni = (uint32_t)(i1-i0+1); _cm_nj = (uint32_t)(j1-j0+1); _cm_nk = (uint32_t)(k1-k0+1);
+    const size_t N = (size_t)_cm_ni*_cm_nj*_cm_nk;
+    _comp_mask.assign( N, 0 );
+
+    auto loc = [&]( int64_t i, int64_t j, int64_t k ) -> size_t {
+	return ((size_t)(k-k0)*_cm_nj + (size_t)(j-j0))*_cm_ni + (size_t)(i-i0);
+    };
+    auto inbox = [&]( int64_t i, int64_t j, int64_t k ) -> bool {
+	return( i>=i0 && i<=i1 && j>=j0 && j<=j1 && k>=k0 && k<=k1 );
+    };
+    // phi read per node rather than copied: a double per node would be
+    // hundreds of MB in 3D for no gain.
+    auto phi_at = [&]( int64_t i, int64_t j, int64_t k ) -> double {
+	size_t a_full = ((size_t)k*ny + j)*nx + i;
+	uint32_t mesh = _geom.mesh( a_full );
+	if( mesh & SMESH_NODE_FIXED )
+	    return (*_epot)( a_full );
+	return (*_sol)( _n2d( a_full ) & N2D_INDEX_MASK );
+    };
+    auto in_region = [&]( int64_t i, int64_t j, int64_t k ) -> bool {
+	if( !_comp_region_func ) return( true );
+	Vec3D x( _geom.origo(0) + h*i, _geom.origo(1) + h*j, _geom.origo(2) + h*k );
+	return( (*_comp_region_func)(x) );
+    };
+
+    // next[] = uphill neighbour (box-local); -1 interior maximum,
+    // -2 absorbed, left the box, or left the region.
+    std::vector<int64_t> next( N, -1 );
+    const int di[6] = {-1,1,0,0,0,0}, dj[6] = {0,0,-1,1,0,0}, dk[6] = {0,0,0,0,-1,1};
+#pragma omp parallel for collapse(3) schedule(static)
+    for( int64_t k = k0; k <= k1; k++ ) {
+	for( int64_t j = j0; j <= j1; j++ ) {
+	    for( int64_t i = i0; i <= i1; i++ ) {
+		size_t a = loc(i,j,k);
+		if( _geom.material(i,j,k) != 0 || !in_region(i,j,k) ) { next[a] = -2; continue; }
+		double best = phi_at(i,j,k);
+		int64_t bi = -1;
+		for( int d = 0; d < 6; d++ ) {
+		    int64_t ii=i+di[d], jj=j+dj[d], kk=k+dk[d];
+		    if( ii<0 || ii>=(int64_t)nx || jj<0 || jj>=(int64_t)ny ||
+			kk<0 || kk>=(int64_t)nz ) continue;
+		    double pb = phi_at(ii,jj,kk);
+		    if( pb <= best ) continue;
+		    best = pb;
+		    bi = ( !inbox(ii,jj,kk) || _geom.material(ii,jj,kk) != 0 ||
+			   !in_region(ii,jj,kk) ) ? -2 : (int64_t)loc(ii,jj,kk);
+		}
+		next[a] = bi;
+	    }
+	}
+    }
+
+    // Resolve each chain to its terminus, memoised.
+    std::vector<uint8_t> done( N, 0 );
+    std::vector<size_t> chain;
+    for( size_t a0 = 0; a0 < N; a0++ ) {
+	if( done[a0] || next[a0] == -2 ) { done[a0] = 1; continue; }
+	chain.clear();
+	size_t a = a0;
+	uint8_t res;
+	for(;;) {
+	    if( done[a] ) { res = _comp_mask[a]; break; }
+	    chain.push_back( a ); done[a] = 1;
+	    int64_t n = next[a];
+	    if( n == -1 ) { res = 1; break; }
+	    if( n == -2 ) { res = 0; break; }
+	    a = (size_t)n;
+	}
+	for( size_t c : chain ) _comp_mask[c] = res;
+    }
+}
+
+
 void EpotMatrixSolver::update_nonlinear_node( uint32_t a, uint32_t i, uint32_t j, uint32_t k, const Vec3D &x )
 {
     const bool have_plasma = ( _plasma == PLASMA_PEXP || _plasma == PLASMA_NSIMP ||
@@ -328,6 +442,16 @@ void EpotMatrixSolver::update_nonlinear_node( uint32_t a, uint32_t i, uint32_t j
 	bool incomp = true;
 	if( _comp_region_func )
 	    incomp = (*_comp_region_func)(x);
+	if( incomp && _comp_ascent ) {
+	    if( i < _cm_i0 || i >= _cm_i0+_cm_ni || j < _cm_j0 || j >= _cm_j0+_cm_nj ||
+		k < _cm_k0 || k >= _cm_k0+_cm_nk )
+		incomp = false;      // outside the confinement box
+	    else {
+		size_t a_loc = ((size_t)(k-_cm_k0)*_cm_nj + (j-_cm_j0))*_cm_ni + (i-_cm_i0);
+		if( a_loc >= _comp_mask.size() || !_comp_mask[a_loc] )
+		    incomp = false;  // not confined here: no trapped population
+	    }
+	}
 	if( incomp ) {
 	    // Prefactor is the LOCAL ion density, exactly as the shield model
 	    // takes its own -- so _scharge must hold ION charge only, with the
@@ -1715,6 +1839,11 @@ void EpotMatrixSolver::build_mat_vec( void )
 	_plasma == PLASMA_SHIELD || _comp ) {
 
 	auto time_t0 = Clock::now();
+
+	// Confinement depends on the current iterate, so it is rebuilt here --
+	// once per nonlinear scan, not once per node.
+	if( _comp && _comp_ascent )
+	    update_comp_mask();
 
 #pragma omp parallel for num_threads(nthreads) collapse(3) schedule(dynamic,64)
 	for( uint32_t k = 0; k < _geom.size(2); k++ ) {

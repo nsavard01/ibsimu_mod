@@ -62,7 +62,8 @@ EpotSolver::EpotSolver( Geometry &geom )
       _force_pot(0.0), _force_pot_func(0), _force_pot_func2(0), 
       _init_plasma_func(0), _plasma_calc_func(0),
       _comp(false), _compTe(1.0), _compVref(0.0), _compRhoMin(0.0),
-      _comp_region_func(0)
+      _comp_region_func(0), _comp_ascent(false), _comp_bbox_set(false),
+      _comp_bmin(0,0,0), _comp_bmax(0,0,0)
 {
 
 }
@@ -78,7 +79,10 @@ EpotSolver::EpotSolver( const EpotSolver &epsolver, Geometry &geom )
       _plasma_calc_func(epsolver._plasma_calc_func),
       _comp(epsolver._comp), _compTe(epsolver._compTe),
       _compVref(epsolver._compVref), _compRhoMin(epsolver._compRhoMin),
-      _comp_region_func(epsolver._comp_region_func)
+      _comp_region_func(epsolver._comp_region_func),
+      _comp_ascent(epsolver._comp_ascent),
+      _comp_bbox_set(epsolver._comp_bbox_set),
+      _comp_bmin(epsolver._comp_bmin), _comp_bmax(epsolver._comp_bmax)
 {
 
 }
@@ -114,6 +118,10 @@ void EpotSolver::set_parameters( const EpotSolver &epsolver )
     _compVref         = epsolver._compVref;
     _compRhoMin       = epsolver._compRhoMin;
     _comp_region_func = epsolver._comp_region_func;
+    _comp_ascent      = epsolver._comp_ascent;
+    _comp_bbox_set    = epsolver._comp_bbox_set;
+    _comp_bmin        = epsolver._comp_bmin;
+    _comp_bmax        = epsolver._comp_bmax;
 }
 
 
@@ -336,6 +344,8 @@ void EpotSolver::set_beam_compensation( double Te, double Vref, double rho_min,
     if( Te <= 0.0 )
         throw( Error( ERROR_LOCATION, "compensation temperature must be positive" ) );
     _comp             = true;
+    _comp_ascent      = false;
+    _comp_bbox_set    = false;
     _compTe           = Te;
     _compVref         = Vref;
     _compRhoMin       = rho_min;
@@ -344,9 +354,38 @@ void EpotSolver::set_beam_compensation( double Te, double Vref, double rho_min,
 }
 
 
+void EpotSolver::set_beam_compensation_ascent( double Te, double Vref, double rho_min,
+                                               CallbackFunctorB_V *region )
+{
+    set_beam_compensation( Te, Vref, rho_min, region );
+    _comp_ascent   = true;
+    _comp_bbox_set = false;
+    reset_problem();
+}
+
+
+void EpotSolver::set_beam_compensation_ascent( double Te, double Vref, double rho_min,
+                                               const Vec3D &bmin, const Vec3D &bmax,
+                                               CallbackFunctorB_V *region )
+{
+    for( int a = 0; a < 3; a++ )
+        if( bmax[a] < bmin[a] )
+            throw( Error( ERROR_LOCATION, "compensation box has bmax < bmin on axis "
+                          + to_string(a) ) );
+    set_beam_compensation( Te, Vref, rho_min, region );
+    _comp_ascent   = true;
+    _comp_bbox_set = true;
+    _comp_bmin     = bmin;
+    _comp_bmax     = bmax;
+    reset_problem();
+}
+
+
 void EpotSolver::unset_beam_compensation( void )
 {
     _comp = false;
+    _comp_ascent = false;
+    _comp_bbox_set = false;
     _comp_region_func = NULL;
     reset_problem();
 }

@@ -2,6 +2,8 @@
 # here, nothing generated should ever land inside src/ or tests/ again.
 build/
 build-*/
+# underscore form too -- build_comp slipped past build-*/ and got committed
+build_*/
 
 *~
 *.o

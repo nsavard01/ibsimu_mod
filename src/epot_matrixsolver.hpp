@@ -132,6 +132,45 @@ protected:
      *  visited by update_nonlinear_node() (i.e. when no plasma model is
      *  active) read back as exactly zero.
      */
+    /*! \brief Trapped/escaped flag per mesh node, for the ascent variant.
+     *
+     *  1 = a cold electron released at rest here is confined; 0 = it reaches
+     *  a solid or leaves the compensation region. Rebuilt from the current
+     *  Newton iterate by update_comp_mask() before each nonlinear scan. */
+    std::vector<uint8_t>   _comp_mask;
+
+    /*! \brief Node-index window the mask covers.
+     *
+     *  The mask is stored box-local, not mesh-global, so that memory and the
+     *  ascent sweep scale with the compensated volume. Nodes outside the
+     *  window are treated as unconfined. */
+    uint32_t               _cm_i0, _cm_j0, _cm_k0;
+    uint32_t               _cm_ni, _cm_nj, _cm_nk;
+
+    /*! \brief Steepest-ascent confinement test, region-confined.
+     *
+     *  Escape means DESCENDING to a wall, and ascent never descends, so run
+     *  over the whole mesh this test would report every node trapped -- every
+     *  path drains into the source plasma, which is a genuine interior
+     *  maximum of phi. Confined to the compensation region it is exactly the
+     *  right test, because leaving the region through its upstream face IS
+     *  the escape, and that is a condition ascent can see. */
+    void update_comp_mask( void );
+
+public:
+    /*! \brief Copy the trapped/escaped mask out, 1.0 = confined.
+     *
+     *  The mask is what the ascent variant actually applied, so any
+     *  diagnostic that reconstructs rho_e afterwards MUST use it. Rebuilding
+     *  rho_e from phi - Vref alone describes the plain model instead, and
+     *  reports a compensation onset at the region edge with a ~47 kV
+     *  residual while the solve itself was correct. Empty until a solve has
+     *  run with the ascent variant armed.
+     */
+    void get_comp_mask( MeshScalarField &out ) const;
+
+protected:
+
     Vector                 _d_vec;
     const Vector          *_sol;           /*!< \brief Current solution vector. */
 

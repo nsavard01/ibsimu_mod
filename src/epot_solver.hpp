@@ -243,6 +243,10 @@ protected:
     double              _compVref;         /*!< \brief Wall/electrode potential (V). */
     double              _compRhoMin;       /*!< \brief Ion-density floor (C/m3). */
     CallbackFunctorB_V *_comp_region_func; /*!< \brief Compensation region, NULL = everywhere. */
+    bool                _comp_ascent;      /*!< \brief Use the trapped-electron ascent test. */
+    bool                _comp_bbox_set;    /*!< \brief Confine the ascent to a box. */
+    Vec3D               _comp_bmin;        /*!< \brief Box lower corner (m). */
+    Vec3D               _comp_bmax;        /*!< \brief Box upper corner (m). */
 
     double              _plA;              /*!< \brief Plasma parameter.
 				            *   For positive ion extraction: rho_th * h^2 / epsilon_0,
@@ -541,6 +545,71 @@ public:
      */
     void set_beam_compensation( double Te, double Vref, double rho_min = 0.0,
                                 CallbackFunctorB_V *region = NULL );
+
+    /*! \brief Beam compensation with a TRAPPED-ELECTRON test (ascent variant).
+     *
+     *  Same charge as set_beam_compensation(),
+     *
+     *    rho_e = -rho_i * ( 1 - exp( -(phi - Vref)/Te ) ),
+     *
+     *  but applied only where a cold electron released at rest is actually
+     *  CONFINED. Confinement is decided by following steepest ascent in phi
+     *  from the node -- which is the electron's own initial trajectory, since
+     *  it accelerates toward higher potential -- and asking where the path
+     *  ends:
+     *
+     *    interior maximum inside \a region  -> trapped, compensation applies
+     *    walks into a solid                 -> absorbed, no compensation
+     *    leaves \a region                   -> escaped,  no compensation
+     *
+     *  WHY THIS EXISTS. set_beam_compensation() reads the barrier as
+     *  phi - Vref, which is only meaningful where the region is closed off
+     *  from the extraction gap by an electron barrier (a suppressor). Without
+     *  one -- a plain extractor at V_bias below the source -- phi - Vref is
+     *  large and positive throughout the acceleration gap, so that model
+     *  reports the extraction beam as fully compensated when in truth the
+     *  electrons are swept out at once. Measured on the reference geometry
+     *  with the suppressor removed: 100% of drift beam nodes compensated with
+     *  a mean barrier of 66 eV, against 0% here.
+     *
+     *  The region matters much less than it does for the plain model: over
+     *  comp_x0 = 0.5..30 mm the reference case gives an identical answer to
+     *  four decimals, because the ascent excludes the gap on its own. It is a
+     *  guard against overlapping the source plasma (whose electrons
+     *  set_pexp_plasma() already supplies) and a bound on cost, not a fitted
+     *  parameter.
+     *
+     *  NOTE the mask is boolean, so a node flipping trapped/escaped between
+     *  iterations is a discontinuity in the residual. It is recomputed each
+     *  Newton iteration; if that proves unstable, freeze it per major cycle.
+     */
+    void set_beam_compensation_ascent( double Te, double Vref, double rho_min = 0.0,
+                                       CallbackFunctorB_V *region = NULL );
+
+    /*! \brief Ascent variant confined to an axis-aligned box.
+     *
+     *  Identical model, but the confinement sweep and every array it needs are
+     *  restricted to \a bmin..\a bmax instead of the whole mesh. Leaving the
+     *  box counts as escape, exactly as leaving \a region does.
+     *
+     *  This is what makes the variant usable in 3D. The functor form has to
+     *  visit every node and allocate mesh-sized workspace, because a predicate
+     *  cannot be inverted into an extent: at 1e8 nodes the ascent's own
+     *  next[] array alone would be 800 MB, for a region that may occupy 1% of
+     *  the mesh. With a box, cost and memory scale with the COMPENSATED VOLUME.
+     *
+     *  \a region may still be given and is applied on top of the box.
+     *
+     *  In MODE_CYL component 0 is the axis of propagation and component 1 is
+     *  the radius, so the box is (x_min,r_min,0)..(x_max,r_max,0). Unused
+     *  components are ignored.
+     */
+    void set_beam_compensation_ascent( double Te, double Vref, double rho_min,
+                                       const Vec3D &bmin, const Vec3D &bmax,
+                                       CallbackFunctorB_V *region = NULL );
+
+    /*! \brief Is the ascent variant in use? */
+    bool get_beam_compensation_ascent( void ) const { return _comp && _comp_ascent; }
 
     /*! \brief Disable beam space-charge compensation. */
     void unset_beam_compensation( void );
