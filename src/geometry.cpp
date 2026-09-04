@@ -2085,6 +2085,41 @@ uint8_t Geometry::mc_case( int32_t i, int32_t j, int32_t k ) const
     std::cout << "mc_case( " << i << ", " << j << ", " << k << " ) ";
 #endif
 
+    // A cube touching a Neumann mask has NO surface: return case 0.
+    //
+    // A mask is the EDGE OF THE SIMULATED DOMAIN, not a physical surface.
+    // Particles never reach a conductor face lying behind one -- they are
+    // reflected at the mask itself by the particle iterator
+    // (ParticleDataBase::set_mask_reflection, on by default), which is a
+    // separate mechanism from the surface collision model this
+    // triangulation feeds. So there is nothing here to collide with, and
+    // generating a surface is not merely pointless, it is impossible:
+    // masked nodes get no _nearsolid entry (masks deliberately bypass the
+    // cut-cell machinery -- the zero-flux set_link() redirect assumes a
+    // clean staircase) and carry no _material either, so solid_dist()
+    // cannot say where the surface cuts a conductor/mask face and throws
+    // "not a near solid node".
+    //
+    // That throw is what a 3D geometry containing any Neumann mask used
+    // to die with in build_surface(), whether or not the mask was
+    // anywhere near an electrode. It had not surfaced before because
+    // build_surface() is MODE_3D only, and masks had so far only been
+    // used in MODE_CYL (ECR_cyl_cut_ramp_comp), where there is no surface
+    // model at all.
+    //
+    // The test lives HERE, in the one place a cube is classified, and not
+    // as an early return in mc_triangulate(). mc_add_vertex_try() derives
+    // a neighbouring cube's triangle count from mc_case() rather than
+    // from _triptr, so suppressing triangles anywhere else makes the two
+    // disagree: the neighbour lookup then walks tricount entries into a
+    // block that holds none and reads off the end of _surface. That is a
+    // segfault, not an exception.
+    for( int32_t dk = 0; dk < 2; dk++ )
+	for( int32_t dj = 0; dj < 2; dj++ )
+	    for( int32_t di = 0; di < 2; di++ )
+		if( SMESH_NODE_IS_NEUMANN_MASK( mesh( i+di, j+dj, k+dk ) ) )
+		    return( 0 );
+
     // Go through mesh nodes surrounding cube (i,j,k). Uses _material
     // directly (real solid membership, conductor or dielectric alike,
     // independent of any stencil-tag reclassification) rather than
@@ -2307,6 +2342,7 @@ void Geometry::mc_triangulate( int32_t i, int32_t j, int32_t k )
 #ifdef MC_DEBUG
     std::cout << "mc_triangulate( " << i << ", " << j << ", " << k << " )\n";
 #endif
+
     uint8_t cn = mc_case( i, j, k );
     int offset = 15*cn;
 
