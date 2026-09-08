@@ -807,10 +807,22 @@ template <class PP> class ParticleIterator {
      *  point identifies WHICH face is the entry face -- exactly what
      *  handle_mask_reflection() needs for its mirror plane.
      *
-     *  Cost is one inside() call per mesh crossing, and only when the
-     *  geometry has a mask at all (_have_mask). check_collision_solid()
-     *  performs the same call immediately afterwards in the non-mask case,
-     *  so this at worst doubles one test that was already being paid for.
+     *  Cost is one inside() test per mesh crossing, and only when the
+     *  geometry has a mask at all (_have_mask).
+     *
+     *  Those tests are aimed at the MASK SOLIDS ONLY, which is what makes
+     *  the cost bounded. The obvious form, is_mask_solid(geom->inside(v)),
+     *  is a trap: Geometry::inside(Vec3D) walks every solid highest-first
+     *  and returns the first hit, so a point that is NOT in a mask -- the
+     *  common case at a mesh crossing -- falls all the way through and pays
+     *  a full point-in-polyhedron test against every ordinary solid before
+     *  returning 0. Against a facetted STL that is O(N_triangles) per
+     *  crossing, per particle, and it silently couples trajectory cost to
+     *  CAD export resolution: measured on a 3D H- extraction geometry,
+     *  refining the STLs 7.9x took "Collision + scharge dep." from 39.8 s
+     *  to 253.1 s, while the same refinement with the mask removed cost
+     *  4.5 s. Asking the mask solids directly is O(1) for the analytic
+     *  FuncSolid a mask normally is, and leaves the electrodes untouched.
      */
     bool entering_mask( size_t c, int dir ) {
 	const size_t a = (size_t)((dir < 0 ? -dir : dir) - 1);
@@ -819,7 +831,13 @@ template <class PP> class ParticleIterator {
 	// compared with a cell, enormous compared with the ULP of a
 	// coordinate, so it cannot be lost to rounding.
 	v[a] += (dir < 0 ? -1.0 : 1.0) * 1.0e-3 * _pidata._geom->h();
-	return( is_mask_solid( _pidata._geom->inside( v ) ) );
+	for( size_t s = 0; s < _mask_solid.size(); s++ ) {
+	    if( !_mask_solid[s] )
+		continue;
+	    if( _pidata._geom->inside( (uint32_t)(s+7), v ) )
+		return( true );
+	}
+	return( false );
     }
 
     /*! \brief Is solid number \a n a Neumann mask?
