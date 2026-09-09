@@ -2085,41 +2085,6 @@ uint8_t Geometry::mc_case( int32_t i, int32_t j, int32_t k ) const
     std::cout << "mc_case( " << i << ", " << j << ", " << k << " ) ";
 #endif
 
-    // A cube touching a Neumann mask has NO surface: return case 0.
-    //
-    // A mask is the EDGE OF THE SIMULATED DOMAIN, not a physical surface.
-    // Particles never reach a conductor face lying behind one -- they are
-    // reflected at the mask itself by the particle iterator
-    // (ParticleDataBase::set_mask_reflection, on by default), which is a
-    // separate mechanism from the surface collision model this
-    // triangulation feeds. So there is nothing here to collide with, and
-    // generating a surface is not merely pointless, it is impossible:
-    // masked nodes get no _nearsolid entry (masks deliberately bypass the
-    // cut-cell machinery -- the zero-flux set_link() redirect assumes a
-    // clean staircase) and carry no _material either, so solid_dist()
-    // cannot say where the surface cuts a conductor/mask face and throws
-    // "not a near solid node".
-    //
-    // That throw is what a 3D geometry containing any Neumann mask used
-    // to die with in build_surface(), whether or not the mask was
-    // anywhere near an electrode. It had not surfaced before because
-    // build_surface() is MODE_3D only, and masks had so far only been
-    // used in MODE_CYL (ECR_cyl_cut_ramp_comp), where there is no surface
-    // model at all.
-    //
-    // The test lives HERE, in the one place a cube is classified, and not
-    // as an early return in mc_triangulate(). mc_add_vertex_try() derives
-    // a neighbouring cube's triangle count from mc_case() rather than
-    // from _triptr, so suppressing triangles anywhere else makes the two
-    // disagree: the neighbour lookup then walks tricount entries into a
-    // block that holds none and reads off the end of _surface. That is a
-    // segfault, not an exception.
-    for( int32_t dk = 0; dk < 2; dk++ )
-	for( int32_t dj = 0; dj < 2; dj++ )
-	    for( int32_t di = 0; di < 2; di++ )
-		if( SMESH_NODE_IS_NEUMANN_MASK( mesh( i+di, j+dj, k+dk ) ) )
-		    return( 0 );
-
     // Go through mesh nodes surrounding cube (i,j,k). Uses _material
     // directly (real solid membership, conductor or dielectric alike,
     // independent of any stencil-tag reclassification) rather than
@@ -2917,6 +2882,54 @@ int32_t Geometry::surface_trianglec( int32_t i, int32_t j, int32_t k ) const
 uint8_t Geometry::solid_dist( uint32_t i, uint32_t j, uint32_t k, uint32_t dir ) const
 {
     uint32_t snode = _smesh[i + j*_size[0] + k*_size[0]*_size[1]];
+
+    /* A face against a Neumann mask: the surface is ON the live node, so
+     * the cut distance measured from it is zero.
+     *
+     * This is not a convention picked for convenience -- it is the same
+     * one the field solve uses. EpotMatrixSolver::set_link() eliminates
+     * the ghost behind a mask with phi_ghost := phi_mirror, a NODE-CENTRED
+     * mirror whose zero-derivative plane lies exactly on the last live
+     * node (see that function; the factor of two on one neighbour is its
+     * signature). mc_surface() parameterises every edge so that dist = 0
+     * places the vertex at the VACUUM node, which is that same plane. So
+     * the triangulated surface a particle reflects off and the plane the
+     * potential is mirrored about are the same surface, by construction.
+     *
+     * Without this, solid_dist() falls through to the on-demand dielectric
+     * bisection, finds neither side dielectric -- masked nodes carry no
+     * _material and get no _nearsolid entry, because masks deliberately
+     * bypass the cut-cell machinery -- and throws "not a near solid node".
+     * That is what build_surface() used to die with on any 3D geometry
+     * containing a mask.
+     *
+     * The zero is only exact while the mask surface is node-aligned, which
+     * is a requirement of the node-centred mirror anyway: a mask cutting
+     * through a cell would need the stencil, the half-control-volume
+     * space-charge weight (scharge_correct_neumann_mask()) and this
+     * distance to agree on the same fraction, and nothing arranges that.
+     * Drivers snap mask faces onto node planes for exactly this reason.
+     */
+    if( SMESH_NODE_IS_NEUMANN_MASK( snode ) )
+	return( 0 );
+    {
+	int32_t ni = (int32_t)i, nj = (int32_t)j, nk = (int32_t)k;
+	switch( dir ) {
+	case 0: ni--; break;
+	case 1: ni++; break;
+	case 2: nj--; break;
+	case 3: nj++; break;
+	case 4: nk--; break;
+	case 5: nk++; break;
+	default: break;
+	}
+	if( ni >= 0 && nj >= 0 && nk >= 0 &&
+	    ni < (int32_t)_size[0] && nj < (int32_t)_size[1] &&
+	    nk < (int32_t)_size[2] &&
+	    SMESH_NODE_IS_NEUMANN_MASK( _smesh[ni + nj*_size[0]
+					       + nk*_size[0]*_size[1]] ) )
+	    return( 0 );
+    }
 
     if( (snode & SMESH_NODE_ID_MASK) == SMESH_NODE_ID_NEAR_SOLID ) {
 	const uint8_t *nptr = &_nearsolid[snode & SMESH_NEAR_SOLID_INDEX_MASK];

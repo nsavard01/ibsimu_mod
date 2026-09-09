@@ -43,6 +43,11 @@
 
 #include <iomanip>
 #include <limits>
+#include <algorithm>
+#include <cmath>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 #include "vtriangle.hpp"
 #include "ibsimu.hpp"
 
@@ -281,19 +286,12 @@ int VTriangleSurfaceSolid::classify_original_tetrahedron( int ss, const Vec3D &p
 }
 
 
-bool VTriangleSurfaceSolid::inside( const Vec3D &p ) const
+/* Exhaustive form: the signed tetrahedron decomposition over EVERY
+ * triangle. Kept as written, both as the fallback when no grid has been
+ * built and as the reference the accelerated path must reproduce exactly.
+ */
+bool VTriangleSurfaceSolid::inside_exhaustive( const Vec3D &x ) const
 {
-    // Fast test if outside bbox
-    for( uint32_t a = 0; a < 3; a++ ) {
-	if( p[a] < _bbox[0][a] )
-	    return( false );
-	if( p[a] > _bbox[1][a] )
-	    return( false );
-    }
-    
-    // Offset point
-    Vec3D x = p+_offset;
-
     // Cleared positive and negative vertex arrays
     std::vector<bool> vpos( _vertex.size(), false );
     std::vector<bool> vneg( _vertex.size(), false );
@@ -340,6 +338,366 @@ void VTriangleSurfaceSolid::update_bbox( Vec3D &min, Vec3D &max, const Vec3D x )
 }
 
 
+/* Build a uniform grid holding, for each cell, the triangles whose
+ * bounding box overlaps it. Cells are sized so the average occupancy is
+ * about one triangle.
+ */
+/* Exact triangle / axis-aligned-box overlap (Akenine-Moller separating
+ * axis test). Used to decide which grid cells a triangle really touches.
+ *
+ * Inserting by BOUNDING BOX instead is far simpler and was tried first,
+ * but these surfaces are CAD tessellations of annular faces: a flat disc
+ * from r = 6.5 to r = 48 mm comes out as long radial slivers whose bbox
+ * spans most of the grid while the triangle itself touches a line of
+ * cells. Bbox insertion put such a triangle in ~1600 cells instead of
+ * ~60, which inflated both the table and every candidate list drawn from
+ * it, and left the query only 2.6x faster than the exhaustive sweep.
+ */
+static bool plane_box_overlap( const Vec3D &normal, const Vec3D &vert,
+			       const Vec3D &maxbox )
+{
+    Vec3D vmin, vmax;
+    for( int q = 0; q < 3; q++ ) {
+	if( normal[q] > 0.0 ) {
+	    vmin[q] = -maxbox[q] - vert[q];
+	    vmax[q] =  maxbox[q] - vert[q];
+	} else {
+	    vmin[q] =  maxbox[q] - vert[q];
+	    vmax[q] = -maxbox[q] - vert[q];
+	}
+    }
+    if( normal*vmin > 0.0 ) return( false );
+    if( normal*vmax >= 0.0 ) return( true );
+    return( false );
+}
+
+static bool tri_box_overlap( const Vec3D &boxcenter, const Vec3D &boxhalf,
+			     const Vec3D &t0, const Vec3D &t1, const Vec3D &t2 )
+{
+    Vec3D v0 = t0-boxcenter, v1 = t1-boxcenter, v2 = t2-boxcenter;
+    Vec3D e0 = v1-v0, e1 = v2-v1, e2 = v0-v2;
+
+#define AXISTEST(a0,a1,b0,b1,c0,c1,ea,eb)				    do {									double p0 = (a0)*(b0) - (a1)*(b1);					double p1 = (a0)*(c0) - (a1)*(c1);					double mn = p0 < p1 ? p0 : p1, mx = p0 < p1 ? p1 : p0;			double rad = fabs(a0)*boxhalf[ea] + fabs(a1)*boxhalf[eb];		if( mn > rad || mx < -rad ) return( false );			    } while( 0 )
+
+    AXISTEST( e0[2], e0[1], v0[1], v0[2], v2[1], v2[2], 1, 2 );
+    AXISTEST( e0[2], e0[0], v0[0], v0[2], v2[0], v2[2], 0, 2 );
+    AXISTEST( e0[1], e0[0], v1[0], v1[1], v2[0], v2[1], 0, 1 );
+    AXISTEST( e1[2], e1[1], v0[1], v0[2], v2[1], v2[2], 1, 2 );
+    AXISTEST( e1[2], e1[0], v0[0], v0[2], v2[0], v2[2], 0, 2 );
+    AXISTEST( e1[1], e1[0], v0[0], v0[1], v1[0], v1[1], 0, 1 );
+    AXISTEST( e2[2], e2[1], v0[1], v0[2], v1[1], v1[2], 1, 2 );
+    AXISTEST( e2[2], e2[0], v0[0], v0[2], v1[0], v1[2], 0, 2 );
+    AXISTEST( e2[1], e2[0], v1[0], v1[1], v2[0], v2[1], 0, 1 );
+#undef AXISTEST
+
+    for( int q = 0; q < 3; q++ ) {
+	double mn = v0[q], mx = v0[q];
+	if( v1[q] < mn ) mn = v1[q];
+	if( v1[q] > mx ) mx = v1[q];
+	if( v2[q] < mn ) mn = v2[q];
+	if( v2[q] > mx ) mx = v2[q];
+	if( mn > boxhalf[q] || mx < -boxhalf[q] ) return( false );
+    }
+
+    Vec3D normal = cross( e0, e1 );
+    return( plane_box_overlap( normal, v0, boxhalf ) );
+}
+
+
+void VTriangleSurfaceSolid::build_grid( void )
+{
+    _gstart.clear();
+    _gtri.clear();
+    _cand.clear();
+
+    const size_t ntri = _triangle.size();
+    if( ntri == 0 )
+	return;
+
+    // Grid spans the SHIFTED vertices, i.e. the frame inside() works in.
+    Vec3D gmin(  std::numeric_limits<double>::infinity(),
+		 std::numeric_limits<double>::infinity(),
+		 std::numeric_limits<double>::infinity() );
+    Vec3D gmax( -std::numeric_limits<double>::infinity(),
+		-std::numeric_limits<double>::infinity(),
+		-std::numeric_limits<double>::infinity() );
+    for( size_t a = 0; a < _vertex.size(); a++ )
+	update_bbox( gmin, gmax, _vertex[a] );
+
+    Vec3D ext = gmax-gmin;
+    for( int a = 0; a < 3; a++ )
+	if( ext[a] <= 0.0 )
+	    ext[a] = 1.0;
+    double cell = pow( ext[0]*ext[1]*ext[2]/(double)ntri, 1.0/3.0 );
+    if( cell <= 0.0 )
+	return;
+    int64_t ncell = 1;
+    for( int a = 0; a < 3; a++ ) {
+	_gn[a] = (int32_t)floor( ext[a]/cell );
+	if( _gn[a] < 1 )   _gn[a] = 1;
+	if( _gn[a] > 128 ) _gn[a] = 128;
+	_gh[a] = ext[a]/_gn[a];
+	ncell *= _gn[a];
+    }
+    _gmin = gmin;
+
+    // Two passes: count per cell, prefix sum, then scatter.
+    std::vector<uint32_t> count( (size_t)ncell+1, 0 );
+    std::vector<int32_t> lo( 3*ntri ), hi( 3*ntri );
+    for( size_t t = 0; t < ntri; t++ ) {
+	Vec3D tmin(  std::numeric_limits<double>::infinity(),
+		     std::numeric_limits<double>::infinity(),
+		     std::numeric_limits<double>::infinity() );
+	Vec3D tmax( -std::numeric_limits<double>::infinity(),
+		    -std::numeric_limits<double>::infinity(),
+		    -std::numeric_limits<double>::infinity() );
+	for( int v = 0; v < 3; v++ )
+	    update_bbox( tmin, tmax, _vertex[_triangle[t][v]] );
+	for( int a = 0; a < 3; a++ ) {
+	    int32_t l = (int32_t)floor( (tmin[a]-_gmin[a])/_gh[a] );
+	    int32_t h = (int32_t)floor( (tmax[a]-_gmin[a])/_gh[a] );
+	    /* Clamp BOTH ends. A triangle touching the grid's upper edge
+	     * gives floor()==_gn[a] for the low index too, and the
+	     * "if( h < l ) h = l" below would then carry that out-of-range
+	     * value straight into the cell index. */
+	    if( l < 0 ) l = 0;
+	    if( l > _gn[a]-1 ) l = _gn[a]-1;
+	    if( h < 0 ) h = 0;
+	    if( h > _gn[a]-1 ) h = _gn[a]-1;
+	    if( h < l ) h = l;
+	    lo[3*t+a] = l;
+	    hi[3*t+a] = h;
+	}
+	const Vec3D &q0 = _vertex[_triangle[t][0]];
+	const Vec3D &q1 = _vertex[_triangle[t][1]];
+	const Vec3D &q2 = _vertex[_triangle[t][2]];
+	/* Inflate the test box by a hair. Vertices of an axis-aligned face
+	 * can land exactly on a cell boundary -- the flat faces of these
+	 * electrodes sit exactly on the grid's outer plane -- and the
+	 * separating-axis test then rejects or accepts on the last bit of
+	 * the box-centre arithmetic. Growing the box can only ever add a
+	 * triangle to a cell, which costs a little work and cannot lose a
+	 * contribution; shrinking it silently drops surface. */
+	const double sat_eps = 1.0e-9;
+	const Vec3D half( 0.5*_gh[0]*(1.0+sat_eps) + sat_eps*_gh[0],
+			  0.5*_gh[1]*(1.0+sat_eps) + sat_eps*_gh[1],
+			  0.5*_gh[2]*(1.0+sat_eps) + sat_eps*_gh[2] );
+	for( int32_t k = lo[3*t+2]; k <= hi[3*t+2]; k++ )
+	    for( int32_t j = lo[3*t+1]; j <= hi[3*t+1]; j++ )
+		for( int32_t i = lo[3*t+0]; i <= hi[3*t+0]; i++ ) {
+		    Vec3D ctr( _gmin[0]+(i+0.5)*_gh[0],
+			       _gmin[1]+(j+0.5)*_gh[1],
+			       _gmin[2]+(k+0.5)*_gh[2] );
+		    if( tri_box_overlap( ctr, half, q0, q1, q2 ) )
+			count[(size_t)((k*_gn[1]+j)*_gn[0]+i)+1]++;
+		}
+    }
+    for( size_t c = 1; c <= (size_t)ncell; c++ )
+	count[c] += count[c-1];
+    _gstart = count;
+    _gtri.resize( count[ncell] );
+    std::vector<uint32_t> fill( _gstart.begin(), _gstart.end()-1 );
+    for( size_t t = 0; t < ntri; t++ ) {
+	const Vec3D &q0 = _vertex[_triangle[t][0]];
+	const Vec3D &q1 = _vertex[_triangle[t][1]];
+	const Vec3D &q2 = _vertex[_triangle[t][2]];
+	/* Inflate the test box by a hair. Vertices of an axis-aligned face
+	 * can land exactly on a cell boundary -- the flat faces of these
+	 * electrodes sit exactly on the grid's outer plane -- and the
+	 * separating-axis test then rejects or accepts on the last bit of
+	 * the box-centre arithmetic. Growing the box can only ever add a
+	 * triangle to a cell, which costs a little work and cannot lose a
+	 * contribution; shrinking it silently drops surface. */
+	const double sat_eps = 1.0e-9;
+	const Vec3D half( 0.5*_gh[0]*(1.0+sat_eps) + sat_eps*_gh[0],
+			  0.5*_gh[1]*(1.0+sat_eps) + sat_eps*_gh[1],
+			  0.5*_gh[2]*(1.0+sat_eps) + sat_eps*_gh[2] );
+	for( int32_t k = lo[3*t+2]; k <= hi[3*t+2]; k++ )
+	    for( int32_t j = lo[3*t+1]; j <= hi[3*t+1]; j++ )
+		for( int32_t i = lo[3*t+0]; i <= hi[3*t+0]; i++ ) {
+		    Vec3D ctr( _gmin[0]+(i+0.5)*_gh[0],
+			       _gmin[1]+(j+0.5)*_gh[1],
+			       _gmin[2]+(k+0.5)*_gh[2] );
+		    if( tri_box_overlap( ctr, half, q0, q1, q2 ) )
+			_gtri[fill[(size_t)((k*_gn[1]+j)*_gn[0]+i)]++] = (uint32_t)t;
+		}
+    }
+    ibsimu.message( 1 ) << "  inside() grid: " << _gn[0] << "x" << _gn[1]
+			<< "x" << _gn[2] << " cells, " << _gtri.size()
+			<< " triangle refs for " << ntri << " triangles\n";
+
+    int nthreads = 1;
+#ifdef _OPENMP
+    nthreads = omp_get_max_threads();
+#endif
+    _cand.resize( nthreads > 0 ? nthreads : 1 );
+}
+
+
+/* Point-in-solid, accelerated but ARITHMETICALLY IDENTICAL to
+ * inside_exhaustive().
+ *
+ * The exhaustive form sums a signed contribution over every triangle,
+ * where triangle t contributes only if the query point lies inside the
+ * tetrahedron (O, t) -- O being the origin of the shifted frame, which
+ * prepare_for_inside() places just outside the solid's minimum corner.
+ * Every other triangle returns VTRI_OUTSIDE and contributes exactly zero.
+ *
+ * The point lies inside tet(O, t) precisely when the ray leaving x along
+ * the direction x -- i.e. straight away from O -- strikes triangle t. So
+ * the triangles that can contribute anything at all are exactly those the
+ * ray meets, and they can be gathered by walking the grid along that ray
+ * instead of by scanning the whole list. Everything skipped would have
+ * added zero.
+ *
+ * Two details keep it bit-exact rather than merely equivalent:
+ *
+ *   - the gathered candidates are SORTED back into triangle order before
+ *     they are accumulated. The vpos/vneg de-duplication is order
+ *     dependent -- for a vertex shared by several triangles the first one
+ *     seen claims it -- so visiting in grid order rather than index order
+ *     would be a different, equally defensible answer, and we want the
+ *     same one.
+ *   - a triangle spanning several cells appears in each, so duplicates are
+ *     removed after sorting; counting it twice would double its term.
+ */
+bool VTriangleSurfaceSolid::inside( const Vec3D &p ) const
+{
+    // Fast test if outside bbox
+    for( uint32_t a = 0; a < 3; a++ ) {
+	if( p[a] < _bbox[0][a] )
+	    return( false );
+	if( p[a] > _bbox[1][a] )
+	    return( false );
+    }
+
+    // Offset point
+    Vec3D x = p+_offset;
+
+    if( _gstart.empty() || _cand.empty() )
+	return( inside_exhaustive( x ) );
+
+    int tid = 0;
+#ifdef _OPENMP
+    tid = omp_get_thread_num();
+#endif
+    if( tid < 0 || tid >= (int)_cand.size() )
+	return( inside_exhaustive( x ) );
+    std::vector<uint32_t> &cand = _cand[tid];
+    cand.clear();
+
+    /* Walk the grid from x along direction d = x (away from O) with a 3D
+     * DDA, collecting every triangle in every cell entered. Conservative:
+     * a cell is visited whenever the ray passes through it, so no triangle
+     * the ray actually hits can be missed. */
+    Vec3D d = x;
+    int32_t ijk[3], step[3];
+    double tmax[3], tdelta[3];
+    for( int a = 0; a < 3; a++ ) {
+	ijk[a] = (int32_t)floor( (x[a]-_gmin[a])/_gh[a] );
+	if( ijk[a] < 0 ) ijk[a] = 0;
+	if( ijk[a] > _gn[a]-1 ) ijk[a] = _gn[a]-1;
+	if( d[a] > 0.0 ) {
+	    step[a] = 1;
+	    tmax[a] = (_gmin[a] + (ijk[a]+1)*_gh[a] - x[a])/d[a];
+	    tdelta[a] = _gh[a]/d[a];
+	} else if( d[a] < 0.0 ) {
+	    step[a] = -1;
+	    tmax[a] = (_gmin[a] + ijk[a]*_gh[a] - x[a])/d[a];
+	    tdelta[a] = -_gh[a]/d[a];
+	} else {
+	    step[a] = 0;
+	    tmax[a] = std::numeric_limits<double>::infinity();
+	    tdelta[a] = std::numeric_limits<double>::infinity();
+	}
+    }
+
+    while( true ) {
+	const size_t c = (size_t)((ijk[2]*_gn[1]+ijk[1])*_gn[0]+ijk[0]);
+	for( uint32_t q = _gstart[c]; q < _gstart[c+1]; q++ )
+	    cand.push_back( _gtri[q] );
+
+	int a = 0;
+	if( tmax[1] < tmax[0] ) a = 1;
+	if( tmax[2] < tmax[a] ) a = 2;
+	if( step[a] == 0 )
+	    break;
+	ijk[a] += step[a];
+	if( ijk[a] < 0 || ijk[a] > _gn[a]-1 )
+	    break;
+	tmax[a] += tdelta[a];
+    }
+
+    if( cand.empty() )
+	return( false );
+    std::sort( cand.begin(), cand.end() );
+    cand.erase( std::unique( cand.begin(), cand.end() ), cand.end() );
+
+    /* De-duplication of the degenerate vertex case.
+     *
+     * The exhaustive form allocates two std::vector<bool> the size of the
+     * whole VERTEX list on every call and clears them, which costs the
+     * same whether one triangle is examined or ten thousand. Here only the
+     * candidates can contribute, so the same bookkeeping is done with two
+     * small lists scanned linearly -- typically a handful of entries, and
+     * touched at all only in the degenerate branch. Same rule, same
+     * result: for a vertex shared by several triangles the first one seen
+     * in triangle order claims it. */
+    uint32_t vpos[8], vneg[8];
+    size_t nvpos = 0, nvneg = 0;
+    bool vpos_of = false, vneg_of = false;
+    std::vector<uint32_t> vpos_x, vneg_x;
+
+    int incl = 0;
+    for( size_t q = 0; q < cand.size(); q++ ) {
+	const uint32_t a = cand[q];
+	int ss = signvol3( _vertex[_triangle[a][0]],
+			   _vertex[_triangle[a][1]],
+			   _vertex[_triangle[a][2]] );
+	int stat = classify_original_tetrahedron( ss, x,
+						  _vertex[_triangle[a][0]],
+						  _vertex[_triangle[a][1]],
+						  _vertex[_triangle[a][2]] );
+	if( stat == VTRI_INSIDE ) {
+	    incl += 2*ss;
+	} else if( stat == VTRI_FACE ) {
+	    incl += ss;
+	} else if( stat != VTRI_OUTSIDE ) {
+	    const uint32_t v = _triangle[a][stat];
+	    if( ss > 0 ) {
+		bool seen = false;
+		for( size_t z = 0; z < nvpos && !seen; z++ )
+		    if( vpos[z] == v ) seen = true;
+		if( vpos_of )
+		    for( size_t z = 0; z < vpos_x.size() && !seen; z++ )
+			if( vpos_x[z] == v ) seen = true;
+		if( !seen ) {
+		    if( nvpos < 8 ) vpos[nvpos++] = v;
+		    else { vpos_x.push_back( v ); vpos_of = true; }
+		    incl += 2*ss;
+		}
+	    } else if( ss < 0 ) {
+		bool seen = false;
+		for( size_t z = 0; z < nvneg && !seen; z++ )
+		    if( vneg[z] == v ) seen = true;
+		if( vneg_of )
+		    for( size_t z = 0; z < vneg_x.size() && !seen; z++ )
+			if( vneg_x[z] == v ) seen = true;
+		if( !seen ) {
+		    if( nvneg < 8 ) vneg[nvneg++] = v;
+		    else { vneg_x.push_back( v ); vneg_of = true; }
+		    incl += 2*ss;
+		}
+	    }
+	}
+    }
+
+    if( incl > 0 )
+	return( true );
+    return( false );
+}
+
+
 void VTriangleSurfaceSolid::prepare_for_inside()
 {
     // Calculate bbox
@@ -362,6 +720,8 @@ void VTriangleSurfaceSolid::prepare_for_inside()
     // Apply offset to vertex data
     for( size_t a = 0; a < _vertex.size(); a++ )
 	_vertex[a] += _offset;
+
+    build_grid();
 }
 
 

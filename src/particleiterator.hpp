@@ -352,6 +352,10 @@ template <class PP> class ParticleIterator {
      *  for a test in the trajectory inner loop.
      */
     std::vector<bool>          _mask_solid;
+    bool                       _mask_reflected; /*!< \brief Set by check_collision_*()
+						  *   when the crossing it found was a
+						  *   Neumann mask, so the caller reflects
+						  *   instead of absorbing. */
 
     /*! \brief Does this geometry contain ANY Neumann mask?
      *
@@ -530,8 +534,54 @@ template <class PP> class ParticleIterator {
 		}
 
 		// Update status and statistics
-		particle.set_status( PARTICLE_COLL );
 		uint32_t solid = get_solid( i[0], i[1], i[2] );
+
+		/* THE TYPE CHECK, at the point where the crossing is
+		 * actually known. A Neumann mask is a symmetry surface, so
+		 * a particle reaching it is REFLECTED, not absorbed -- and
+		 * the decision is made from the same triangle, in the same
+		 * place, as the decision to absorb.
+		 *
+		 * That is what makes the two impossible to disagree. The
+		 * pre-check this replaces (entering_mask(), still used by
+		 * the analytic engine below) had to be analytic precisely
+		 * because it ran BEFORE this test and a mesh-tag version of
+		 * it disagreed with the analytic absorption here, letting a
+		 * symmetry surface eat the beam. Deciding both from one
+		 * intersection removes the disagreement structurally rather
+		 * than by making the two agree.
+		 *
+		 * The reflection normal comes from the triangle, so a
+		 * staircase corner is handled without a special case: the
+		 * velocity component along n is reversed and the particle
+		 * is nudged back to the live side, opposite whichever way
+		 * it was entering. The particle is TRUNCATED at the
+		 * surface, not mirrored past it -- the caller discards the
+		 * remaining crossings for this step -- so it never samples
+		 * the masked region, where the solver leaves the potential
+		 * unwritten. */
+		if( is_mask_solid( solid ) ) {
+		    Vec3D n = cross( vb-va, vc-va );
+		    double nn = n.norm2();
+		    if( nn > 0.0 ) {
+			n /= nn;
+			double vn = 0.0;
+			for( size_t b = 0; b < PP::dim(); b++ )
+			    vn += status_x[2*b+2]*n[b];
+			const double eps = 1.0e-3*_pidata._geom->h();
+			const double sgn = ( vn > 0.0 ? -1.0 : 1.0 );
+			for( size_t b = 0; b < PP::dim(); b++ ) {
+			    status_x[2*b+1] += sgn*eps*n[b];
+			    status_x[2*b+2] -= 2.0*vn*n[b];
+			}
+		    }
+		    _mask_reflected = true;
+		    DEBUG_MESSAGE( "Neumann mask reflection\n" );
+		    DEBUG_DEC_INDENT();
+		    return( false );
+		}
+
+		particle.set_status( PARTICLE_COLL );
 		_stat.add_bound_collision( solid, particle.IQ() );
 
 		if( _tsur_cb )
@@ -992,7 +1042,16 @@ template <class PP> class ParticleIterator {
 	// solid checks below. That ordering is the fix: a Neumann mask is a
 	// symmetry surface and must never reach check_collision_solid(),
 	// which would happily absorb on it.
-	if( _have_mask && _mask_reflect && entering_mask( c, _coldata[c]._dir ) ) {
+	_mask_reflected = false;
+
+	// Analytic engine only. With the surface model on, the mask is
+	// decided inside check_collision_surface() from the triangle it
+	// actually hits -- the same place, and the same intersection, as
+	// absorption. Running this pre-check as well would do a second,
+	// more expensive test of the same thing, and it is the one that
+	// walks every STL triangle.
+	if( _have_mask && _mask_reflect && !_surface_collision &&
+	    entering_mask( c, _coldata[c]._dir ) ) {
 	    handle_mask_reflection( c, _coldata[c]._dir, x2 );
 	    DEBUG_DEC_INDENT();
 	    return( true );
@@ -1079,6 +1138,28 @@ template <class PP> class ParticleIterator {
 	    DEBUG_MESSAGE( "Surface collision!\n" );
 	    DEBUG_DEC_INDENT();
 	    return( false );
+	}
+
+	/* The surface engine reported a mask reflection. Undo the mesh
+	 * index advance -- a reflected particle stays in the cell it was
+	 * in -- discard the rest of this step's crossings, and tell the
+	 * adaptive stepper its history no longer describes this
+	 * trajectory. status_x (the caller's x2) already carries the
+	 * reflected state.
+	 *
+	 * The undo is exact: every branch above moves exactly one index by
+	 * one, in the direction _coldata[c]._dir names. */
+	if( _mask_reflected ) {
+	    const size_t a = (size_t)((_coldata[c]._dir < 0 ?
+				       -_coldata[c]._dir : _coldata[c]._dir) - 1);
+	    i[a] += ( _coldata[c]._dir < 0 ? +1 : -1 );
+	    save_trajectory_point( _coldata[c]._x );
+	    _coldata.resize( c+1 );
+	    gsl_odeiv2_step_reset( _step );
+	    gsl_odeiv2_evolve_reset( _evolve );
+	    DEBUG_MESSAGE( "Mask reflection, index restored\n" );
+	    DEBUG_DEC_INDENT();
+	    return( true );
 	}
 
 	// Check for collisions/mirroring with simulation boundary. Here
@@ -1481,7 +1562,7 @@ public:
 	  _surface_collision(false), _pidata(scharge,efield,bfield,geom),
 	  _thand_cb(0), _tend_cb(0), _tsur_cb(0), _bsup_cb(0), _pdb(0),
 	  _stat(geom->number_of_boundaries()),
-	  _time_ode(0.0), _time_trajhandle(0.0) {
+	  _time_ode(0.0), _time_trajhandle(0.0), _mask_reflected(false) {
 
 	// Cache which solids are Neumann masks -- see _mask_solid.
 	_have_mask = false;

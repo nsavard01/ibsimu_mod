@@ -221,6 +221,23 @@ class VTriangleSurfaceSolid : public VTriangleSurface {
 
     void update_bbox( Vec3D &min, Vec3D &max, const Vec3D x ) const;
 
+    /* Uniform grid over the triangles, used to answer inside() with a ray
+     * query instead of a sweep over every triangle. See build_grid() and
+     * inside() for why the two give bit-identical answers. */
+    int32_t                    _gn[3];     /*!< \brief Grid dimensions. */
+    Vec3D                      _gmin;      /*!< \brief Grid origin, shifted frame. */
+    Vec3D                      _gh;        /*!< \brief Grid cell size. */
+    std::vector<uint32_t>      _gstart;    /*!< \brief CSR offsets, _gn product + 1. */
+    std::vector<uint32_t>      _gtri;      /*!< \brief Triangle indices per cell. */
+
+    /* Per-thread scratch. inside() is const and called from inside OpenMP
+     * regions (Geometry::build_mesh_parallel_thread_3d), so this is indexed
+     * by thread rather than shared or allocated per call. */
+    mutable std::vector<std::vector<uint32_t> > _cand;   /*!< \brief Candidate list. */
+
+    void build_grid( void );
+    bool inside_exhaustive( const Vec3D &x ) const;
+
 public:
 
     /*! \brief Constructor for vertex triangle surface solid.
