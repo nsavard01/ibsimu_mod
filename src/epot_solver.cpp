@@ -534,6 +534,20 @@ void EpotSolver::preprocess( MeshScalarField &epot )
 		    // stay pinned to the plasma potential right at that
 		    // corner, even after the box-edge Neumann case was
 		    // fixed.
+		    // A Neumann solid's SURFACE LAYER carries a vacuum tag so
+		    // that it stays in the solve (Geometry::neumann_surface_
+		    // retag()), but it is *inside* a solid: it is the node the
+		    // field mirrors about, not a region a plasma or a forced
+		    // potential may occupy. It is excluded from forcing for
+		    // exactly the reason a dielectric is -- see the comment
+		    // above -- and it must be, or the branches below turn it
+		    // into a PURE_VACUUM_FIX node; postprocess() only restores
+		    // those away from the box faces, so one lying on a face is
+		    // stranded with a FIX tag that the next preprocess() then
+		    // rejects as an unknown node id.
+		    if( _geom.is_neumann_surface( i, j, k ) )
+			continue;
+
 		    double val;
 		    if( _force_pot_func2 &&
 			comp_isfinite( (val = (*_force_pot_func2)( x ))) &&

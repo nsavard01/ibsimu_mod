@@ -78,6 +78,8 @@ public:
      */
     bool inside( const Vec3D &x ) const;
 
+    virtual bool analytic_surface( void ) const { return( true ); }
+
     /*! \brief Print debugging information to \a os.
      */
     void debug_print( std::ostream &os ) const;

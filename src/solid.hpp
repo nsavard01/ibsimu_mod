@@ -111,6 +111,10 @@ public:
      */
     virtual bool inside( const Vec3D &x ) const = 0;
 
+    /*! \brief Is this solid's surface cheap and exact to intersect
+     *  analytically (closed-form inside())? */
+    virtual bool analytic_surface( void ) const { return( false ); }
+
     /*! \brief Return a conservative world-space axis-aligned bounding
      *  box for the solid in \a min and \a max.
      *

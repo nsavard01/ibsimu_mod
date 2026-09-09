@@ -325,6 +325,8 @@ class Geometry : public Mesh
      *  needing its own cache or living with the tag's blind spots.
      */
     std::vector<uint8_t>       _material;
+    std::vector<bool>          _analytic;  /*!< \brief Cached Solid::analytic_surface(). */
+    std::vector<bool>          _neumann;   /*!< \brief Cached: solid has BOUND_NEUMANN. */
 
     /*! \brief Live nodes touching a Neumann mask, with their face count.
      *
@@ -465,6 +467,7 @@ class Geometry : public Mesh
     void build_mesh_parallel_thread_1d( void );
 
     void build_mesh_parallel( void );
+    void neumann_surface_retag( void );
 
     static const int32_t mc_faces[15*256];
 
@@ -685,6 +688,32 @@ public:
      *  See _material's doc comment.
      */
     uint32_t material( int32_t i ) const { return( _material[i] ); }
+
+    /*! \brief Is solid \a n analytic? See Solid::analytic_surface(). */
+    bool solid_is_analytic( uint32_t n ) const {
+	return( n >= 7 && n-7 < _analytic.size() && _analytic[n-7] );
+    }
+
+    /*! \brief Is solid \a n a Neumann (masked) solid? */
+    bool solid_is_neumann( uint32_t n ) const {
+	return( n >= 7 && n-7 < _neumann.size() && _neumann[n-7] );
+    }
+
+    /*! \brief Is (i,j,k) the SURFACE LAYER of a Neumann solid -- inside it,
+     *  but still solved?
+     *
+     *  See build_mesh()'s retagging pass. Such a node is in the solid by
+     *  _material, so particle code sees it as solid, but carries no
+     *  SMESH_NODE_FIXED bit, so the field solves it and set_link() mirrors
+     *  about it. It also carries beam space charge, unlike every other
+     *  in-solid node, which is why scharge_clear_solid_nodes() must skip
+     *  it. */
+    bool is_neumann_surface( int32_t i, int32_t j, int32_t k ) const {
+	uint32_t m = _material[i + j*_size[0] + k*_size[0]*_size[1]];
+	if( m == 0 || !solid_is_neumann( m ) )
+	    return( false );
+	return( (mesh(i,j,k) & SMESH_NODE_FIXED) == 0 );
+    }
 
     /*! \brief Returns the real solid number node (\a i, \a j) truly
      *  belongs to (0 = vacuum), independent of any stencil/tag

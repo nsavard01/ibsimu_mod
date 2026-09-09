@@ -281,7 +281,16 @@ void scharge_clear_solid_nodes( MeshScalarField &scharge, const Geometry &geom )
 	for( uint32_t k = 0; k < nz; k++ ) {
 	    for( uint32_t j = 0; j < ny; j++ ) {
 		for( uint32_t i = 0; i < nx; i++ ) {
-		    if( geom.material(i,j,k) != 0 )
+		    /* A Neumann solid's SURFACE LAYER is inside the solid but
+		     * still solved, and it is the node the field mirrors
+		     * about -- so it carries beam charge (doubled, by
+		     * scharge_correct_neumann_mask(), because it owns half a
+		     * control volume) and must not be zeroed here. Every
+		     * other in-solid node either holds no free charge (a
+		     * dielectric) or is eliminated from the solve, so
+		     * clearing those is right. */
+		    if( geom.material(i,j,k) != 0 &&
+			!geom.is_neumann_surface( i, j, k ) )
 			scharge( i, j, k ) = 0.0;
 		}
 	    }

@@ -1669,6 +1669,120 @@ void Geometry::build_mesh_parallel_thread_1d( void )
 }
 
 
+/* Give a Neumann solid's OUTERMOST LAYER of nodes back to the solve.
+ *
+ * A node-centred mirror needs its symmetry plane to sit ON a node that is
+ * still solved: set_link() eliminates the ghost behind the mask with
+ * phi_ghost := phi_mirror, so the zero-derivative plane lies exactly on the
+ * last live node, and that node owns half a control volume (hence the
+ * factor of two scharge_correct_neumann_mask() applies to it).
+ *
+ * Tagging EVERY node of the solid as masked therefore forces a choice
+ * between two wrong things: either the solid is defined to stop one node
+ * short of its real surface -- which is what a driver writing "x > box_x"
+ * does -- and then no node carries the solid's material where the surface
+ * actually is, so particle code keyed on material() cannot see the entry
+ * face and only notices a cell later; or the solid includes the surface
+ * node and the field's mirror plane slides a cell inward, which is the
+ * field/particle mismatch set_link() warns about.
+ *
+ * Neither is necessary, because "in a solid" and "eliminated from the
+ * solve" are already independent in this library -- a BOUND_DIELECTRIC
+ * interior is tagged SMESH_NODE_ID_PURE_VACUUM with its material number
+ * set, and is solved. The same split is applied here: the layer of the
+ * Neumann solid that touches anything else keeps its material but goes
+ * back to being an ordinary solved node, and only the interior stays
+ * masked. Then material() marks the true surface (so a particle crossing
+ * it is tested on the crossing that enters it, not a cell late) and the
+ * mirror plane lands on that same surface.
+ *
+ * Only in-mesh neighbours count. A mask running out to the simulation box
+ * edge has no outward neighbour there, and must stay masked rather than
+ * exposing a live shell along the box wall.
+ *
+ * A mask one node thick would become entirely surface and so entirely
+ * live, leaving no ghost to mirror against. Such a mask cannot represent a
+ * symmetry plane at any resolution and is a modelling error rather than a
+ * case to handle here.
+ */
+void Geometry::neumann_surface_retag( void )
+{
+    bool any = false;
+    for( uint32_t a = 0; a < _n; a++ )
+	if( _neumann[a] )
+	    any = true;
+    if( !any )
+	return;
+
+    const int32_t nx = _size[0], ny = _size[1], nz = _size[2];
+    const bool is3d = ( _geom_mode == MODE_3D );
+    std::vector<uint32_t> retag;
+
+    for( int32_t k = 0; k < (is3d ? nz : 1); k++ ) {
+	for( int32_t j = 0; j < ny; j++ ) {
+	    for( int32_t i = 0; i < nx; i++ ) {
+		/* Never retag a node lying ON a simulation box face. Two
+		 * separate things break if we do, and both are silent:
+		 *
+		 * 1. A PURE_VACUUM tag is a promise that all six (four in
+		 *    2D) neighbours exist -- add_vacuum_node() builds the
+		 *    full stencil unconditionally, so on a face it indexes
+		 *    off the end of the mesh. That is the crash, not a
+		 *    wrong answer.
+		 * 2. EpotSolver::postprocess() only converts PURE_VACUUM_FIX
+		 *    back to a live tag AWAY from the faces (face nodes are
+		 *    restored by its per-boundary loops, keyed on the box's
+		 *    own boundary type). A retagged face node forced by
+		 *    force_pot_func/init_plasma_func would be stranded with
+		 *    a FIX tag that the next preprocess() rejects.
+		 *
+		 * A face node's tag already encodes the box's own boundary
+		 * condition, which is what the one-sided stencils there are
+		 * built from; the mask keeps it out of the solve, exactly as
+		 * before this pass existed. _material still marks it as
+		 * inside the solid, so the particle side is unaffected. */
+		if( i == 0 || i == nx-1 || j == 0 || j == ny-1 ||
+		    ( is3d && ( k == 0 || k == nz-1 ) ) )
+		    continue;
+
+		const uint32_t ptr = i + j*nx + k*nx*ny;
+		const uint32_t m = _material[ptr];
+		if( m == 0 || !solid_is_neumann( m ) )
+		    continue;
+		if( (_smesh[ptr] & SMESH_NODE_ID_MASK) != SMESH_NODE_ID_NEUMANN_MASK )
+		    continue;
+
+		bool surface = false;
+		const int32_t di[6] = { -1, 1, 0, 0, 0, 0 };
+		const int32_t dj[6] = { 0, 0, -1, 1, 0, 0 };
+		const int32_t dk[6] = { 0, 0, 0, 0, -1, 1 };
+		for( int d = 0; d < ( is3d ? 6 : 4 ) && !surface; d++ ) {
+		    int32_t ni = i+di[d], nj = j+dj[d], nk = k+dk[d];
+		    if( ni < 0 || nj < 0 || nk < 0 ||
+			ni >= nx || nj >= ny || ( is3d && nk >= nz ) )
+			continue;                       // outside the mesh
+		    if( _material[ni + nj*nx + nk*nx*ny] != m )
+			surface = true;
+		}
+		if( surface )
+		    retag.push_back( ptr );
+	    }
+	}
+    }
+
+    /* Bare PURE_VACUUM, dropping the mask tag's solid number: on a vacuum
+     * tag those low bits mean "dielectric solid number" instead (see
+     * build_mesh_parallel_thread_3d()), and a Neumann solid is not a
+     * dielectric. The node's true solid number is still in _material,
+     * which is where every caller that wants it looks. */
+    for( size_t a = 0; a < retag.size(); a++ )
+	_smesh[retag[a]] = SMESH_NODE_ID_PURE_VACUUM;
+
+    ibsimu.message( 1 ) << "  Neumann surface layer: " << retag.size()
+			<< " nodes returned to the solve\n";
+}
+
+
 void Geometry::build_mesh_parallel( void )
 {
     // Mesh building in 1d is not parallelized
@@ -1738,6 +1852,14 @@ const std::vector<std::pair<uint32_t,uint8_t> > &Geometry::mask_face_nodes( void
 
 void Geometry::build_mesh( void )
 {
+    _analytic.assign( _n, false );
+    for( uint32_t a = 0; a < _n; a++ )
+	if( _sdata[a] )
+	    _analytic[a] = _sdata[a]->analytic_surface();
+    _neumann.assign( _n, false );
+    for( uint32_t a = 0; a < _n; a++ )
+	_neumann[a] = ( _bound[a+6].type() == BOUND_NEUMANN );
+
     // Node classification is about to change, so the derived mask-face
     // list must be rebuilt on next use.
     _mask_face_nodes_valid = false;
@@ -1755,6 +1877,7 @@ void Geometry::build_mesh( void )
 
     _built = true;
     build_mesh_parallel();
+    neumann_surface_retag();
 
     // Report node counts
     int b;
@@ -2094,40 +2217,58 @@ uint8_t Geometry::mc_case( int32_t i, int32_t j, int32_t k ) const
     uint8_t res = 0;
     uint32_t ptr = (k*_size[1] + j)*_size[0] + i;
 
+    /* A node counts as surface-bearing only if its solid is TRIANGULATED.
+     * Analytic solids are intersected in closed form by the particle
+     * iterator -- exactly, corners included -- so triangulating them would
+     * only substitute a node-plane staircase for their true surface. */
+/* A node counts as surface-bearing only if its solid is TRIANGULATED.
+     * Analytic solids are intersected in closed form by the particle
+     * iterator -- exactly, corners included -- so triangulating them would
+     * only substitute a node-plane staircase for their true surface.
+     *
+     * They must NOT be left in as a belt-and-braces second net: get_solid_mc()
+     * attributes a triangle hit only to a triangulated solid, so a mask
+     * triangle would report solid 0, read as "no collision", and the
+     * particle would pass clean through. Measured that way: 414 of 10368
+     * trajectories leaked into the mask instead of 17. */
+#define mc_solid(m) ( (m) != 0 && !solid_is_analytic( m ) )
+
     // Node 1 (i,j,k)
-    if( _material[ptr] != 0 )
+    if( mc_solid(_material[ptr]) )
 	res += MC_V1;
 
     // Node 2 (i+1,j,k)
-    if( _material[ptr+1] != 0 )
+    if( mc_solid(_material[ptr+1]) )
 	res += MC_V2;
 
     // Node 3 (i+1,j+1,k)
-    if( _material[ptr+1+_size[0]] != 0 )
+    if( mc_solid(_material[ptr+1+_size[0]]) )
 	res += MC_V3;
 
     // Node 4 (i,j+1,k)
-    if( _material[ptr+_size[0]] != 0 )
+    if( mc_solid(_material[ptr+_size[0]]) )
 	res += MC_V4;
 
     // Second z-level
     ptr += _size[0]*_size[1];
 
     // Node 5 (i,j,k+1)
-    if( _material[ptr] != 0 )
+    if( mc_solid(_material[ptr]) )
 	res += MC_V5;
 
     // Node 6 (i+1,j,k+1)
-    if( _material[ptr+1] != 0 )
+    if( mc_solid(_material[ptr+1]) )
 	res += MC_V6;
 
     // Node 7 (i+1,j+1,k+1)
-    if( _material[ptr+1+_size[0]] != 0 )
+    if( mc_solid(_material[ptr+1+_size[0]]) )
 	res += MC_V7;
 
     // Node 8 (i,j+1,k+1)
-    if( _material[ptr+_size[0]] != 0 )
+    if( mc_solid(_material[ptr+_size[0]]) )
 	res += MC_V8;
+
+#undef mc_solid
 
 #ifdef MC_DEBUG
     std::cout << "res = " << res << "\n";
@@ -2911,6 +3052,14 @@ uint8_t Geometry::solid_dist( uint32_t i, uint32_t j, uint32_t k, uint32_t dir )
      * Drivers snap mask faces onto node planes for exactly this reason.
      */
     if( SMESH_NODE_IS_NEUMANN_MASK( snode ) )
+	return( 0 );
+    /* Same for any ANALYTIC solid: they are excluded from the
+     * marching-cubes surface (see mc_case()), carry no _nearsolid entry,
+     * and are intersected in closed form by the particle iterator instead.
+     * Guarding only the Neumann case would leave a Dirichlet FuncSolid --
+     * ECR's solid_outer(), for instance -- to fall through to the
+     * dielectric bisection and throw "not a near solid node". */
+    if( solid_is_analytic( _material[i + j*_size[0] + k*_size[0]*_size[1]] ) )
 	return( 0 );
     {
 	int32_t ni = (int32_t)i, nj = (int32_t)j, nk = (int32_t)k;
