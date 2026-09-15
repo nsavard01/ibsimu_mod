@@ -82,6 +82,11 @@ class EpotBiCGSTABSolver : public EpotMatrixSolver {
      */
     virtual void reset_problem( void );
 
+    /*! \brief Keep the matrix cache and preconditioner when only nonlinear
+     *  model parameters change. See EpotSolver::reset_nonlinear_parameters().
+     */
+    virtual void reset_nonlinear_parameters( void );
+
     /*! \brief Solve problem with given mesh based space charge.
      */
     virtual void subsolve( MeshScalarField &epot, const MeshScalarField &scharge );

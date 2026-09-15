@@ -227,21 +227,43 @@ void EpotSolver::set_initial_plasma_rho( MeshScalarField &scharge, double rho,
 }
 
 
+/* True when a nonlinear plasma model of type \a type is already active, so
+ * a setter re-arming the same type changes only Jacobian values -- see
+ * reset_nonlinear_parameters(). A change of model type (in particular to or
+ * from an INITIAL model, which fixes nodes) still needs reset_problem().
+ */
+static inline bool same_nonlinear_plasma( plasma_mode_e current, plasma_mode_e type,
+					  const CallbackFunctorB_V *init_plasma_func )
+{
+    return( current == type && init_plasma_func == NULL );
+}
+
+
 void EpotSolver::set_plasma_calc_region( CallbackFunctorB_V *plasma_calc_func )
 {
     _plasma_calc_func = plasma_calc_func;
-    reset_problem();
+    // Evaluated per node in update_nonlinear_node(); it does not decide
+    // which nodes are fixed.
+    if( ( _plasma == PLASMA_PEXP || _plasma == PLASMA_NSIMP ||
+	  _plasma == PLASMA_SHIELD ) && _init_plasma_func == NULL )
+	reset_nonlinear_parameters();
+    else
+	reset_problem();
 }
 
 
 void EpotSolver::set_pexp_plasma( double rhoe, double Te, double Up )
 {
+    bool params_only = same_nonlinear_plasma( _plasma, PLASMA_PEXP, _init_plasma_func );
     _init_plasma_func = NULL;
     _plasma     = PLASMA_PEXP;
     _rhoe       = -fabs(rhoe); // Ensure correct sign of charge density
     _Te         = Te;
     _Up         = Up;
-    reset_problem();
+    if( params_only )
+	reset_nonlinear_parameters();
+    else
+	reset_problem();
 }
 
 
@@ -260,6 +282,7 @@ void EpotSolver::set_nsimp_initial_plasma( CallbackFunctorB_V *init_plasma_func 
 void EpotSolver::set_nsimp_plasma( double rhop, double Ep, 
 				   std::vector<double> rhoi, std::vector<double> Ei )
 {
+    bool params_only = same_nonlinear_plasma( _plasma, PLASMA_NSIMP, _init_plasma_func );
     _init_plasma_func = NULL;
     _plasma = PLASMA_NSIMP;
     _rhoi.clear();
@@ -279,17 +302,24 @@ void EpotSolver::set_nsimp_plasma( double rhop, double Ep,
 	_Ei.push_back( Ei[a] );
     }
 
-    reset_problem();
+    if( params_only )
+	reset_nonlinear_parameters();
+    else
+	reset_problem();
 }
 
 
 void EpotSolver::set_shield_plasma( double Tm, double Um )
 {
+    bool params_only = same_nonlinear_plasma( _plasma, PLASMA_SHIELD, _init_plasma_func );
     _init_plasma_func = NULL;
     _plasma     = PLASMA_SHIELD;
     _Te        = Tm;
     _Up        = Um;
-    reset_problem();
+    if( params_only )
+	reset_nonlinear_parameters();
+    else
+	reset_problem();
 }
 
 
@@ -343,6 +373,14 @@ void EpotSolver::set_beam_compensation( double Te, double Vref, double rho_min,
 {
     if( Te <= 0.0 )
         throw( Error( ERROR_LOCATION, "compensation temperature must be positive" ) );
+    // Turning compensation on can switch the problem from linear to
+    // nonlinear (linear() returns false when _comp), so that needs the full
+    // reset. Re-arming it -- new Te/Vref/rho_min/region, or a switch
+    // between the plain and ascent forms -- changes only Jacobian values:
+    // the region and confinement mask are evaluated per node in
+    // update_nonlinear_node(), and the ascent mask is rebuilt in every
+    // build_mat_vec().
+    bool params_only = _comp;
     _comp             = true;
     _comp_ascent      = false;
     _comp_bbox_set    = false;
@@ -350,17 +388,21 @@ void EpotSolver::set_beam_compensation( double Te, double Vref, double rho_min,
     _compVref         = Vref;
     _compRhoMin       = rho_min;
     _comp_region_func = region;
-    reset_problem();
+    if( params_only )
+        reset_nonlinear_parameters();
+    else
+        reset_problem();
 }
 
 
 void EpotSolver::set_beam_compensation_ascent( double Te, double Vref, double rho_min,
                                                CallbackFunctorB_V *region )
 {
+    // set_beam_compensation() does whichever reset is needed; the two flags
+    // set afterwards do not affect it.
     set_beam_compensation( Te, Vref, rho_min, region );
     _comp_ascent   = true;
     _comp_bbox_set = false;
-    reset_problem();
 }
 
 
@@ -377,7 +419,6 @@ void EpotSolver::set_beam_compensation_ascent( double Te, double Vref, double rh
     _comp_bbox_set = true;
     _comp_bmin     = bmin;
     _comp_bmax     = bmax;
-    reset_problem();
 }
 
 

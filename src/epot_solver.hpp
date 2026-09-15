@@ -374,7 +374,23 @@ protected:
     /*! \brief Reset solver/problem settings.
      */
     virtual void reset_problem( void ) = 0;
-    
+
+    /*! \brief Called instead of reset_problem() when a setter changes only
+     *  the parameters of the nonlinear model already in use (plasma
+     *  density/temperature/potential, compensation Te/Vref/region, plasma
+     *  calculation region), not the model type or which nodes are fixed.
+     *
+     *  Those parameters enter only the Jacobian values -- the plasma
+     *  coefficients are recomputed in preprocess() and the nonlinear term
+     *  is re-evaluated every Newton iteration -- so the matrix pattern and
+     *  node elimination are unchanged. The default is a full
+     *  reset_problem(), which is always safe. Solvers that cache work that
+     *  depends only on the pattern (EpotBiCGSTABSolver's GMG hierarchy)
+     *  override this to keep it: callers that update the plasma model
+     *  every major cycle would otherwise rebuild it every cycle.
+     */
+    virtual void reset_nonlinear_parameters( void ) { reset_problem(); }
+
     MeshScalarField *evaluate_scharge( const ScalarField &__scharge ) const;
 
     /*! \brief Solve problem with given mesh based space charge.

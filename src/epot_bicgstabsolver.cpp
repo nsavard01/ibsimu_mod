@@ -250,6 +250,20 @@ void EpotBiCGSTABSolver::reset_problem( void )
 }
 
 
+/* Nothing to drop. The cached matrix holds only the linear (geometry)
+ * part -- build_mat_vec() re-applies the nonlinear diagonal and rhs from
+ * scratch every Newton iteration -- and GMG_Precond::construct() refreshes
+ * every level's values on each call. If the fixed-node set did change,
+ * subsolve()'s set_node_map() sees the new map and forces a full
+ * prepare() anyway. Clearing here instead rebuilt the GMG hierarchy
+ * (~20% of run time) on every major cycle for drivers that call
+ * set_pexp_plasma() each cycle.
+ */
+void EpotBiCGSTABSolver::reset_nonlinear_parameters( void )
+{
+}
+
+
 void EpotBiCGSTABSolver::bicgstab( const Matrix &mat, const Vector &rhs, Vector &sol,
 				   const Precond &pc )
 {
