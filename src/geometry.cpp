@@ -1850,6 +1850,113 @@ const std::vector<std::pair<uint32_t,uint8_t> > &Geometry::mask_face_nodes( void
 }
 
 
+/* See the doc comment on validate_neumann_mask_alignment() in the header. */
+void Geometry::validate_neumann_mask_alignment( void ) const
+{
+    // Cheap rejection: nothing to check unless some solid is a mask.
+    bool any = false;
+    for( size_t a = 0; a < _neumann.size() && !any; a++ )
+	any = _neumann[a];
+    if( !any )
+	return;
+
+    // Same order as entering_mask()'s probe: a surface closer than this to
+    // a node behaves exactly as if it sat on the node, because that probe
+    // is what decides inside/outside at a crossing.
+    const double tol = 1.0e-3*_h;
+    const bool is3d = ( _geom_mode == MODE_3D );
+    const int naxes = ( _geom_mode == MODE_1D ) ? 1 : ( is3d ? 3 : 2 );
+
+    for( uint32_t n = 7; n <= _n+6; n++ ) {
+	if( !solid_is_neumann( n ) )
+	    continue;
+
+	int32_t imin, imax, jmin, jmax, kmin, kmax;
+	solid_node_range( _sdata[n-7], imin, imax, jmin, jmax, kmin, kmax );
+	// One node of slack: the transition sits between an outside node and
+	// an inside one, and the outside node can lie just beyond the bbox.
+	if( imin > 0 ) imin--;
+	if( jmin > 0 ) jmin--;
+	if( kmin > 0 ) kmin--;
+	if( imax < _size[0]-1 ) imax++;
+	if( jmax < _size[1]-1 ) jmax++;
+	if( is3d && kmax < _size[2]-1 ) kmax++;
+	if( !is3d ) { kmin = kmax = 0; }
+	if( _geom_mode == MODE_1D ) { jmin = jmax = 0; }
+
+	double worst = 0.0;
+	Vec3D worst_at;
+	int worst_axis = -1;
+
+	for( int axis = 0; axis < naxes; axis++ ) {
+	    int32_t d[3] = { 0, 0, 0 };
+	    d[axis] = 1;
+
+	    for( int32_t k = kmin; k <= kmax; k++ ) {
+		for( int32_t j = jmin; j <= jmax; j++ ) {
+		    for( int32_t i = imin; i <= imax; i++ ) {
+
+			int32_t i2 = i+d[0], j2 = j+d[1], k2 = k+d[2];
+			if( i2 > imax || j2 > jmax || k2 > kmax )
+			    continue;
+
+			Vec3D xa( _origo[0]+i*_h,  _origo[1]+j*_h,  _origo[2]+k*_h  );
+			Vec3D xb( _origo[0]+i2*_h, _origo[1]+j2*_h, _origo[2]+k2*_h );
+			bool ia = inside( n, xa );
+			if( ia == inside( n, xb ) )
+			    continue;          // no surface between these nodes
+
+			// Bisect to the transition, then measure how far it
+			// lies from the nearer of the two node planes.
+			Vec3D lo = xa, hi = xb;
+			for( int it = 0; it < 24; it++ ) {
+			    Vec3D mid( 0.5*(lo[0]+hi[0]),
+				       0.5*(lo[1]+hi[1]),
+				       0.5*(lo[2]+hi[2]) );
+			    if( inside( n, mid ) == ia )
+				lo = mid;
+			    else
+				hi = mid;
+			}
+			double cross = 0.5*(lo[axis]+hi[axis]);
+			double da = fabs( cross - xa[axis] );
+			double db = fabs( cross - xb[axis] );
+			double off = ( da < db ) ? da : db;
+			if( off > worst ) {
+			    worst = off;
+			    worst_axis = axis;
+			    worst_at = Vec3D( 0.5*(lo[0]+hi[0]),
+					      0.5*(lo[1]+hi[1]),
+					      0.5*(lo[2]+hi[2]) );
+			}
+		    }
+		}
+	    }
+	}
+
+	if( worst > tol ) {
+	    std::ostringstream ss;
+	    ss << "solid " << n << " is not usable as a Neumann mask (BOUND_NEUMANN): "
+	       << "its surface must be axis-perpendicular and lie on mesh node planes. "
+	       << "Found a crossing " << worst << " m (" << (worst/_h)
+	       << " cells) off the nearest node plane at " << worst_at
+	       << " along axis " << worst_axis << "; tolerance is " << tol << " m. "
+	       << "A mask is a node-centred symmetry plane: the field mirrors about "
+	       << "the last live node, particles reflect at the analytic surface, and "
+	       << "the half-control-volume space-charge correction applies to that "
+	       << "same node. Those coincide only for a node-aligned surface, and a "
+	       << "mask has no cut-cell stencil to fall back on. Snap the solid's "
+	       << "bounds onto node planes (origo + i*h).";
+	    throw( Error( ERROR_LOCATION, ss.str() ) );
+	}
+
+	ibsimu.message( 1 ) << "Neumann mask solid " << n
+			    << ": surface node-aligned to " << worst
+			    << " m (" << (worst/_h) << " cells)\n";
+    }
+}
+
+
 void Geometry::build_mesh( void )
 {
     _analytic.assign( _n, false );
@@ -1875,9 +1982,33 @@ void Geometry::build_mesh( void )
 	    throw( Error( ERROR_LOCATION, "solid " + to_string(a) + " not defined" ) );
     }
 
+    // A Neumann mask must be node-aligned -- see
+    // validate_neumann_mask_alignment(). Checked BEFORE tagging so a
+    // modelling mistake is named here rather than surfacing later as a
+    // space charge that sags towards the mask.
+    validate_neumann_mask_alignment();
+
     _built = true;
     build_mesh_parallel();
-    neumann_surface_retag();
+
+    // neumann_surface_retag() is deliberately NOT called any more.
+    //
+    // It returned the mask's surface layer to the solve, which did two
+    // things: it moved the field's mirror plane one node OUTWARD from the
+    // node where entering_mask() reflects particles, and it stripped the
+    // SMESH_NODE_ID_NEUMANN_MASK tag that mask_face_nodes() tests for when
+    // collecting the nodes needing the half-control-volume *= 2. With that
+    // tag gone the sweep found almost nothing (1 node on a mask with ~90
+    // faces), so scharge_correct_neumann_mask() became a no-op and the
+    // space charge next to a mask read a factor of two low -- which looks
+    // exactly like particles being absorbed there, though none are.
+    //
+    // With alignment enforced above the retag is unnecessary: the ghost
+    // stays masked, set_link() mirrors about the last live node, and that
+    // node gets its factor of two. The function is retained for reference;
+    // is_neumann_surface() consequently returns false everywhere, which
+    // makes its two call sites (epot_solver.cpp's forcing exclusion and
+    // scharge_clear_solid_nodes()'s 3D exception) correctly inert.
 
     // Report node counts
     int b;

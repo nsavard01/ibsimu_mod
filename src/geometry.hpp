@@ -469,6 +469,34 @@ class Geometry : public Mesh
     void build_mesh_parallel( void );
     void neumann_surface_retag( void );
 
+    /*! \brief Refuse a Neumann-mask solid whose surface is not node-aligned.
+     *
+     *  A mask is a NODE-CENTRED symmetry plane, and three independent
+     *  mechanisms have to agree on where that plane is:
+     *
+     *    - the FIELD mirrors about the last live node, because
+     *      EpotMatrixSolver::set_link() redirects a link pointing at a
+     *      masked node onto the mirror-image node (phi_(j+1) := phi_(j-1));
+     *    - the SPACE CHARGE on that same node is doubled by
+     *      scharge_correct_neumann_mask(), since a node on a symmetry plane
+     *      owns half a control volume;
+     *    - PARTICLES reflect where ParticleIterator::entering_mask() first
+     *      finds Solid::inside() true at a mesh crossing, probing 1e-3*h
+     *      past the face.
+     *
+     *  All three coincide only when the solid's surface lies on node
+     *  planes. A surface cutting mid-cell puts the field's mirror a cell
+     *  away from where particles turn around, and a mask deliberately
+     *  bypasses the near-solid cut-cell machinery, so there is no
+     *  stencil-distance treatment available to interpolate with. Rather
+     *  than quietly model something else, this throws.
+     *
+     *  Cost is O(surface area): inside() is evaluated per node within the
+     *  solid's bounding box, and only adjacent pairs straddling the surface
+     *  are bisected.
+     */
+    void validate_neumann_mask_alignment( void ) const;
+
     static const int32_t mc_faces[15*256];
 
     Vec3D mc_surface( int32_t i, int32_t j, int32_t k, uint8_t cn, int32_t ei ) const;
