@@ -77,9 +77,6 @@ Bound::Bound( bound_e type, const CallbackFunctorD_V *functor )
 }
 
 
-/* type(), value(), value(x) and is_constant() are defined inline in
- * geometry.hpp -- see their doc comments there. Only their cold paths
- * live here. */
 
 
 void Bound::set_value( double value )
@@ -137,6 +134,8 @@ std::ostream &operator<<( std::ostream &os, const Bound &b )
 {
     if( b._type == BOUND_NEUMANN )
 	os << "(BOUND_NEUMANN, ";
+    else if( b._type == BOUND_DIELECTRIC )
+	os << "(BOUND_DIELECTRIC, ";
     else 
 	os << "(BOUND_DIRICHLET, ";
     if( b._functor )
@@ -214,13 +213,6 @@ Geometry::Geometry( std::istream &is )
     read_compressed_block( is, sizeof(uint8_t)*nearsolidsize,
 			   (int8_t *)&_nearsolid[0] );
 
-    // _material is read back directly rather than re-derived via
-    // populate_material_array() -- that function calls Solid::inside()
-    // through _sdata, but _sdata was just loaded above as all NULL
-    // placeholders whenever this file was saved with save_solids=false
-    // (the only mode any real caller in this codebase actually uses), so
-    // there is no live solid geometry left to query. See Geometry::save()'s
-    // matching write and _material's own doc comment.
     _material.resize( (size_t)_size[0]*_size[1]*_size[2] );
     read_compressed_block( is, sizeof(uint8_t)*_material.size(),
 			   (int8_t *)&_material[0] );
@@ -272,6 +264,7 @@ void Geometry::set_solid( uint32_t n, const Solid *s )
     }
 
     _sdata[n-7] = s;
+    _revision++;
 }
 
 
@@ -301,34 +294,12 @@ void Geometry::set_boundary( uint32_t n, const Bound &b )
     if( n <= 0 || n > _n+6 )
 	throw( Error( ERROR_LOCATION, "illegal solid number " + to_string(n) ) );
 
-    // Solids (n >= 7) may be Dirichlet (a conductor at a fixed
-    // potential) or, since ceramics/dielectric support was added,
-    // Dielectric (a solid with a relative permittivity, whose interior
-    // is not eliminated -- see BOUND_DIELECTRIC's doc comment in
-    // types.hpp). Only the six simulation box boundaries (n <= 6) may
-    // be Neumann.
-    // BOUND_NEUMANN on a SOLID (n >= 7) makes it a Neumann MASK: its nodes
-    // are removed from the solve and every face separating one of them from
-    // a live node carries a homogeneous Neumann (zero-flux) condition. This
-    // is not a boundary in the box-face sense -- it imposes no value and
-    // needs none -- it is a way of saying "do not solve here, and let
-    // nothing flow across".
-    //
-    // Its purpose is to shrink the active domain without inventing a
-    // potential for the surface that closes it. The motivating case: an
-    // axisymmetric plasma truncated radially to avoid emitting particles
-    // out to the real chamber wall. No Dirichlet value is correct there,
-    // because the potential at the truncation radius is partway down a
-    // self-consistent sheath whose depth depends on the locally deposited
-    // ion density -- the very quantity being solved for. dphi/dr = 0 is
-    // correct, being the symmetry statement for the uniform plasma section.
-    //
-    // It also saves memory: masked nodes carry no matrix row, which matters
-    // in 3D where an unused corner of the box can be a large fraction of
-    // the mesh.
-    //
-    // A Neumann mask must carry no value: nothing ever reads one, so a
-    // functor here would silently do nothing and mislead whoever set it.
+    // A solid (n >= 7) is an electrode (BOUND_DIRICHLET), a dielectric
+    // (BOUND_DIELECTRIC, the value is the relative permittivity) or a
+    // Neumann mask (BOUND_NEUMANN): a volume that is left out of the
+    // solution, with no flux through its surface. A mask closes the
+    // solved volume where no potential is known, at a symmetry plane for
+    // example. It takes no value.
     if( n >= 7 && b.type() == BOUND_NEUMANN && !b.is_constant() )
 	throw( Error( ERROR_LOCATION, "Neumann-mask solid " + to_string(n) +
 		      " must not be given a value functor -- a mask imposes "
@@ -342,6 +313,7 @@ void Geometry::set_boundary( uint32_t n, const Bound &b )
 		      "relative permittivity value, not a spatially varying functor" ) );
 
     _bound[n-1] = b;
+    _revision++;
 }
 
 
@@ -465,7 +437,7 @@ uint32_t Geometry::mesh_check( int32_t i, int32_t j, int32_t k ) const
 uint32_t Geometry::material_check( int32_t i ) const
 {
     if( i < 0 || i >= _size[0] )
-	return( 0 ); // outside the box is never real solid material
+	return( 0 );
     return( _material[i] );
 }
 
@@ -1214,38 +1186,6 @@ void Geometry::build_mesh_parallel_prepare_1d( void )
 }
 
 
-/* See the doc comment on override_dielectric_box_boundary_3d() in the
- * header for the full rationale: a dielectric solid's interior tag
- * (SMESH_NODE_ID_PURE_VACUUM with the solid number in its lower bits)
- * is applied before box-edge classification and, unlike a Dirichlet
- * solid, is never itself excluded from further consideration by that
- * pass -- so if the dielectric reaches the simulation box edge, that
- * boundary layer is left tagged as ordinary free interior instead of
- * the box's actual Dirichlet/Neumann condition, which is both
- * physically wrong right at that surface and a mesh-edge read past
- * the domain in add_vacuum_node().
- *
- * This now runs *before* build_mesh_parallel_prepare_3d(), and its job
- * is reduced to resetting a qualifying node back to "unclaimed"
- * (mesh(i,j,k) = 0) rather than directly deciding its final box-edge
- * tag. An earlier version of this function ran *after* prepare_3d() and
- * assigned the Dirichlet/Neumann tag itself, duplicating prepare_3d()'s
- * own decision tree -- which silently broke the one case that tree is
- * actually needed for: if a *real conductor* solid happens to be
- * immediately adjacent to this same box-edge node (e.g. two STL solids
- * meeting right at the simulation box boundary), prepare_3d()'s
- * is_near_solid() check must run for it, exactly like it would for an
- * ordinary vacuum node there, so it gets tagged NEAR_SOLID (with a
- * proper cached entry) instead of a plain box-edge tag. The direct-assign
- * version bypassed is_near_solid() entirely, leaving such a node neither
- * NEAR_SOLID-tagged nor dielectric-tagged -- solid_dist() would then
- * throw "not a near solid node" the first time surface triangulation
- * crossed that edge (seen on a real 5-solid STL geometry where a
- * dielectric and a conductor solid both reached the same box edge cell).
- * Resetting to 0 and letting prepare_3d()'s already-correct, already
- * order-matched decision tree run instead fixes this for free, with no
- * duplicated logic.
- */
 void Geometry::override_dielectric_box_boundary_3d( void )
 {
     for( int32_t k = 0; k < _size[2]; k++ ) {
@@ -1255,24 +1195,18 @@ void Geometry::override_dielectric_box_boundary_3d( void )
 		uint32_t node = mesh(i,j,k);
 		if( (node & SMESH_NODE_ID_MASK) != SMESH_NODE_ID_PURE_VACUUM ||
 		    (node & SMESH_NEAR_SOLID_INDEX_MASK) == 0 )
-		    continue; // not a dielectric node here -- nothing to fix
+		    continue; // not inside a dielectric
 
 		if( i == 0 || i == _size[0]-1 ||
 		    j == 0 || j == _size[1]-1 ||
 		    k == 0 || k == _size[2]-1 )
-		    mesh(i,j,k) = 0; // let prepare_3d() reclassify it from scratch
-		// else: not on any box edge -- genuinely interior
-		// dielectric node, left untouched.
+		    mesh(i,j,k) = 0;
 	    }
 	}
     }
 }
 
 
-/* See override_dielectric_box_boundary_3d() -- same rationale and same
- * "reset to 0, let prepare_2d() reclassify (is_near_solid() first)"
- * fix, 2d/CYL.
- */
 void Geometry::override_dielectric_box_boundary_2d( void )
 {
     for( int32_t j = 0; j < _size[1]; j++ ) {
@@ -1284,16 +1218,12 @@ void Geometry::override_dielectric_box_boundary_2d( void )
 		continue;
 
 	    if( i == 0 || i == _size[0]-1 || j == 0 || j == _size[1]-1 )
-		mesh(i,j) = 0; // let prepare_2d() reclassify it from scratch
+		mesh(i,j) = 0;
 	}
     }
 }
 
 
-/* See override_dielectric_box_boundary_3d() -- same rationale and same
- * "reset to 0, let prepare_1d() reclassify (is_near_solid() first)"
- * fix, 1d.
- */
 void Geometry::override_dielectric_box_boundary_1d( void )
 {
     uint32_t node = mesh(0);
@@ -1308,38 +1238,12 @@ void Geometry::override_dielectric_box_boundary_1d( void )
 }
 
 
-/* Mesh building, OpenMP notes
- * ----------------------------
- * Marking which solid (if any) each mesh node belongs to used to be done
- * node-major: for every node, call the combined Geometry::inside(x),
- * which itself loops over solids from highest numbered to lowest,
- * calling _sdata[a]->inside(x) and stopping at the first match ("highest
- * overlapping solid wins"). That means consecutive mesh nodes processed
- * by a thread routinely dispatch through a *different* Solid subclass's
- * virtual inside() on every iteration (FuncSolid, DXFSolid, STLSolid,
- * ...), which is unfriendly to both the branch predictor and the
- * instruction cache.
+/* Mesh building
  *
- * The loop below is solid-major instead: it still visits solids from
- * highest to lowest, but for a fixed solid it sweeps the *entire* mesh
- * (in parallel) before moving to the next one, skipping any node
- * already claimed by a higher priority solid. This keeps every thread
- * inside a single Solid subclass's inside() for the full sweep, and
- * exposes far more independent work to the scheduler than slicing the
- * grid into one contiguous strip per thread, so OpenMP's dynamic
- * scheduling can keep every thread busy even when the cost of inside()
- * varies wildly across the mesh (e.g. STL/DXF solids vs. simple
- * FuncSolids, or regions near a lot of solid boundaries vs. open
- * vacuum). The total number of inside() calls, and the result, are
- * identical to the original node-major version.
- *
- * Threading itself is done with OpenMP rather than hand-rolled pthreads
- * plus a mutex/condition-variable barrier. The barrier is unnecessary
- * complexity here: two ordinary "#pragma omp for" work-sharing loops
- * inside one "#pragma omp parallel" region already provide the barrier
- * (all threads finish the first loop before any of them starts the
- * second), so the same result is reached with far less code and no
- * chance of a missed wakeup/deadlock in the synchronization logic.
+ * The nodes are tagged one solid at a time, from the highest numbered solid
+ * to the lowest, each solid in parallel over the nodes within its bounding
+ * box. A node that a higher numbered solid has taken is skipped, so where
+ * solids overlap the highest number wins, as in Geometry::inside().
  */
 
 
@@ -1348,14 +1252,12 @@ void Geometry::restrict_axis_range( double bmin, double bmax, double origo, int3
 {
     const double sanity_limit = 1.0e10;
 
-    // Solid::bbox_from_local_box() flags an axis it cannot bound by
-    // giving it a "mesh-implausible" magnitude -- leave the full
-    // range in that case.
+    // Solid::bbox_from_local_box() marks an axis without a bound with a
+    // huge value.
     if( fabs(bmin) >= sanity_limit || fabs(bmax) >= sanity_limit )
 	return;
 
-    // One extra node of margin on each side to absorb floating point
-    // rounding right at the box edge.
+    // One node of margin for rounding errors.
     int32_t lo = (int32_t)floor( (bmin-origo)/_h ) - 1;
     int32_t hi = (int32_t)ceil ( (bmax-origo)/_h ) + 1;
 
@@ -1365,7 +1267,7 @@ void Geometry::restrict_axis_range( double bmin, double bmax, double origo, int3
 	hi = size-1;
 
     if( lo > hi ) {
-	// Bounding box doesn't overlap the mesh at all along this axis.
+	// No overlap with the mesh.
 	imin = 0;
 	imax = -1;
     } else {
@@ -1404,40 +1306,18 @@ void Geometry::build_mesh_parallel_thread_3d( void )
     memset( _smesh, 0, sizeof(uint32_t)*ntot );
     _material.assign( ntot, 0 );
 
-    // Phase timing: this whole function runs once (or a handful of
-    // times at most) per program run, so a full Timer per phase (each
-    // a syscall or two) is negligible overhead -- unlike the per-
-    // operation chrono deltas used inside the Poisson solve's hot
-    // loops, there is no call-frequency concern here.
     Timer t_solid;
 
-    // Parallel: mark solid (Dirichlet) nodes, solid-major, highest
-    // numbered solid first (see note above).
+    // Tag the nodes inside solids, see the note above.
 #pragma omp parallel num_threads(nthreads)
     {
 	for( ssize_t a = (ssize_t)_sdata.size()-1; a >= 0; a-- ) {
 
 	    const Solid *solid = _sdata[a];
 
-	    // Dielectric solids keep their interior as an ordinary free
-	    // mesh region (tagged like vacuum, just carrying the solid
-	    // number in the lower bits for material lookup) instead of
-	    // being eliminated as Dirichlet: the interior satisfies
-	    // Laplace's equation with the same stencil as vacuum (a
-	    // uniform permittivity cancels out of the homogeneous
-	    // equation), and EpotMatrixSolver::preprocess() only
-	    // eliminates nodes whose SMESH_NODE_FIXED bit is set, which
-	    // SMESH_NODE_ID_PURE_VACUUM does not have. See
-	    // add_vacuum_node() for where the permittivity actually
-	    // enters, at material boundaries.
-	    // Three kinds of solid now:
-	    //   BOUND_DIELECTRIC -- interior stays a free node (a uniform
-	    //       permittivity cancels out of the homogeneous equation);
-	    //       the permittivity enters at material faces.
-	    //   BOUND_NEUMANN    -- interior is MASKED: eliminated from the
-	    //       matrix, with zero flux across every face to a live node.
-	    //       See set_boundary() and EpotMatrixSolver::set_link().
-	    //   otherwise        -- ordinary Dirichlet conductor.
+	    // The inside of a dielectric stays free, with the vacuum tag
+	    // and the solid number. A Neumann mask and an electrode are
+	    // fixed.
 	    uint32_t nid;
 	    if( _bound[a+6].type() == BOUND_DIELECTRIC )
 		nid = SMESH_NODE_ID_PURE_VACUUM | (uint32_t)(a+7);
@@ -1446,9 +1326,6 @@ void Geometry::build_mesh_parallel_thread_3d( void )
 	    else
 		nid = SMESH_NODE_ID_DIRICHLET | (uint32_t)(a+7);
 
-	    // Restrict the sweep to the node range the solid's bbox
-	    // can possibly touch (falls back to the whole mesh when
-	    // no useful bound is available -- see Solid::get_bbox()).
 	    int32_t imin, imax, jmin, jmax, kmin, kmax;
 	    solid_node_range( solid, imin, imax, jmin, jmax, kmin, kmax );
 
@@ -1463,11 +1340,6 @@ void Geometry::build_mesh_parallel_thread_3d( void )
 			Vec3D x( i*_h+_origo[0], j*_h+_origo[1], k*_h+_origo[2] );
 			if( solid->inside( x ) ) {
 			    mesh(i,j,k) = nid;
-			    // Record true solid membership independent of
-			    // the tag above -- see _material's doc comment.
-			    // Same "still unclaimed" ordering as the tag
-			    // write, so this gets the same highest-solid-
-			    // wins precedence for free.
 			    _material[i + j*_size[0] + k*_size[0]*_size[1]] = (uint8_t)(a+7);
 			}
 		    }
@@ -1477,12 +1349,8 @@ void Geometry::build_mesh_parallel_thread_3d( void )
     }
     t_solid.stop();
 
-    // Fix up any dielectric solid that reaches the box edge -- see the
-    // doc comment on override_dielectric_box_boundary_3d(). Must run
-    // *before* build_mesh_parallel_prepare_3d(): it only resets such a
-    // node back to "unclaimed", and relies on prepare_3d()'s own
-    // decision tree (is_near_solid() checked first, then box edges,
-    // then vacuum) to reclassify it exactly like an ordinary free node.
+    // Has to be done before build_mesh_parallel_prepare_3d(), see the
+    // header.
     Timer t_boxfix;
     override_dielectric_box_boundary_3d();
     t_boxfix.stop();
@@ -1527,28 +1395,16 @@ void Geometry::build_mesh_parallel_thread_2d( void )
     memset( _smesh, 0, sizeof(uint32_t)*ntot );
     _material.assign( ntot, 0 );
 
-    // See build_mesh_parallel_thread_3d() -- same rationale for using a
-    // full Timer per phase here (runs once per program, not a hot loop).
     Timer t_solid;
 
-    // Parallel: mark solid (Dirichlet) nodes, solid-major, highest
-    // numbered solid first (see note above).
+    // Tag the nodes inside solids, see the note above.
 #pragma omp parallel num_threads(nthreads)
     {
 	for( ssize_t a = (ssize_t)_sdata.size()-1; a >= 0; a-- ) {
 
 	    const Solid *solid = _sdata[a];
 
-	    // See the identical branch in build_mesh_parallel_thread_3d()
-	    // for the rationale.
-	    // Three kinds of solid now:
-	    //   BOUND_DIELECTRIC -- interior stays a free node (a uniform
-	    //       permittivity cancels out of the homogeneous equation);
-	    //       the permittivity enters at material faces.
-	    //   BOUND_NEUMANN    -- interior is MASKED: eliminated from the
-	    //       matrix, with zero flux across every face to a live node.
-	    //       See set_boundary() and EpotMatrixSolver::set_link().
-	    //   otherwise        -- ordinary Dirichlet conductor.
+	    // As in build_mesh_parallel_thread_3d().
 	    uint32_t nid;
 	    if( _bound[a+6].type() == BOUND_DIELECTRIC )
 		nid = SMESH_NODE_ID_PURE_VACUUM | (uint32_t)(a+7);
@@ -1570,8 +1426,6 @@ void Geometry::build_mesh_parallel_thread_2d( void )
 		    Vec3D x( i*_h+_origo[0], j*_h+_origo[1] );
 		    if( solid->inside( x ) ) {
 			mesh(i,j) = nid;
-			// See build_mesh_parallel_thread_3d() -- _material's
-			// doc comment.
 			_material[i + j*_size[0]] = (uint8_t)(a+7);
 		    }
 		}
@@ -1580,11 +1434,8 @@ void Geometry::build_mesh_parallel_thread_2d( void )
     }
     t_solid.stop();
 
-    // Fix up any dielectric solid that reaches the box edge -- see the
-    // doc comment on override_dielectric_box_boundary_3d() (same
-    // rationale, 2d/CYL). Must run *before* build_mesh_parallel_prepare_2d()
-    // -- see the comment at the equivalent call in
-    // build_mesh_parallel_thread_3d().
+    // Has to be done before build_mesh_parallel_prepare_2d(), see the
+    // header.
     Timer t_boxfix;
     override_dielectric_box_boundary_2d();
     t_boxfix.stop();
@@ -1627,19 +1478,15 @@ void Geometry::build_mesh_parallel_thread_1d( void )
 	double x = i*_h+_origo[0];
 	uint32_t nid = inside( Vec3D(x) );
 	if( nid ) {
-	    // See build_mesh_parallel_thread_3d() for the dielectric and
-	    // Neumann-mask rationale.
+	    // As in build_mesh_parallel_thread_3d().
 	    if( _bound[nid-1].type() == BOUND_DIELECTRIC )
 		mesh(i) = SMESH_NODE_ID_PURE_VACUUM | nid;
 	    else if( nid >= 7 && _bound[nid-1].type() == BOUND_NEUMANN )
 		mesh(i) = SMESH_NODE_ID_NEUMANN_MASK | nid;
 	    else
 		mesh(i) = SMESH_NODE_ID_DIRICHLET | nid;
-	    // nid here can also be 1-6 (a box face, from inside()'s own
-	    // boundary fallback -- see its doc comment) which is not a
-	    // real user-defined solid; only >=7 belongs in _material.
-	    // See build_mesh_parallel_thread_3d() for _material's
-	    // rationale generally.
+	    // inside() returns 1-6 outside the simulation box, which is
+	    // not a solid.
 	    if( nid >= 7 )
 		_material[i] = (uint8_t)nid;
 	} else {
@@ -1647,11 +1494,8 @@ void Geometry::build_mesh_parallel_thread_1d( void )
 	}
     }
 
-    // Fix up any dielectric solid that reaches the box edge -- see the
-    // doc comment on override_dielectric_box_boundary_3d() (same
-    // rationale, 1d). Must run *before* build_mesh_parallel_prepare_1d()
-    // -- see the comment at the equivalent call in
-    // build_mesh_parallel_thread_3d().
+    // Has to be done before build_mesh_parallel_prepare_1d(), see the
+    // header.
     override_dielectric_box_boundary_1d();
 
     // Mark rest of mesh nodes and prepare for building near solid data
@@ -1666,120 +1510,6 @@ void Geometry::build_mesh_parallel_thread_1d( void )
 	    build_mesh_parallel_near_solid( index, i, 0, 0 );
 	}
     }
-}
-
-
-/* Give a Neumann solid's OUTERMOST LAYER of nodes back to the solve.
- *
- * A node-centred mirror needs its symmetry plane to sit ON a node that is
- * still solved: set_link() eliminates the ghost behind the mask with
- * phi_ghost := phi_mirror, so the zero-derivative plane lies exactly on the
- * last live node, and that node owns half a control volume (hence the
- * factor of two scharge_correct_neumann_mask() applies to it).
- *
- * Tagging EVERY node of the solid as masked therefore forces a choice
- * between two wrong things: either the solid is defined to stop one node
- * short of its real surface -- which is what a driver writing "x > box_x"
- * does -- and then no node carries the solid's material where the surface
- * actually is, so particle code keyed on material() cannot see the entry
- * face and only notices a cell later; or the solid includes the surface
- * node and the field's mirror plane slides a cell inward, which is the
- * field/particle mismatch set_link() warns about.
- *
- * Neither is necessary, because "in a solid" and "eliminated from the
- * solve" are already independent in this library -- a BOUND_DIELECTRIC
- * interior is tagged SMESH_NODE_ID_PURE_VACUUM with its material number
- * set, and is solved. The same split is applied here: the layer of the
- * Neumann solid that touches anything else keeps its material but goes
- * back to being an ordinary solved node, and only the interior stays
- * masked. Then material() marks the true surface (so a particle crossing
- * it is tested on the crossing that enters it, not a cell late) and the
- * mirror plane lands on that same surface.
- *
- * Only in-mesh neighbours count. A mask running out to the simulation box
- * edge has no outward neighbour there, and must stay masked rather than
- * exposing a live shell along the box wall.
- *
- * A mask one node thick would become entirely surface and so entirely
- * live, leaving no ghost to mirror against. Such a mask cannot represent a
- * symmetry plane at any resolution and is a modelling error rather than a
- * case to handle here.
- */
-void Geometry::neumann_surface_retag( void )
-{
-    bool any = false;
-    for( uint32_t a = 0; a < _n; a++ )
-	if( _neumann[a] )
-	    any = true;
-    if( !any )
-	return;
-
-    const int32_t nx = _size[0], ny = _size[1], nz = _size[2];
-    const bool is3d = ( _geom_mode == MODE_3D );
-    std::vector<uint32_t> retag;
-
-    for( int32_t k = 0; k < (is3d ? nz : 1); k++ ) {
-	for( int32_t j = 0; j < ny; j++ ) {
-	    for( int32_t i = 0; i < nx; i++ ) {
-		/* Never retag a node lying ON a simulation box face. Two
-		 * separate things break if we do, and both are silent:
-		 *
-		 * 1. A PURE_VACUUM tag is a promise that all six (four in
-		 *    2D) neighbours exist -- add_vacuum_node() builds the
-		 *    full stencil unconditionally, so on a face it indexes
-		 *    off the end of the mesh. That is the crash, not a
-		 *    wrong answer.
-		 * 2. EpotSolver::postprocess() only converts PURE_VACUUM_FIX
-		 *    back to a live tag AWAY from the faces (face nodes are
-		 *    restored by its per-boundary loops, keyed on the box's
-		 *    own boundary type). A retagged face node forced by
-		 *    force_pot_func/init_plasma_func would be stranded with
-		 *    a FIX tag that the next preprocess() rejects.
-		 *
-		 * A face node's tag already encodes the box's own boundary
-		 * condition, which is what the one-sided stencils there are
-		 * built from; the mask keeps it out of the solve, exactly as
-		 * before this pass existed. _material still marks it as
-		 * inside the solid, so the particle side is unaffected. */
-		if( i == 0 || i == nx-1 || j == 0 || j == ny-1 ||
-		    ( is3d && ( k == 0 || k == nz-1 ) ) )
-		    continue;
-
-		const uint32_t ptr = i + j*nx + k*nx*ny;
-		const uint32_t m = _material[ptr];
-		if( m == 0 || !solid_is_neumann( m ) )
-		    continue;
-		if( (_smesh[ptr] & SMESH_NODE_ID_MASK) != SMESH_NODE_ID_NEUMANN_MASK )
-		    continue;
-
-		bool surface = false;
-		const int32_t di[6] = { -1, 1, 0, 0, 0, 0 };
-		const int32_t dj[6] = { 0, 0, -1, 1, 0, 0 };
-		const int32_t dk[6] = { 0, 0, 0, 0, -1, 1 };
-		for( int d = 0; d < ( is3d ? 6 : 4 ) && !surface; d++ ) {
-		    int32_t ni = i+di[d], nj = j+dj[d], nk = k+dk[d];
-		    if( ni < 0 || nj < 0 || nk < 0 ||
-			ni >= nx || nj >= ny || ( is3d && nk >= nz ) )
-			continue;                       // outside the mesh
-		    if( _material[ni + nj*nx + nk*nx*ny] != m )
-			surface = true;
-		}
-		if( surface )
-		    retag.push_back( ptr );
-	    }
-	}
-    }
-
-    /* Bare PURE_VACUUM, dropping the mask tag's solid number: on a vacuum
-     * tag those low bits mean "dielectric solid number" instead (see
-     * build_mesh_parallel_thread_3d()), and a Neumann solid is not a
-     * dielectric. The node's true solid number is still in _material,
-     * which is where every caller that wants it looks. */
-    for( size_t a = 0; a < retag.size(); a++ )
-	_smesh[retag[a]] = SMESH_NODE_ID_PURE_VACUUM;
-
-    ibsimu.message( 1 ) << "  Neumann surface layer: " << retag.size()
-			<< " nodes returned to the solve\n";
 }
 
 
@@ -1807,9 +1537,7 @@ const std::vector<std::pair<uint32_t,uint8_t> > &Geometry::mask_face_nodes( void
 
     _mask_face_nodes.clear();
 
-    // Cheap rejection first: no solid carries BOUND_NEUMANN, so there is
-    // nothing to find and the O(N) sweep below is skipped entirely. This is
-    // the common case and it should cost almost nothing.
+    // Nothing to do without a Neumann mask.
     bool any = false;
     for( uint32_t n = 7; n <= _n+6 && !any; n++ )
 	any = ( _bound[n-1].type() == BOUND_NEUMANN );
@@ -1850,19 +1578,17 @@ const std::vector<std::pair<uint32_t,uint8_t> > &Geometry::mask_face_nodes( void
 }
 
 
-/* See the doc comment on validate_neumann_mask_alignment() in the header. */
 void Geometry::validate_neumann_mask_alignment( void ) const
 {
-    // Cheap rejection: nothing to check unless some solid is a mask.
+    // Nothing to do without a Neumann mask.
     bool any = false;
     for( size_t a = 0; a < _neumann.size() && !any; a++ )
 	any = _neumann[a];
     if( !any )
 	return;
 
-    // Same order as entering_mask()'s probe: a surface closer than this to
-    // a node behaves exactly as if it sat on the node, because that probe
-    // is what decides inside/outside at a crossing.
+    // The distance at which ParticleIterator::entering_mask() probes for
+    // the mask. A surface closer than this to a node is on the node.
     const double tol = 1.0e-3*_h;
     const bool is3d = ( _geom_mode == MODE_3D );
     const int naxes = ( _geom_mode == MODE_1D ) ? 1 : ( is3d ? 3 : 2 );
@@ -1873,8 +1599,7 @@ void Geometry::validate_neumann_mask_alignment( void ) const
 
 	int32_t imin, imax, jmin, jmax, kmin, kmax;
 	solid_node_range( _sdata[n-7], imin, imax, jmin, jmax, kmin, kmax );
-	// One node of slack: the transition sits between an outside node and
-	// an inside one, and the outside node can lie just beyond the bbox.
+	// One node more, to have the last node outside the solid as well.
 	if( imin > 0 ) imin--;
 	if( jmin > 0 ) jmin--;
 	if( kmin > 0 ) kmin--;
@@ -1967,8 +1692,6 @@ void Geometry::build_mesh( void )
     for( uint32_t a = 0; a < _n; a++ )
 	_neumann[a] = ( _bound[a+6].type() == BOUND_NEUMANN );
 
-    // Node classification is about to change, so the derived mask-face
-    // list must be rebuilt on next use.
     _mask_face_nodes_valid = false;
     _mask_face_nodes.clear();
 
@@ -1982,33 +1705,11 @@ void Geometry::build_mesh( void )
 	    throw( Error( ERROR_LOCATION, "solid " + to_string(a) + " not defined" ) );
     }
 
-    // A Neumann mask must be node-aligned -- see
-    // validate_neumann_mask_alignment(). Checked BEFORE tagging so a
-    // modelling mistake is named here rather than surfacing later as a
-    // space charge that sags towards the mask.
     validate_neumann_mask_alignment();
 
     _built = true;
+    _revision++;
     build_mesh_parallel();
-
-    // neumann_surface_retag() is deliberately NOT called any more.
-    //
-    // It returned the mask's surface layer to the solve, which did two
-    // things: it moved the field's mirror plane one node OUTWARD from the
-    // node where entering_mask() reflects particles, and it stripped the
-    // SMESH_NODE_ID_NEUMANN_MASK tag that mask_face_nodes() tests for when
-    // collecting the nodes needing the half-control-volume *= 2. With that
-    // tag gone the sweep found almost nothing (1 node on a mask with ~90
-    // faces), so scharge_correct_neumann_mask() became a no-op and the
-    // space charge next to a mask read a factor of two low -- which looks
-    // exactly like particles being absorbed there, though none are.
-    //
-    // With alignment enforced above the retag is unnecessary: the ghost
-    // stays masked, set_link() mirrors about the last live node, and that
-    // node gets its factor of two. The function is retained for reference;
-    // is_neumann_surface() consequently returns false everywhere, which
-    // makes its two call sites (epot_solver.cpp's forcing exclusion and
-    // scharge_clear_solid_nodes()'s 3D exception) correctly inert.
 
     // Report node counts
     int b;
@@ -2339,29 +2040,15 @@ uint8_t Geometry::mc_case( int32_t i, int32_t j, int32_t k ) const
     std::cout << "mc_case( " << i << ", " << j << ", " << k << " ) ";
 #endif
 
-    // Go through mesh nodes surrounding cube (i,j,k). Uses _material
-    // directly (real solid membership, conductor or dielectric alike,
-    // independent of any stencil-tag reclassification) rather than
-    // SMESH_NODE_IS_SOLID_MATERIAL(_smesh[...]), which is blind exactly
-    // at a solid that reaches the simulation box edge -- see
-    // _material's doc comment.
+    // Go through mesh nodes surrounding cube (i,j,k). The solid of a
+    // node is read from _material, which is valid also at the edge of
+    // the simulation box, see its documentation.
     uint8_t res = 0;
     uint32_t ptr = (k*_size[1] + j)*_size[0] + i;
 
-    /* A node counts as surface-bearing only if its solid is TRIANGULATED.
-     * Analytic solids are intersected in closed form by the particle
-     * iterator -- exactly, corners included -- so triangulating them would
-     * only substitute a node-plane staircase for their true surface. */
-/* A node counts as surface-bearing only if its solid is TRIANGULATED.
-     * Analytic solids are intersected in closed form by the particle
-     * iterator -- exactly, corners included -- so triangulating them would
-     * only substitute a node-plane staircase for their true surface.
-     *
-     * They must NOT be left in as a belt-and-braces second net: get_solid_mc()
-     * attributes a triangle hit only to a triangulated solid, so a mask
-     * triangle would report solid 0, read as "no collision", and the
-     * particle would pass clean through. Measured that way: 414 of 10368
-     * trajectories leaked into the mask instead of 17. */
+    // Analytic solids are left out of the triangulated surface. The
+    // particle iterator intersects them exactly, and get_solid_mc() does
+    // not find the solid of a triangle that belongs to one.
 #define mc_solid(m) ( (m) != 0 && !solid_is_analytic( m ) )
 
     // Node 1 (i,j,k)
@@ -2662,8 +2349,6 @@ void Geometry::build_surface( void )
 
 uint8_t Geometry::surface_cell_face_case_2d( const int32_t i[3], const int32_t vb[3] ) const
 {
-    // Uses _material directly instead of SMESH_NODE_IS_SOLID_MATERIAL --
-    // see mc_case()'s comment / _material's doc comment.
     int res = 0;
     int32_t j[3] = { i[0], i[1], i[2] };
 
@@ -3015,10 +2700,6 @@ uint32_t Geometry::surface_inside( const Vec3D &x ) const
 
 uint32_t Geometry::surface_inside_solid_number( int32_t i, int32_t j,int32_t k ) const
 {
-    // Uses _material directly (already the real solid number itself,
-    // no mask needed) instead of SMESH_NODE_IS_SOLID_MATERIAL +
-    // SMESH_BOUNDARY_NUMBER_MASK -- see mc_case()'s comment /
-    // _material's doc comment.
     uint32_t ptr = (k*_size[1] + j)*_size[0] + i;
     if( _material[ptr] != 0 )
 	return( _material[ptr] );
@@ -3146,50 +2827,16 @@ int32_t Geometry::surface_trianglec( int32_t i, int32_t j, int32_t k ) const
 }
 
 
-/* See the doc comment in the header. */
-/* dielectric_material_at() is now defined inline in geometry.hpp -- see
- * its doc comment there for why. */
-
-
 uint8_t Geometry::solid_dist( uint32_t i, uint32_t j, uint32_t k, uint32_t dir ) const
 {
     uint32_t snode = _smesh[i + j*_size[0] + k*_size[0]*_size[1]];
 
-    /* A face against a Neumann mask: the surface is ON the live node, so
-     * the cut distance measured from it is zero.
-     *
-     * This is not a convention picked for convenience -- it is the same
-     * one the field solve uses. EpotMatrixSolver::set_link() eliminates
-     * the ghost behind a mask with phi_ghost := phi_mirror, a NODE-CENTRED
-     * mirror whose zero-derivative plane lies exactly on the last live
-     * node (see that function; the factor of two on one neighbour is its
-     * signature). mc_surface() parameterises every edge so that dist = 0
-     * places the vertex at the VACUUM node, which is that same plane. So
-     * the triangulated surface a particle reflects off and the plane the
-     * potential is mirrored about are the same surface, by construction.
-     *
-     * Without this, solid_dist() falls through to the on-demand dielectric
-     * bisection, finds neither side dielectric -- masked nodes carry no
-     * _material and get no _nearsolid entry, because masks deliberately
-     * bypass the cut-cell machinery -- and throws "not a near solid node".
-     * That is what build_surface() used to die with on any 3D geometry
-     * containing a mask.
-     *
-     * The zero is only exact while the mask surface is node-aligned, which
-     * is a requirement of the node-centred mirror anyway: a mask cutting
-     * through a cell would need the stencil, the half-control-volume
-     * space-charge weight (scharge_correct_neumann_mask()) and this
-     * distance to agree on the same fraction, and nothing arranges that.
-     * Drivers snap mask faces onto node planes for exactly this reason.
-     */
+    // The surface of a Neumann mask is on the last free node, where the
+    // potential solver has its symmetry plane (EpotMatrixSolver::
+    // set_link()), so the distance is zero from either side.
     if( SMESH_NODE_IS_NEUMANN_MASK( snode ) )
 	return( 0 );
-    /* Same for any ANALYTIC solid: they are excluded from the
-     * marching-cubes surface (see mc_case()), carry no _nearsolid entry,
-     * and are intersected in closed form by the particle iterator instead.
-     * Guarding only the Neumann case would leave a Dirichlet FuncSolid --
-     * ECR's solid_outer(), for instance -- to fall through to the
-     * dielectric bisection and throw "not a near solid node". */
+    // Analytic solids are not triangulated, see mc_case().
     if( solid_is_analytic( _material[i + j*_size[0] + k*_size[0]*_size[1]] ) )
 	return( 0 );
     {
@@ -3225,38 +2872,14 @@ uint8_t Geometry::solid_dist( uint32_t i, uint32_t j, uint32_t k, uint32_t dir )
 	if( (neighbours & 0x01) != 0x00 )
 	    return( *nptr );
 
-	// Cached near-solid data exists for this node (it has a real
-	// conductor neighbour in some *other* direction -- that's why
-	// it's tagged NEAR_SOLID at all), but not for this particular
-	// direction. add_near_solid_entry()/build_mesh_parallel_prepare_
-	// near_solid() cache *every* direction that has a conductor
-	// neighbour (is_solid()), so a missing bit here means whatever
-	// mc_case() saw as "solid material" this way cannot be a
-	// conductor -- it must be a dielectric surface along a
-	// different axis than whichever conductor got this node
-	// classified NEAR_SOLID in the first place (that relationship
-	// is never cached in _nearsolid, same as for a node that isn't
-	// NEAR_SOLID-tagged at all -- see below). Fall through to the
-	// same on-demand bisection used for that case, rather than
-	// throwing.
+	// The node is near an electrode in some other direction. In this
+	// direction the surface is that of a dielectric, see below.
     }
 
-    // Not a cached near-solid *direction* (either this node isn't
-    // NEAR_SOLID-tagged at all, or it is but not for this axis -- see
-    // above). This is expected next to a dielectric surface: a
-    // dielectric solid's interior stays plain SMESH_NODE_ID_PURE_VACUUM
-    // (see build_mesh_parallel_thread_3d()), never reclassified
-    // SMESH_NODE_ID_NEAR_SOLID the way a conductor's boundary layer is,
-    // so no fractional distance is cached in _nearsolid for it -- yet
-    // surface_trianglec()/mc_case() (via SMESH_NODE_IS_SOLID_MATERIAL)
-    // now correctly triangulate a dielectric surface too, and need this
-    // distance to place the vertex. Resolve it on demand instead of
-    // from the cache, by bisecting against whichever side (this node or
-    // its neighbour in direction dir) is dielectric material -- same
-    // approach as EpotMatrixSolver::vacuum_face_coefficient() uses for
-    // the matrix coefficients, see that function's doc comment for why
-    // the bisection has to run from whichever side is geometrically
-    // outside the target solid.
+    // No near-solid data in this direction: the surface is that of a
+    // dielectric, which has none. The distance is found by bisection from
+    // the node that is outside the solid, as in EpotMatrixSolver::
+    // vacuum_face_coefficient().
     int32_t ni = i, nj = j, nk = k;
     int sign = 0, coord = 0;
     switch( dir ) {
@@ -3273,10 +2896,10 @@ uint8_t Geometry::solid_dist( uint32_t i, uint32_t j, uint32_t k, uint32_t dir )
     uint32_t nb_mat = dielectric_material_at( ni, nj, nk );
 
     if( self_mat == 0 && nb_mat == 0 )
-	throw( Error( ERROR_LOCATION, "not a near solid node" ) ); // genuinely neither side is a dielectric
+	throw( Error( ERROR_LOCATION, "not a near solid node" ) );
 
     uint32_t bisect_solid = ( self_mat != 0 ) ? self_mat : nb_mat;
-    double alpha; // fraction in (0,1], bracket_ndist()'s 1-255 byte divided by 255
+    double alpha;
     if( bisect_solid == self_mat )
 	alpha = 1.0 - bracket_ndist( ni, nj, nk, bisect_solid, -sign, coord )/255.0;
     else
@@ -3347,13 +2970,7 @@ void Geometry::save( std::ostream &os, bool save_solids ) const
     write_compressed_block( os, _nearsolid.size()*sizeof(uint8_t),
 			    (int8_t *)&_nearsolid[0] );
 
-    // _material has to be serialized explicitly here (unlike a "just call
-    // populate_material_array() again on load" scheme) because it's built
-    // from live Solid::inside() queries against _sdata, and save_solids is
-    // false in every real caller in this codebase -- so on load _sdata is
-    // all NULL placeholders (FILEID_NULL) and there is no solid geometry
-    // left to re-derive it from. See the istream constructor's matching
-    // read and _material's own doc comment.
+    // _material can not be remade at loading if the solids are not saved.
     write_compressed_block( os, _material.size()*sizeof(uint8_t),
 			    (int8_t *)&_material[0] );
 }

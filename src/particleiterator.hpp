@@ -310,67 +310,24 @@ template <class PP> class ParticleIterator {
     double                     _epsrel;        /*!< \brief Relative error limit. */
     uint32_t                   _maxsteps;      /*!< \brief Maximum number of simulation steps for particle. */
     double                     _maxt;          /*!< \brief Maximum particle lifetime. */
-    /*! \brief Zero-length collision brackets seen by this iterator.
-     *
-     *  Rate-limits the warning in check_collision_solid(). Particle
-     *  iteration is threaded and there is one iterator per thread, so a
-     *  plain member needs no locking. A default member initialiser is used
-     *  rather than an entry in the constructor's init list, which would
-     *  have to be kept in declaration order to avoid -Wreorder. */
-    uint32_t                   _degenerate_bracket = 0;
-
-    /*! \brief Particles killed by step-size underflow on this thread.
-     *
-     *  Rate-limits the warning. One iterator per thread, so no locking. */
-    uint32_t                   _stuck_reported = 0;
-
-    /*! \brief Reflect particles at Neumann masks, or absorb them?
-     *
-     *  A mask is a symmetry surface, so true is the physically correct
-     *  setting and the default. false restores the old (wrong) behaviour in
-     *  which a mask absorbed like any other solid.
-     *
-     *  It exists as a DIAGNOSTIC. Reflection closes what was an artificial
-     *  loss channel, which raises the space charge near the mask; if a run
-     *  becomes unstable after enabling it, this separates "the extra charge
-     *  is real and the parameter set is space-charge limited" from "the
-     *  reflection itself is misbehaving". The field-side treatment is
-     *  untouched either way -- the stencil stays Neumann -- so the two
-     *  halves of the change can be tested independently.
-     */
-    bool                       _mask_reflect = true;
+    uint32_t                   _degenerate_bracket = 0; /*!< \brief Zero-length collision brackets seen,
+							 *   limits the warning. */
+    uint32_t                   _stuck_reported = 0;     /*!< \brief Step size underflows seen,
+							 *   limits the warning. */
+    bool                       _mask_reflect = true;    /*!< \brief Reflect particles at Neumann masks
+							 *   (default). If false, a mask absorbs
+							 *   like any other solid. */
 
     bool                       _save_points;   /*!< \brief Save all points? */
     uint32_t                   _trajdiv;       /*!< \brief Divisor for saved trajectories,
 					        * if 3, every third trajectory is saved. */
     bool                       _mirror[6];     /*!< \brief Is particle mirrored on boundary? */
 
-    /*! \brief Which user solids are Neumann masks, indexed by (n - 7).
-     *
-     *  Cached once in the constructor. Geometry::get_boundary() returns a
-     *  Bound by value and range-checks every call, which is the wrong shape
-     *  for a test in the trajectory inner loop.
-     */
-    std::vector<bool>          _mask_solid;
-    bool                       _have_analytic;  /*!< \brief Any analytic solid at all. */
-    std::vector<uint32_t>      _analytic_solid; /*!< \brief Solid numbers with an
-						  *   analytic surface. Tested directly,
-						  *   never via node materials -- see
-						  *   check_collision_surface(). */
-    bool                       _mask_reflected; /*!< \brief Set by check_collision_*()
-						  *   when the crossing it found was a
-						  *   Neumann mask, so the caller reflects
-						  *   instead of absorbing. */
-
-    /*! \brief Does this geometry contain ANY Neumann mask?
-     *
-     *  Short-circuits the mask test in handle_trajectory_advance(). Without
-     *  it every mesh-face crossing in every simulation would pay for 4 (2D)
-     *  or 8 (3D) mesh_check() lookups that can only ever return false --
-     *  a small but unnecessary tax on the overwhelming majority of runs,
-     *  which have no mask at all.
-     */
-    bool                       _have_mask;
+    std::vector<uint32_t>      _mask_solid;     /*!< \brief Solid numbers of the Neumann masks. */
+    std::vector<uint32_t>      _analytic_solid; /*!< \brief Solid numbers of the solids with an
+						 *   analytic surface. */
+    bool                       _mask_reflected; /*!< \brief Set by check_collision_surface() if it
+						 *   reflected the particle from a Neumann mask. */
     bool                       _surface_collision;
 
     ParticleIteratorData       _pidata;        /*!< \brief User data provided to PP::get_derivatives(). */
@@ -388,16 +345,8 @@ template <class PP> class ParticleIterator {
 
     ParticleStatistics         _stat;          /*!< \brief Particle statistics. */
 
-    /* Timing accumulators for particle mover sub-timing. Each
-     * ParticleIterator instance lives on exactly one thread for its
-     * whole lifetime (see Scheduler usage in
-     * ParticleDataBaseImp::iterate_trajectories()/step_particles()),
-     * so these are plain doubles with no synchronization -- they are
-     * summed across all per-thread instances by the caller after
-     * Scheduler::finish(), mirroring the existing _stat accumulation
-     * pattern. Reset to zero in the constructor only; not meant to be
-     * reset per trajectory (final totals are read once at the end of
-     * the whole iterate_trajectories()/step_particles() call). */
+    /* Timing accumulators. An iterator serves one thread only, so they
+     * need no locking. The caller sums them over the iterators. */
     double                     _time_ode;        /*!< \brief Time spent in gsl_odeiv2_evolve_apply() (ODE stepping). */
     double                     _time_trajhandle;  /*!< \brief Time spent in handle_trajectory() (collision detection + space charge deposition). */
 
@@ -414,14 +363,6 @@ template <class PP> class ParticleIterator {
 	}
     }
 
-    /*! \brief Return solid number from nodes around cube (i,j,k).
-     *
-     *  Reads Geometry::material() directly (real solid membership,
-     *  conductor or dielectric alike, independent of any stencil-tag
-     *  reclassification) instead of SMESH_NODE_IS_SOLID_MATERIAL on the
-     *  raw mesh tag, which is blind exactly at a solid that reaches the
-     *  simulation box edge -- see Geometry's _material doc comment.
-     */
     /*! \brief Outward surface normal of analytic solid \a n at \a p, by
      *  differencing the indicator. On a face this is exactly the axis
      *  normal, which is what a box-shaped mask needs. */
@@ -441,9 +382,8 @@ template <class PP> class ParticleIterator {
 	return( nv );
     }
 
-    /*! \brief First TRIANGULATED solid at cube (i,j,k), 0 if none. A
-     *  triangle hit must be attributed to a solid that is actually in the
-     *  surface, which get_solid() does not guarantee. */
+    /*! \brief First triangulated solid with a node on cube (i,j,k), 0 if
+     *  none. A triangle hit in the cube is attributed to it. */
     uint32_t get_solid_mc( int i, int j, int k ) {
 	for( int cz = 0; cz < 2; cz++ )
 	    for( int cy = 0; cy < 2; cy++ )
@@ -452,38 +392,6 @@ template <class PP> class ParticleIterator {
 		    if( m != 0 && !_pidata._geom->solid_is_analytic( m ) )
 			return( m );
 		}
-	return( 0 );
-    }
-
-    uint32_t get_solid( int i, int j, int k ) {
-	uint32_t m;
-	if( PP::dim() == 2 ) {
-	    if( (m = _pidata._geom->material( i, j )) != 0 )
-		return( m );
-	    if( (m = _pidata._geom->material( i+1, j )) != 0 )
-		return( m );
-	    if( (m = _pidata._geom->material( i, j+1 )) != 0 )
-		return( m );
-	    if( (m = _pidata._geom->material( i+1, j+1 )) != 0 )
-		return( m );
-	} else {
-	    if( (m = _pidata._geom->material( i, j, k )) != 0 )
-		return( m );
-	    if( (m = _pidata._geom->material( i+1, j, k )) != 0 )
-		return( m );
-	    if( (m = _pidata._geom->material( i, j+1, k )) != 0 )
-		return( m );
-	    if( (m = _pidata._geom->material( i+1, j+1, k )) != 0 )
-		return( m );
-	    if( (m = _pidata._geom->material( i, j, k+1 )) != 0 )
-		return( m );
-	    if( (m = _pidata._geom->material( i+1, j, k+1 )) != 0 )
-		return( m );
-	    if( (m = _pidata._geom->material( i, j+1, k+1 )) != 0 )
-		return( m );
-	    if( (m = _pidata._geom->material( i+1, j+1, k+1 )) != 0 )
-		return( m );
-	}
 	return( 0 );
     }
 
@@ -517,17 +425,11 @@ template <class PP> class ParticleIterator {
 	DEBUG_MESSAGE( "v1 = " << v1 << "\n" );
 	DEBUG_MESSAGE( "v2 = " << v2 << "\n" );
 
-	/* One search over every solid touching this cube, each intersected
-	 * by the method its representation calls for, NEAREST hit wins.
-	 *
-	 * get_solid() reports whichever solid owns the first non-vacuum
-	 * corner, which is arbitrary when a cube touches two -- and if one
-	 * is a Neumann mask and the other an electrode, that arbitrary
-	 * choice decides between reflecting and absorbing. Taking the
-	 * smallest parametric distance answers it properly: whichever
-	 * surface the particle reaches first acts on it. Both stages report
-	 * t measured from x1, so they are directly comparable.
-	 */
+	/* Every solid that can be met in this cube is tested and the
+	 * nearest hit wins: a cube can touch a mask and an electrode at
+	 * once, and the surface reached first decides between reflection
+	 * and absorption. Both tests below give the hit as the fraction t
+	 * of the way from x1 to x2. */
 	double tbest = 2.0;
 	uint32_t sbest = 0;
 	Vec3D nbest;
@@ -536,41 +438,22 @@ template <class PP> class ParticleIterator {
 	double k1best = 0.0, k2best = 0.0;
 	PP xbest;
 
-	/* (a) ANALYTIC solids -- every one of them, tested directly.
-	 *
-	 * Deliberately NOT filtered by the node materials of this cube, and
-	 * that is the whole point. An analytic solid's surface sits on the
-	 * plane of the LAST LIVE NODE -- that is what makes it agree with
-	 * set_link()'s node-centred mirror -- so the face a particle crosses
-	 * to enter it has no solid node on it at all. Deriving the candidate
-	 * list from node materials therefore misses the entry completely and
-	 * only notices one cell later, by which point the particle has been
-	 * inside for a whole cell and may have left the solid's z range
-	 * entirely. Traced on this geometry: a particle stepping
-	 * x = 8.9866 -> 9.0132 mm crosses box_x = 9.0 (node 36, live; first
-	 * masked node 37 at 9.25) and was never tested, then passed z = 0
-	 * where the mask ends. 17 trajectories in 10368 escaped that way.
-	 *
-	 * There are only ever a handful of analytic solids and each test is
-	 * a closed-form predicate, so testing all of them on every crossing
-	 * costs about what the old entering_mask() pre-check did -- which
-	 * was likewise ungated, for exactly this reason. */
+	/* Analytic solids, all of them. They cannot be selected by the
+	 * node materials of the cube: the surface of an analytic solid is
+	 * on the plane of its last free node (set_link() mirrors about
+	 * that node), so the face through which a particle enters it has
+	 * no solid node. */
 	for( size_t q = 0; q < _analytic_solid.size(); q++ ) {
 	    const uint32_t m = _analytic_solid[q];
 
-	    /* Must be a CROSSING. Without the v1 test a particle already
-	     * inside re-triggers on every later crossing, and
-	     * bracket_surface() would be asked to bracket between two
-	     * points that are both inside -- it assumes the second is
-	     * outside -- returning a meaningless surface point that never
-	     * extracts the particle. */
+	    /* Only an entry is a hit. bracket_surface() needs x1 to be
+	     * outside the solid. */
 	    if( _pidata._geom->inside( m, v1 ) )
 		continue;
 
-	    /* Probe just PAST the crossing: the surface lies exactly on the
-	     * node plane the crossing lands on, where the solid's predicate
-	     * is boundary-degenerate (solid_plasma_box() tests x > box_x
-	     * strictly), so testing v2 itself would miss the entry. */
+	    /* The end of the segment is probed slightly past x2: x2 is on
+	     * the node plane where the surface is, and the solid may not
+	     * count that plane as inside. */
 	    Vec3D dseg = v2-v1;
 	    double dl = dseg.norm2();
 	    Vec3D probe = v2;
@@ -598,8 +481,7 @@ template <class PP> class ParticleIterator {
 	    }
 	}
 
-	/* (b) TRIANGULATED solids: marching-cubes triangles for this cube.
-	 * Keeps the nearest rather than stopping at the first. */
+	/* Triangulated solids: the surface triangles of this cube. */
 	int32_t tric = _pidata._geom->surface_trianglec( i[0], i[1], i[2] );
 	int32_t ptr = _pidata._geom->surface_triangle_ptr( i[0], i[1], i[2] );
 
@@ -652,9 +534,9 @@ template <class PP> class ParticleIterator {
 		break;
 	}
 
-	/* The type check, on the solid actually reached first. Neumann is a
-	 * symmetry surface: reflect. Anything else absorbs. */
-	if( is_mask_solid( sbest ) ) {
+	/* A Neumann mask is a symmetry surface and reflects the particle.
+	 * Any other solid absorbs it. */
+	if( _mask_reflect && is_mask_solid( sbest ) ) {
 	    Vec3D n = nbest_valid ? nbest
 				  : analytic_normal( sbest, status_x.location() );
 	    double nn = n.norm2();
@@ -711,40 +593,10 @@ template <class PP> class ParticleIterator {
 	Vec3D vc;
 	Vec3D v1 = x1.location();
 
-	// DEGENERATE INTERVAL: x1 and x2 are the same point.
-	//
-	// bracket_surface() throws "xin and xout are the same point" on this,
-	// because its return value is a parametric fraction along the segment,
-	//     (xsurf[a] - xin[a]) / (xout[a] - xin[a])
-	// taken on the axis of largest coordinate difference -- and that axis
-	// has zero extent. K is then used just below to interpolate the FULL
-	// particle state (time and velocity included, not only position) onto
-	// the solid surface, which is what makes absorption sub-cell accurate.
-	//
-	// With a zero-length segment there is no fraction to find, but the
-	// answer is already known: the inside() test above returned bound >= 7,
-	// so this point lies in a real solid, and K = 0 (status_x = x2) is what
-	// a converged bisection returns when the inside point IS the surface.
-	//
-	// CAUSE NOT YET ESTABLISHED. It first appeared at h = 0.5*debye, having
-	// never occurred at 5*debye. Note what the condition actually requires:
-	// x1 == x2 AND that point inside a solid, which also means x1 was inside
-	// the solid -- violating this function's stated precondition that x1 is
-	// in vacuum. So something upstream handed it a segment it should not
-	// have. Two things worth knowing while diagnosing:
-	//
-	//   - Geometry::inside() scans solids BACKWARDS, so the highest-numbered
-	//     solid is tested first. In the cut driver that is 12, the Neumann
-	//     mask -- the newest and least-exercised path.
-	//   - handle_mask_reflection() mirrors about the crossing point with
-	//     x2[2a+1] = 2*xmirror - x2[2a+1]. If x2 already sits on that plane
-	//     the mirror is a no-op in POSITION and flips only the velocity,
-	//     leaving the particle where it was and still inside the mask.
-	//
-	// The warning below prints both endpoints, the solid and the velocity
-	// precisely so this can be settled from one run rather than reasoned
-	// about. If the reported solid is 12 and the location is at
-	// r ~ enclosed_r with x < 0, it is the mask reflection.
+	// x1 and x2 can be the same point, which bracket_surface() cannot
+	// bracket. The point is inside the solid, so the collision is
+	// taken to be there (K = 0). It also means that x1 was not in
+	// vacuum as it should be, hence the warning.
 	if( v1 == v2 && _degenerate_bracket < 10 ) {
 	    _degenerate_bracket++;
 	    ibsimu.message( MSG_WARNING, 1 )
@@ -801,88 +653,43 @@ template <class PP> class ParticleIterator {
     }
 
 
-    /*! \brief Reflect the trajectory at a mirror simulation box boundary.
+    /*! \brief End the current step at mesh crossing \a c.
      *
-     *  The particle is STOPPED on the wall, not mirrored past it: it is
-     *  placed on the crossing point with the normal velocity reversed, the
-     *  mesh index advance is undone, and the rest of this step's crossings
-     *  are discarded. This is exactly what handle_mask_reflection() does at
-     *  a Neumann mask -- see its comment for the reasoning -- and the point
-     *  of doing it here too is that the two are now the SAME operation.
-     *
-     *  What this replaces: handle_mirror() reflected the OVERSHOOT, folding
-     *  the part of the step beyond the wall back inside by rewriting, in
-     *  place, every saved trajectory point back to _xi, every remaining
-     *  entry in _coldata, and the mesh index (i[a] = -i[a]-1 on the low
-     *  side, 2*size-i-3 on the high side). For a box wall in isolation that
-     *  is not an approximation at all -- the mirrored path is the true path
-     *  of the image particle -- and it is why the code was written that way.
-     *
-     *  It stops being safe as soon as a step can meet more than one kind of
-     *  boundary. Rewriting the remaining crossings hands the NEXT iteration
-     *  of handle_trajectory()'s loop a coldata list describing the mirrored
-     *  path, while _xi, the analytic solids, and the mask tags all still
-     *  describe the real one; whichever is consulted next disagrees with the
-     *  others. Truncating removes the possibility rather than patching it:
-     *  nothing downstream of the wall is rewritten because nothing
-     *  downstream of the wall is kept.
-     *
-     *  Both handlers now leave the particle in the same state -- on the
-     *  surface, normal velocity reversed, coldata cut at c, stepper reset,
-     *  index unmoved -- so the crossing that comes first in _coldata is the
-     *  one that decides the particle's fate, whatever kind of surface it is.
-     *  That ordering is free: build_coldata() emits crossings in time order,
-     *  and a solid intersection found within the segment ending at crossing
-     *  c is by construction not later than c itself, which is why the solid
-     *  test above still runs before this one.
-     *
-     *  Nothing is lost by truncating. x2 = _coldata[c]._x copies the
-     *  crossing point INCLUDING its time, so the particle's clock sits at
-     *  the instant of contact and the next ODE step resumes from there: the
-     *  step is cut short, not skipped. The cost is one extra step per
-     *  reflection, and the error is the discarded overshoot -- bounded by
-     *  the step the integrator had already accepted as within tolerance.
-     *  Measured against the mirroring version on this driver it is a wash:
-     *  same wall time to within run-to-run noise, and the extracted current
-     *  and emittance move in the fifth significant figure.
-     *
-     *  The nudge to the live side also subsumes a special case that used to
-     *  live at the end of handle_mirror(): in MODE_CYL the axis is r = 0 and
-     *  get_derivatives() rejects r <= 0, so a particle arriving exactly on
-     *  the axis mirrored to exactly the axis and every subsequent step
-     *  failed, whatever dt. Placing it a hair inside cannot produce that
-     *  state, on the axis or anywhere else.
+     *  For use when the particle coordinates are changed discontinuously
+     *  at the crossing. The rest of the crossings describe a path that
+     *  is not taken, and the history of the adaptive stepper is not
+     *  valid any more. The crossing point has its own time, so the next
+     *  step continues from the instant of the crossing.
      */
-    void handle_boundary_reflection( size_t c, int i[3], size_t a, int border, PP &x2 ) {
-
-	DEBUG_MESSAGE( "Reflect trajectory at box boundary\n" );
-	DEBUG_INC_INDENT();
-
-	const double xmirror = ( border < 0 ) ? _pidata._geom->origo(a)
-	                                      : _pidata._geom->max(a);
-
-	/* Undo the caller's mesh index advance: a reflected particle stays in
-	 * the cell it was in. The advance moved i[a] exactly one step past the
-	 * valid range (cells are indexed 0 .. size-2), so the cell it came
-	 * from is the first or last one. */
-	i[a] = ( border < 0 ) ? 0 : (int32_t)_pidata._geom->size(a)-2;
-
-	DEBUG_MESSAGE( "xmirror = " << xmirror << "\n" );
-
+    void truncate_step( size_t c ) {
 	save_trajectory_point( _coldata[c]._x );
+	_coldata.resize( c+1 );      // ends the loop of handle_trajectory()
+	gsl_odeiv2_step_reset( _step );
+	gsl_odeiv2_evolve_reset( _evolve );
+    }
+
+
+    /*! \brief Reflect the particle at mesh crossing \a c from the plane
+     *  x[a] = \a plane, which it met moving in direction \a side (-1 or
+     *  +1) along axis \a a.
+     *
+     *  Serves the mirror boundaries of the simulation box and the
+     *  Neumann masks alike. The particle is stopped at the plane,
+     *  slightly on the side it came from, with its normal velocity
+     *  reversed, and the step ends there. The part of the step beyond
+     *  the plane is not mirrored back: beyond a mask there is no field
+     *  solution to have followed, and in cylindrical symmetry the image
+     *  can land on r <= 0, where get_derivatives() fails.
+     */
+    void reflect_at_plane( size_t c, size_t a, int side, double plane, PP &x2 ) {
+
+	DEBUG_MESSAGE( "Reflect trajectory at plane " << plane << "\n" );
 
 	const double eps = 1.0e-3 * _pidata._geom->h();
 	x2 = _coldata[c]._x;
-	x2[2*a+1] = xmirror + ( border < 0 ? eps : -eps );
+	x2[2*a+1] = plane + ( side < 0 ? eps : -eps );
 	x2[2*a+2] *= -1.0;
-	_coldata.resize( c+1 );      // ends handle_trajectory()'s loop
-
-	// Coordinates changed discontinuously: the adaptive stepper's
-	// history no longer describes this trajectory.
-	gsl_odeiv2_step_reset( _step );
-	gsl_odeiv2_evolve_reset( _evolve );
-
-	DEBUG_DEC_INDENT();
+	truncate_step( c );
     }
 
 
@@ -897,207 +704,67 @@ template <class PP> class ParticleIterator {
     }
 
 
-    /*! \brief Return if node (i,j) is a solid node
+    /*! \brief Is any node of a face of mesh cell \a i a solid node?
+     *
+     *  The face is the one across axis \a a, on the low side of the
+     *  cell for \a side = -1 and on the high side for +1.
      */
-    bool is_solid( int i, int j ) {
-	return( _pidata._geom->material_check( i, j ) != 0 );
+    bool face_has_solid( const int i[3], size_t a, int side ) {
+
+	const Geometry &geom = *_pidata._geom;
+	int n[3] = { i[0], i[1], i[2] };
+	if( side > 0 )
+	    n[a]++;
+
+	if( PP::dim() == 2 ) {
+	    if( geom.material_check( n[0], n[1] ) != 0 )
+		return( true );
+	    n[1-a]++;
+	    return( geom.material_check( n[0], n[1] ) != 0 );
+	}
+
+	const size_t b = (a+1)%3;
+	const size_t d = (a+2)%3;
+	for( int kd = 0; kd < 2; kd++ ) {
+	    for( int kb = 0; kb < 2; kb++ ) {
+		int m[3] = { n[0], n[1], n[2] };
+		m[b] += kb;
+		m[d] += kd;
+		if( geom.material_check( m[0], m[1], m[2] ) != 0 )
+		    return( true );
+	    }
+	}
+	return( false );
     }
 
-    /*! \brief Return if node (i,j,k) is a solid node
+
+    /*! \brief Is the particle entering a Neumann mask at mesh crossing
+     *  \a c, which it makes in direction \a side (-1 or +1) along axis
+     *  \a a?
+     *
+     *  Asked from the mask solids at a point slightly past the crossing,
+     *  not from the node materials: the two disagree between the surface
+     *  of a mask and its first solid node, and check_collision_solid()
+     *  absorbs by the solid. Only the masks are asked, so the cost does
+     *  not depend on the other solids.
      */
-    bool is_solid( int i, int j, int k ) {
-	return( _pidata._geom->material_check( i, j, k ) != 0 );
-    }
-
-    /*! \brief Return if node (i,j) is inside a Neumann-mask solid. */
-    bool is_mask( int i, int j ) {
-	return( SMESH_NODE_IS_NEUMANN_MASK( _pidata._geom->mesh_check( i, j ) ) );
-    }
-
-    /*! \brief Return if node (i,j,k) is inside a Neumann-mask solid. */
-    bool is_mask( int i, int j, int k ) {
-	return( SMESH_NODE_IS_NEUMANN_MASK( _pidata._geom->mesh_check( i, j, k ) ) );
-    }
-
-    /*! \brief Is the particle crossing INTO a Neumann mask at _coldata[c]?
-     *
-     *  Decided ANALYTICALLY, by asking Geometry::inside() about a point just
-     *  past the crossing face -- NOT by the mesh node classification.
-     *
-     *  The mesh-node version this replaces caused a real and quiet bug.
-     *  Reflection was gated on SMESH_NODE_IS_NEUMANN_MASK, while absorption
-     *  in check_collision_solid() is decided by the analytic inside(). Those
-     *  two disagree everywhere between the mask surface and the first node
-     *  actually marked as masked, and when the gate said no,
-     *  handle_trajectory_advance() fell straight through to the absorbing
-     *  path -- so a SYMMETRY surface ate the beam. Measured in the ECR cut
-     *  run: 2.9 mA and 293 particles absorbed on solid 12, concentrated at
-     *  exactly the radius where the sheath was being measured, which is why
-     *  it showed up as space charge falling off towards the mask.
-     *
-     *  Testing the CROSSING POINT rather than the segment end x2 is
-     *  load-bearing, not stylistic. x2 is the same for every c, so a test on
-     *  it would fire on the FIRST face of a multi-crossing step and mirror
-     *  the trajectory about a plane it had not reached yet. The crossing
-     *  point identifies WHICH face is the entry face -- exactly what
-     *  handle_mask_reflection() needs for its mirror plane.
-     *
-     *  Cost is one inside() test per mesh crossing, and only when the
-     *  geometry has a mask at all (_have_mask).
-     *
-     *  Those tests are aimed at the MASK SOLIDS ONLY, which is what makes
-     *  the cost bounded. The obvious form, is_mask_solid(geom->inside(v)),
-     *  is a trap: Geometry::inside(Vec3D) walks every solid highest-first
-     *  and returns the first hit, so a point that is NOT in a mask -- the
-     *  common case at a mesh crossing -- falls all the way through and pays
-     *  a full point-in-polyhedron test against every ordinary solid before
-     *  returning 0. Against a facetted STL that is O(N_triangles) per
-     *  crossing, per particle, and it silently couples trajectory cost to
-     *  CAD export resolution: measured on a 3D H- extraction geometry,
-     *  refining the STLs 7.9x took "Collision + scharge dep." from 39.8 s
-     *  to 253.1 s, while the same refinement with the mask removed cost
-     *  4.5 s. Asking the mask solids directly is O(1) for the analytic
-     *  FuncSolid a mask normally is, and leaves the electrodes untouched.
-     */
-    bool entering_mask( size_t c, int dir ) {
-	const size_t a = (size_t)((dir < 0 ? -dir : dir) - 1);
+    bool entering_mask( size_t c, size_t a, int side ) {
 	Vec3D v = _coldata[c]._x.location();
-	// Step just past the face, into the cell being entered. Small
-	// compared with a cell, enormous compared with the ULP of a
-	// coordinate, so it cannot be lost to rounding.
-	v[a] += (dir < 0 ? -1.0 : 1.0) * 1.0e-3 * _pidata._geom->h();
+	v[a] += side * 1.0e-3 * _pidata._geom->h();
 	for( size_t s = 0; s < _mask_solid.size(); s++ ) {
-	    if( !_mask_solid[s] )
-		continue;
-	    if( _pidata._geom->inside( (uint32_t)(s+7), v ) )
+	    if( _pidata._geom->inside( _mask_solid[s], v ) )
 		return( true );
 	}
 	return( false );
     }
 
+
     /*! \brief Is solid number \a n a Neumann mask?
-     *
-     *  Cached at construction rather than asking Geometry per test:
-     *  get_boundary() returns Bound BY VALUE and range-checks on every
-     *  call, and this sits in the trajectory inner loop.
      */
     bool is_mask_solid( uint32_t n ) const {
-	return( n >= 7 && n - 7 < _mask_solid.size() && _mask_solid[n-7] );
+	return( std::find( _mask_solid.begin(), _mask_solid.end(), n ) != _mask_solid.end() );
     }
 
-    /*! \brief Reflect the particle if it is genuinely entering a mask.
-     *
-     *  A mask is a SYMMETRY surface, so a particle reaching it must be
-     *  reflected -- not absorbed (that would put an artificial loss channel
-     *  on a surface that is not physically there, which is one of the
-     *  things a mask exists to avoid) and not passed through (there is no
-     *  field solution on the far side).
-     *
-     *  The particle is STOPPED at the plane, not mirrored past it. It is
-     *  placed on the crossing point with the normal velocity reversed, and
-     *  the rest of this step's crossings are discarded. Because the
-     *  crossing point carries its own time, the next ODE step resumes at
-     *  the instant of contact, so the step is shortened rather than any
-     *  path being lost.
-     *
-     *  Mirroring the overshoot -- what handle_boundary_reflection() used to
-     *  do for box faces, before it was made to truncate for the same reason
-     *  -- was tried here and removed. It relies on two properties a box wall
-     *  has and a mask does not:
-     *
-     *  - A box mirror plane IS the domain edge, so the image of an
-     *    overshoot is always back inside. A mask plane is interior, and
-     *    2*p - x lands wherever it lands; radially it goes NEGATIVE once
-     *    the particle penetrated further than the plane's own radius.
-     *
-     *  - get_derivatives() bounds a box overshoot to one cell: a step
-     *    ending beyond origo-h / max+h returns IBSIMU_DERIV_ERROR, so the
-     *    step is rejected and dt halved until it fits. Nothing does that
-     *    for a mask, because the masked region is INSIDE the mesh box.
-     *    Worse, the solver never writes a potential there (see
-     *    epot_solver.cpp: masked nodes are eliminated and keep stale
-     *    values), so a particle that dips in is pushed by a meaningless
-     *    field and can arrive tens of cells deep in one step. Mirroring
-     *    that gave r < 0, after which every step failed the r > 0 test and
-     *    the run died with "too small step size" far from the mask.
-     *
-     *  Stopping at the plane means the particle never samples the unsolved
-     *  region, which beats any quality of guess about what is in it. There
-     *  is also no single mirror direction to guess ALONG: a mask is a
-     *  staircase with axial and radial faces and corners, not one plane
-     *  with a normal, so set_extrapolation()'s per-box-face trick has no
-     *  analogue here.
-     *
-     *  THE PLANE IS THE MESH FACE just crossed, _coldata[c], not the
-     *  analytic solid surface. With both mask faces snapped to node planes
-     *  by the driver the two coincide; where they do not, the mesh face is
-     *  still the right choice, because set_link() drops the face between a
-     *  live node and a masked node, so the field's own zero-flux surface is
-     *  mesh-aligned too.
-     *
-     *  The mesh index i[] is deliberately NOT advanced by the caller in
-     *  this path: a reflected particle stays in the cell it was in.
-     */
-    bool handle_mask_reflection( size_t c, int dir, PP &x2 ) {
-
-	// NO re-test of x2 here. entering_mask() has already decided, and
-	// analytically, at the crossing point. Re-testing the segment END
-	// would reintroduce exactly the mesh-vs-analytic disagreement this
-	// was written to remove, and would reject a particle whose step
-	// happens to finish back outside the mask.
-	const size_t a = (size_t)((dir < 0 ? -dir : dir) - 1);
-	const double xmirror = _coldata[c]._x[2*a+1];
-
-	DEBUG_MESSAGE( "Reflecting trajectory at Neumann mask, plane "
-		       << xmirror << "\n" );
-
-	save_trajectory_point( _coldata[c]._x );
-
-	// TRUNCATE at the surface. The particle is placed exactly on the
-	// reflection plane, a hair back on the live side, with the normal
-	// velocity reversed, and the remaining crossings for this step are
-	// discarded -- they describe a path that no longer exists.
-	//
-	// Nothing is lost by this. x2 = _coldata[c]._x copies the crossing
-	// point INCLUDING its time (index 0), so the particle's clock sits at
-	// the instant it met the plane and the next ODE step simply continues
-	// from there. The step is cut short, not skipped.
-	//
-	// The alternative -- mirroring the whole overshoot about the plane,
-	// as the box-wall handler originally did -- was tried and removed. It
-	// works for a box because the mirror plane IS the domain edge, so the
-	// image is always inside, and because get_derivatives() bounds the
-	// overshoot to one cell: a step landing further out returns
-	// IBSIMU_DERIV_ERROR, is rejected, and dt is halved until it fits.
-	//
-	// Neither holds at a mask. The masked region is INSIDE the mesh box,
-	// so nothing errors and nothing bounds the penetration; and the
-	// potential there is never written by the solver (see epot_solver.cpp
-	// -- masked nodes are eliminated and keep stale values), so a particle
-	// that dips in is accelerated by a meaningless field and can arrive
-	// tens of cells deep in a single step. Mirroring that overshoot sent
-	// it to NEGATIVE radius, after which every subsequent step failed the
-	// r > 0 test and the run died with "too small step size", far from the
-	// mask and with nothing pointing back at it.
-	//
-	// Truncating means the particle never samples the unsolved region at
-	// all, which is worth more than any quality of guess about what is in
-	// there. A mask is also a staircase, not a plane, so there is no
-	// single well-defined mirror direction to extrapolate along the way
-	// set_extrapolation() can for a box face.
-	const double eps = 1.0e-3 * _pidata._geom->h();
-	x2 = _coldata[c]._x;
-	x2[2*a+1] = xmirror + ( dir < 0 ? eps : -eps );
-	x2[2*a+2] *= -1.0;
-	_coldata.resize( c+1 );      // ends handle_trajectory()'s loop
-
-	// Coordinates changed discontinuously: the adaptive stepper's
-	// history no longer describes this trajectory.
-	gsl_odeiv2_step_reset( _step );
-	gsl_odeiv2_evolve_reset( _evolve );
-
-	return( true );
-    }
 
     /*! \brief Handle particle mesh intersection.
      *
@@ -1109,175 +776,75 @@ template <class PP> class ParticleIterator {
      */
     bool handle_trajectory_advance( Particle<PP> &particle, size_t c, int i[3], PP &x2 ) {
 
-	bool surface_collision = false;
 	DEBUG_MESSAGE( "Handle trajectory advance\n" );
 	DEBUG_INC_INDENT();
 
-	// Neumann-mask reflection, BEFORE the solid checks and before the
-	// mesh index is advanced. The particle stays in the cell it was in
-	// with its normal velocity flipped, so i[] must not move -- hence
-	// the early return rather than falling through to the advance
-	// below.
-	// Neumann-mask reflection, BEFORE the solid checks and before the
-	// mesh index is advanced: a reflected particle stays in the cell it
-	// was in, so i[] must not move -- hence the early return rather than
-	// falling through to the advance below.
-	//
-	// entering_mask() is the whole decision now, taken analytically at
-	// the crossing point, so reflection ALWAYS precedes the absorbing
-	// solid checks below. That ordering is the fix: a Neumann mask is a
-	// symmetry surface and must never reach check_collision_solid(),
-	// which would happily absorb on it.
-	_mask_reflected = false;
+	// The particle leaves cell i through its face across axis a, on
+	// the low (side = -1) or high (side = +1) side of the cell.
+	const int dir = _coldata[c]._dir;
+	const size_t a = (size_t)((dir < 0 ? -dir : dir) - 1);
+	const int side = ( dir < 0 ? -1 : +1 );
 
-	// Analytic engine only. With the surface model on, the mask is
-	// decided inside check_collision_surface() from the triangle it
-	// actually hits -- the same place, and the same intersection, as
-	// absorption. Running this pre-check as well would do a second,
-	// more expensive test of the same thing, and it is the one that
-	// walks every STL triangle.
-	if( _have_mask && _mask_reflect && !_surface_collision &&
-	    entering_mask( c, _coldata[c]._dir ) ) {
-	    handle_mask_reflection( c, _coldata[c]._dir, x2 );
+	// Solid collision model: a mask reflects here, before the
+	// collision test, which would absorb on it. The surface collision
+	// model finds the masks in check_collision_surface() instead.
+	if( !_mask_solid.empty() && _mask_reflect && !_surface_collision &&
+	    entering_mask( c, a, side ) ) {
+	    reflect_at_plane( c, a, side, _coldata[c]._x[2*a+1], x2 );
 	    DEBUG_DEC_INDENT();
 	    return( true );
 	}
 
-	// Check for collisions with solids and advance coordinates i.
-	if( PP::dim() == 2 ) {
-	    if( _coldata[c]._dir == -1 ) {
-		if( (is_solid(i[0],i[1]) || is_solid(i[0], i[1]+1) || _have_analytic) &&
-		    !check_collision( particle, _xi, _coldata[c]._x, x2, i ) )
-		    surface_collision = true;
-		i[0]--;
-	    } else if( _coldata[c]._dir == +1 ) {
-		if( (is_solid(i[0]+1,i[1]) || is_solid(i[0]+1,i[1]+1) || _have_analytic) &&
-		    !check_collision( particle, _xi, _coldata[c]._x, x2, i ) )
-		    surface_collision = true;
-		i[0]++;
-	    } else if( _coldata[c]._dir == -2 ) {
-		if( (is_solid(i[0],i[1]) || is_solid(i[0]+1,i[1]) || _have_analytic) &&
-		    !check_collision( particle, _xi, _coldata[c]._x, x2, i ) )
-		    surface_collision = true;
-		i[1]--;
-	    } else {
-		if( (is_solid(i[0],  i[1]+1) || is_solid(i[0]+1,i[1]+1) || _have_analytic) &&
-		    !check_collision( particle, _xi, _coldata[c]._x, x2, i ) )
-		    surface_collision = true;
-		i[1]++;
-	    }
-	} else if( PP::dim() == 3 ) {
-	    if( _coldata[c]._dir == -1 ) {
-		if( (is_solid(i[0],  i[1],  i[2]  ) || 
-		     is_solid(i[0],  i[1]+1,i[2]  ) ||
-		     is_solid(i[0],  i[1],  i[2]+1) ||
-		     is_solid(i[0],  i[1]+1,i[2]+1) || _have_analytic) &&
-		    !check_collision( particle, _xi, _coldata[c]._x, x2, i ) )
-		    surface_collision = true;
-		i[0]--;
-	    } else if( _coldata[c]._dir == +1 ) {
-		if( (is_solid(i[0]+1,i[1],  i[2]  ) || 
-		     is_solid(i[0]+1,i[1]+1,i[2]  ) ||
-		     is_solid(i[0]+1,i[1],  i[2]+1) ||
-		     is_solid(i[0]+1,i[1]+1,i[2]+1) || _have_analytic) &&
-		    !check_collision( particle, _xi, _coldata[c]._x, x2, i ) )
-		    surface_collision = true;
-		i[0]++;
-	    } else if( _coldata[c]._dir == -2 ) {
-		if( (is_solid(i[0],  i[1],i[2]  ) || 
-		     is_solid(i[0]+1,i[1],i[2]  ) ||
-		     is_solid(i[0],  i[1],i[2]+1) ||
-		     is_solid(i[0]+1,i[1],i[2]+1) || _have_analytic) &&
-		    !check_collision( particle, _xi, _coldata[c]._x, x2, i ) )
-		    surface_collision = true;
-		i[1]--;
-	    } else if( _coldata[c]._dir == +2 ) {
-		if( (is_solid(i[0],  i[1]+1,i[2]  ) || 
-		     is_solid(i[0]+1,i[1]+1,i[2]  ) ||
-		     is_solid(i[0],  i[1]+1,i[2]+1) ||
-		     is_solid(i[0]+1,i[1]+1,i[2]+1) || _have_analytic) &&
-		    !check_collision( particle, _xi, _coldata[c]._x, x2, i ) )
-		    surface_collision = true;
-		i[1]++;
-	    } else if( _coldata[c]._dir == -3 ) {
-		if( (is_solid(i[0],  i[1],  i[2]) || 
-		     is_solid(i[0]+1,i[1],  i[2]) ||
-		     is_solid(i[0],  i[1]+1,i[2]) ||
-		     is_solid(i[0]+1,i[1]+1,i[2]) || _have_analytic) &&
-		    !check_collision( particle, _xi, _coldata[c]._x, x2, i ) )
-		    surface_collision = true;
-		i[2]--;
-	    } else {
-		if( (is_solid(i[0],  i[1],  i[2]+1) || 
-		     is_solid(i[0]+1,i[1],  i[2]+1) ||
-		     is_solid(i[0],  i[1]+1,i[2]+1) ||
-		     is_solid(i[0]+1,i[1]+1,i[2]+1) || _have_analytic) &&
-		    !check_collision( particle, _xi, _coldata[c]._x, x2, i ) )
-		    surface_collision = true;
-		i[2]++;
-	    }
-	} else {
-	    throw( Error( ERROR_LOCATION, "unsupported dimension number" ) );
+	// Test for a collision if the face has a solid node. With the
+	// surface collision model also if there is any analytic solid,
+	// see check_collision_surface().
+	_mask_reflected = false;
+	const bool collided =
+	    ( face_has_solid( i, a, side ) || (_surface_collision && !_analytic_solid.empty()) ) &&
+	    !check_collision( particle, _xi, _coldata[c]._x, x2, i );
+
+	if( _mask_reflected ) {
+	    // check_collision_surface() reflected the particle from a
+	    // mask and set x2. The step ends there, before the crossing.
+	    _coldata[c]._x = x2;
+	    truncate_step( c );
+	    DEBUG_DEC_INDENT();
+	    return( true );
 	}
-	
-	if( surface_collision ) {
+
+	i[a] += side;
+
+	if( collided ) {
 	    DEBUG_MESSAGE( "Surface collision!\n" );
 	    DEBUG_DEC_INDENT();
 	    return( false );
 	}
 
-	/* The surface engine reported a mask reflection. Undo the mesh
-	 * index advance -- a reflected particle stays in the cell it was
-	 * in -- discard the rest of this step's crossings, and tell the
-	 * adaptive stepper its history no longer describes this
-	 * trajectory. status_x (the caller's x2) already carries the
-	 * reflected state.
-	 *
-	 * The undo is exact: every branch above moves exactly one index by
-	 * one, in the direction _coldata[c]._dir names. */
-	if( _mask_reflected ) {
-	    const size_t a = (size_t)((_coldata[c]._dir < 0 ?
-				       -_coldata[c]._dir : _coldata[c]._dir) - 1);
-	    i[a] += ( _coldata[c]._dir < 0 ? +1 : -1 );
-	    save_trajectory_point( _coldata[c]._x );
-	    _coldata.resize( c+1 );
-	    gsl_odeiv2_step_reset( _step );
-	    gsl_odeiv2_evolve_reset( _evolve );
-	    DEBUG_MESSAGE( "Mask reflection, index restored\n" );
+	// Simulation box boundary: i is now outside the cell range
+	// 0...size-2 on the axis where the particle left the box.
+	for( size_t b = 0; b < PP::dim(); b++ ) {
+
+	    int border;
+	    if( i[b] < 0 )
+		border = -1;
+	    else if( i[b] >= (int32_t)(_pidata._geom->size(b)-1) )
+		border = +1;
+	    else
+		continue;
+
+	    const uint32_t bound = ( border < 0 ? 1+2*b : 2+2*b );
+	    DEBUG_MESSAGE( "Boundary collision at boundary " << bound << "\n" );
 	    DEBUG_DEC_INDENT();
-	    return( true );
-	}
-
-	/* Check for collisions/reflection at the simulation box wall. Here
-	 * coordinates i are already advanced to the next mesh cell, so the
-	 * wall is the axis whose index just left the valid cell range
-	 * 0 .. size-2.
-	 *
-	 * At most ONE axis can be out of range: this call handles a single
-	 * crossing, _coldata[c], and every branch above moves exactly one
-	 * index by one. So the loop finds that axis and is done -- the
-	 * returns are not an early exit past work that still needed doing.
-	 * (The old mirroring handler let the loop run on, which was harmless
-	 * for the same reason.) */
-	for( size_t a = 0; a < PP::dim(); a++ ) {
-
-	    if( i[a] < 0 ) {
-		DEBUG_MESSAGE( "Boundary collision at boundary " << 2*a+0 << "\n" );
-		if( _mirror[2*a] )
-		    handle_boundary_reflection( c, i, a, -1, x2 );
-		else
-		    handle_collision( particle, 1+2*a, c, x2 );
-		DEBUG_DEC_INDENT();
-		return( _mirror[2*a] );
-	    } else if( i[a] >= (int32_t)(_pidata._geom->size(a)-1) ) {
-		DEBUG_MESSAGE( "Boundary collision at boundary " << 2*a+1 << "\n" );
-		if( _mirror[2*a+1] )
-		    handle_boundary_reflection( c, i, a, +1, x2 );
-		else
-		    handle_collision( particle, 2+2*a, c, x2 );
-		DEBUG_DEC_INDENT();
-		return( _mirror[2*a+1] );
+	    if( !_mirror[bound-1] ) {
+		handle_collision( particle, bound, c, x2 );
+		return( false );
 	    }
+
+	    // A reflected particle stays in the first or last cell.
+	    i[b] = ( border < 0 ? 0 : (int32_t)_pidata._geom->size(b)-2 );
+	    reflect_at_plane( c, b, border,
+			      border < 0 ? _pidata._geom->origo(b) : _pidata._geom->max(b), x2 );
+	    return( true );
 	}
 
 	DEBUG_MESSAGE( "No collision.\n" );
@@ -1652,29 +1219,16 @@ public:
 		      const Geometry *geom )
 	: _type(type), _intrp(intrp), _scharge_dep(scharge_dep), _epsabs(epsabs), _epsrel(epsrel),
 	  _maxsteps(maxsteps), _maxt(maxt), _save_points(save_points), _trajdiv(trajdiv),
-	  _surface_collision(false), _pidata(scharge,efield,bfield,geom),
+	  _mask_reflected(false), _surface_collision(false), _pidata(scharge,efield,bfield,geom),
 	  _thand_cb(0), _tend_cb(0), _tsur_cb(0), _bsup_cb(0), _pdb(0),
 	  _stat(geom->number_of_boundaries()),
-	  _time_ode(0.0), _time_trajhandle(0.0), _mask_reflected(false),
-	  _have_analytic(false) {
+	  _time_ode(0.0), _time_trajhandle(0.0) {
 
-	// Cache which solids are Neumann masks -- see _mask_solid.
-	_have_mask = false;
-	{
-	    uint32_t nb = geom->number_of_boundaries();
-	    if( nb > 6 ) {
-		_mask_solid.resize( nb - 6, false );
-		for( uint32_t n = 7; n <= nb; n++ ) {
-		    bool m = ( geom->get_boundary(n).type() == BOUND_NEUMANN );
-		    _mask_solid[n-7] = m;
-		    if( m )
-			_have_mask = true;
-		    if( geom->solid_is_analytic( n ) ) {
-			_analytic_solid.push_back( n );
-			_have_analytic = true;
-		    }
-		}
-	    }
+	for( uint32_t n = 7; n <= geom->number_of_boundaries(); n++ ) {
+	    if( geom->get_boundary(n).type() == BOUND_NEUMANN )
+		_mask_solid.push_back( n );
+	    if( geom->solid_is_analytic( n ) )
+		_analytic_solid.push_back( n );
 	}
 
 	// Initialize mirroring
@@ -1731,11 +1285,8 @@ public:
     }
 
 
-    /*! \brief Reflect at Neumann masks (true, default) or absorb (false).
-     *
-     *  Diagnostic switch -- see _mask_reflect. Affects particles only; the
-     *  potential solve keeps its Neumann stencil either way, so the field
-     *  side and the particle side of a mask can be tested independently.
+    /*! \brief Reflect particles at Neumann masks (true, default) or
+     *  absorb them (false).
      */
     void set_mask_reflection( bool reflect ) { _mask_reflect = reflect; }
 

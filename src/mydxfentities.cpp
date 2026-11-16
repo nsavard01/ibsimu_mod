@@ -235,8 +235,7 @@ bool MyDXFEntities::inside_loop( MyDXFEntitySelection *selection, double x, doub
 	int stat = 0;
         int par = 0;
         for( uint32_t a = 0; a < selection->size(); a++ ) {
-	    MyDXFEntity *e = _entities[(*selection)(a)];
-	    MyDXFPathEntity *pe = dynamic_cast<MyDXFPathEntity *>( e );
+	    const MyDXFPathEntity *pe = _entities[(*selection)(a)]->as_path();
 	    if( !pe )
 		throw Error( ERROR_LOCATION, "Not a path entity" );
 

@@ -18,39 +18,40 @@
  */
 
 #include <algorithm>
-#include <numeric>
-#include <unordered_map>
 #include <cmath>
-#include <cstring>
 #include <cstdint>
-#include <omp.h>
 #include "gmg_precond.hpp"
 #include "ibsimu.hpp"
 #include "error.hpp"
 
 
-/* Portable CAS-loop atomic add for double (std::atomic<double> has no
- * fetch_add() until C++20). Duplicated from the identical helper in
- * scharge.cpp rather than shared, to keep this file dependency-free --
- * same rationale as color_graph() being duplicated from
- * RBSOR_Precond rather than shared with it.
+/* A loop over fewer rows than this runs on the calling thread, because
+ * starting an OpenMP team costs more than such a loop gains. Measured
+ * with 32 threads on 41k and 198k node meshes: the solve time is flat
+ * for 256...2048 and rises from 8192 up.
  */
-namespace {
-inline void atomic_add_double( double &target, double val )
+static const int GMG_PAR_MIN_ROWS = 1024;
+
+/* The coarsest level is solved by dense LU up to this many rows, and by
+ * relaxation beyond it. It is factorised on every construct(), which
+ * costs 2/3*n^3 operations.
+ */
+static const int GMG_DIRECT_MAX_ROWS = 256;
+
+
+/* Calls body(i) for i in [0,n). No iteration may depend on another.
+ */
+template <class Body>
+static inline void for_rows( int n, int nthreads, const Body &body )
 {
-    static_assert( sizeof(double) == sizeof(uint64_t), "unexpected double size" );
-    uint64_t *addr = reinterpret_cast<uint64_t *>( &target );
-    uint64_t old_bits = __atomic_load_n( addr, __ATOMIC_RELAXED );
-    for( ;; ) {
-        double old_val, new_val;
-        std::memcpy( &old_val, &old_bits, sizeof(double) );
-        new_val = old_val + val;
-        uint64_t new_bits;
-        std::memcpy( &new_bits, &new_val, sizeof(double) );
-        if( __atomic_compare_exchange_n( addr, &old_bits, new_bits, true, __ATOMIC_RELAXED, __ATOMIC_RELAXED ) )
-            break;
+    if( nthreads > 1 && n >= GMG_PAR_MIN_ROWS ) {
+        #pragma omp parallel for num_threads(nthreads) schedule(static)
+        for( int i = 0; i < n; i++ )
+            body( i );
+    } else {
+        for( int i = 0; i < n; i++ )
+            body( i );
     }
-}
 }
 
 
@@ -91,12 +92,11 @@ GMG_Precond::~GMG_Precond()
 }
 
 
+/* Returns an unprepared preconditioner with the same parameters, like
+ * RBSOR_Precond::copy(): the hierarchy is rebuilt at first use.
+ */
 GMG_Precond *GMG_Precond::copy( void ) const
 {
-    // Same philosophy as RBSOR_Precond::copy(): the hierarchy is cheap
-    // to rebuild from the matrix at first use, so we hand back a
-    // fresh, unprepared preconditioner with the same parameters rather
-    // than deep-copy the (possibly large) level data.
     GMG_Precond *pc = new GMG_Precond( _nx0, _ny0, _nz0, _dim, _nlevels_req,
                                         _npre, _npost, _ncoarse_sweeps, _coarse_rtol, _w,
                                         _coarse_w, _ncycles, _nthreads );
@@ -114,11 +114,13 @@ void GMG_Precond::clear( void )
     _b.clear();
     _r.clear();
     _lvl0_diag_ref.clear();
+    _lvl0_delta.clear();
     _lvl1_lin_val.clear();
+    _delta_ptr.clear();
     _delta_src.clear();
-    _delta_dst.clear();
     _delta_coef.clear();
-    _delta_group.clear();
+    _lu.clear();
+    _lu_piv.clear();
 }
 
 
@@ -128,48 +130,21 @@ std::string GMG_Precond::typestring( void ) const
 }
 
 
+int GMG_Precond::nthreads( void ) const
+{
+    return( _nthreads ? (int)_nthreads : (int)ibsimu.get_thread_count() );
+}
+
+
 /* *****************************************************************************
  * Hierarchy construction
  */
 
-/* Refreshes _level[0]'s VALUES only, in place, reusing the ptr/col
- * layout already established by build_level0() in prepare(). Safe
- * because A's sparsity PATTERN is invariant for the lifetime of this
- * preconditioner (fixed by geometry/discretization), so only VALUES
- * need updating from one construct() call to the next -- e.g. every
- * Newton round and every major cycle, as the nonlinear plasma model's
- * Jacobian diagonal evolves with the current potential. Mirrors
- * build_level0()'s value-assignment loop exactly (same order), just
- * without touching ptr/col or re-pushing a level.
- */
-void GMG_Precond::refresh_level0_values( const CRowMatrix &A )
-{
-    Level &lev = _level[0];
-    int nfull = (int)_node_map.size();
-
-    for( int m = 0; m < nfull; m++ ) {
-        int32_t r = _node_map[m];
-        int p = lev.ptr[m];
-        if( r < 0 ) {
-            lev.val[p] = 1.0;
-        } else {
-            int a0 = A.ptr(r), a1 = A.ptr(r+1);
-            for( int a = a0; a < a1; a++, p++ )
-                lev.val[p] = A.val(a);
-        }
-    }
-}
-
-
-/* Embeds matrix A (A.rows() == number of *free* nodes, "dof") into a
- * level-0 operator sized nx0*ny0*nz0 (the full mesh), using
- * _node_map/_row_to_node built by prepare(). Every eliminated
- * (fixed/Dirichlet) mesh slot becomes a trivial decoupled identity
- * row (diagonal 1, no off-diagonal, always solves to x=0); every free
- * mesh slot gets A's row for that node, with column indices remapped
- * from matrix-row space back to mesh-index space via _row_to_node so
- * that all of level 0's neighbours are addressed the same way as
- * every coarser level (by mesh index).
+/* Level 0 is matrix A embedded in the full mesh: a free node gets its
+ * row of A with the columns translated to mesh indices, an eliminated
+ * node gets an identity row. Nothing refers to an eliminated node, so
+ * those rows stay at x = 0 and are left out of the smoother, see
+ * color_graph().
  */
 void GMG_Precond::build_level0( const CRowMatrix &A )
 {
@@ -210,13 +185,30 @@ void GMG_Precond::build_level0( const CRowMatrix &A )
 }
 
 
+/* Copies the values of A into level 0, whose layout build_level0() made.
+ */
+void GMG_Precond::refresh_level0_values( const CRowMatrix &A )
+{
+    Level &lev = _level[0];
+
+    for_rows( lev.n, nthreads(), [&]( int m ) {
+        int32_t r = _node_map[m];
+        if( r < 0 )
+            return; // identity row, set by build_level0()
+        int p = lev.ptr[m];
+        for( int a = A.ptr(r); a < A.ptr(r+1); a++, p++ )
+            lev.val[p] = A.val(a);
+    } );
+}
+
+
+/* Size of the next coarser grid, (size+1)/2 in every active direction
+ * as in EpotMGSolver::prepare_mg_geom(). Returns false where the
+ * hierarchy has to stop: an even size cannot be halved with coincident
+ * nodes, and a direction with fewer than 3 nodes has no interior left.
+ */
 bool GMG_Precond::next_level_size( const Level &fine, uint32_t &cnx, uint32_t &cny, uint32_t &cnz ) const
 {
-    // Same coarsening convention as EpotMGSolver::prepare_mg_geom():
-    // size[d] = (size[d]+1)/2, only exact (i.e. keeps the coarse grid
-    // nodes coincident with every other fine grid node) when size[d]
-    // is odd. Stop the hierarchy rather than throwing if that's not
-    // the case, or if the grid would become too small to be useful.
     cnx = fine.nx; cny = fine.ny; cnz = fine.nz;
 
     if( fine.nx % 2 == 0 )
@@ -234,11 +226,6 @@ bool GMG_Precond::next_level_size( const Level &fine, uint32_t &cnx, uint32_t &c
         cnz = (fine.nz+1)/2;
     }
 
-    // Stop once the coarsest grid would have essentially no interior
-    // left -- below this the SOR "coarse solve" converges in a
-    // handful of sweeps anyway, so there's nothing to gain from
-    // coarsening further, and the (n+1)/2 formula stops making sense
-    // once a dimension collapses to 1.
     if( cnx < 3 || (_dim >= 2 && cny < 3) || (_dim >= 3 && cnz < 3) )
         return( false );
 
@@ -246,25 +233,15 @@ bool GMG_Precond::next_level_size( const Level &fine, uint32_t &cnx, uint32_t &c
 }
 
 
-/* fine_node_map, when non-NULL, is _node_map (the level-0 mesh-node ->
- * matrix-row map, see set_node_map()): entries whose fine index maps
- * to an eliminated (fixed/Dirichlet, node_map<0) node are dropped
- * entirely from both P and R (no renormalization -- same convention
- * already used for out-of-range/boundary neighbours). This matters
- * for two reasons:
- *   - Without it, prolong_add() would write nonzero corrections into
- *     fixed mesh slots that the smoother otherwise correctly locks at
- *     x=0 forever, corrupting every free neighbour's stencil on the
- *     next smoothing sweep.
- *   - Without it, the Galerkin product A_coarse = R*A*P would pick up
- *     spurious coarse-coarse coupling "through" a fixed node: for a
- *     fixed row i (a pure identity row in A), AP[i][:] = P[i][:]
- *     rather than 0, since A[i][i]=1 is the only nonzero. Dropping
- *     fixed targets from P makes P's row i empty, so AP[i][:] = 0 as
- *     it physically should be (no coupling through solid/eliminated
- *     material).
- * Only the level-0 -> level-1 transfer needs this: coarser levels are
- * pure Galerkin unknowns with no elimination of their own.
+/* Prolongation P (multilinear interpolation: weight 1 at the coincident
+ * fine node, 1/2 per direction of offset) and restriction
+ * R = (1/2^dim)*P^T from the coarse level to its parent \a fine.
+ * Neighbours outside the grid are left out without renormalisation.
+ *
+ * fine_node_map is _node_map for the transfer from level 0, NULL
+ * otherwise. Eliminated fine nodes are left out of P and R: they must
+ * receive no correction, and with an empty P row the Galerkin product
+ * couples nothing through them.
  */
 void GMG_Precond::build_transfer_operators( const Level &fine, Level &coarse,
                                              const std::vector<int32_t> *fine_node_map ) const
@@ -272,20 +249,11 @@ void GMG_Precond::build_transfer_operators( const Level &fine, Level &coarse,
     int fnx = fine.nx,   fny = (_dim>=2? fine.ny  :1),   fnz = (_dim>=3? fine.nz  :1);
     int cnx = coarse.nx, cny = (_dim>=2? coarse.ny :1),  cnz = (_dim>=3? coarse.nz :1);
 
-    // c = 1/2^dim, the standard variational full-weighting factor
-    // relating restriction to the transpose of prolongation.
     double c = 1.0;
     for( uint32_t d = 0; d < _dim; d++ )
         c *= 0.5;
 
-    // For every coarse node, gather the (fine index, weight) pairs of
-    // the multilinear interpolation stencil (identical stencil to the
-    // one implied by EpotMGSolver::prolong_3d(): weight 1 at the
-    // coincident node, 1/2 at each face-adjacent neighbour, 1/4 at
-    // each edge-adjacent neighbour, 1/8 at each corner neighbour, and
-    // so on generalized to 1D/2D/3D). Out-of-range fine neighbours are
-    // simply omitted (no renormalization), matching
-    // EpotMGSolver::restrict_3d()'s boundary-face handling.
+    // (fine index, weight) pairs of every coarse node
     std::vector< std::vector< std::pair<int,double> > > rows( coarse.n );
 
     for( int K = 0; K < cnz; K++ ) {
@@ -313,11 +281,10 @@ void GMG_Precond::build_transfer_operators( const Level &fine, Level &coarse,
                             if( fi < 0 || fi >= fnx ) continue;
                             double wi = (di==0? 1.0 : 0.5);
 
-                            double weight = wi*wj*wk;
                             int frow = fk*fnx*fny + fj*fnx + fi;
                             if( fine_node_map && (*fine_node_map)[frow] < 0 )
-                                continue; // fine target is fixed/eliminated -- never interpolate into it
-                            entries.push_back( std::make_pair(frow, weight) );
+                                continue;
+                            entries.push_back( std::make_pair(frow, wi*wj*wk) );
                         }
                     }
                 }
@@ -325,7 +292,7 @@ void GMG_Precond::build_transfer_operators( const Level &fine, Level &coarse,
         }
     }
 
-    // Assemble R = c * (the above), coarse.n rows x fine.n cols.
+    // R = c * (the above), coarse.n rows x fine.n columns
     coarse.r_ptr.assign( coarse.n+1, 0 );
     for( int i = 0; i < coarse.n; i++ )
         coarse.r_ptr[i+1] = coarse.r_ptr[i] + (int)rows[i].size();
@@ -339,7 +306,7 @@ void GMG_Precond::build_transfer_operators( const Level &fine, Level &coarse,
         }
     }
 
-    // Assemble P as the (unscaled) transpose, fine.n rows x coarse.n cols.
+    // P = the transpose, fine.n rows x coarse.n columns
     std::vector<int> col_count( fine.n, 0 );
     for( int i = 0; i < coarse.n; i++ )
         for( size_t k = 0; k < rows[i].size(); k++ )
@@ -351,189 +318,166 @@ void GMG_Precond::build_transfer_operators( const Level &fine, Level &coarse,
     coarse.p_col.resize( coarse.p_ptr.back() );
     coarse.p_val.resize( coarse.p_ptr.back() );
 
-    std::vector<int> cursor( fine.n );
-    for( int i = 0; i < fine.n; i++ )
-        cursor[i] = coarse.p_ptr[i];
-
+    std::vector<int> cursor( coarse.p_ptr.begin(), coarse.p_ptr.end()-1 );
     for( int I = 0; I < coarse.n; I++ ) {
         for( size_t k = 0; k < rows[I].size(); k++ ) {
-            int f = rows[I][k].first;
-            double weight = rows[I][k].second;
-            int p = cursor[f]++;
+            int p = cursor[ rows[I][k].first ]++;
             coarse.p_col[p] = I;
-            coarse.p_val[p] = weight;
+            coarse.p_val[p] = rows[I][k].second;
         }
     }
 }
 
 
-/* Sparse-sparse product C = A*B (A: m x k CSR, B: k x n CSR), used to
- * compute the Galerkin coarse-grid operator. Parallelized over the
- * rows of A/C -- each output row is independent, so this is
- * embarrassingly parallel. Uses a thread-local hash accumulator; the
- * matrices involved here are the (small) per-level operators built
- * once in construct(), so simplicity is favoured over the last bit of
- * performance (a dense marker-array Gustavson accumulator would be
- * the next optimization if this ever shows up in a profile).
+/* Sparsity pattern of C = A*B in CSR form, columns ascending within a
+ * row. It depends on the patterns of A and B only, never on their
+ * values, so prepare() computes it once.
  */
-static void spgemm( int m,
-                     const std::vector<int> &ptrA, const std::vector<int> &colA, const std::vector<double> &valA,
-                     const std::vector<int> &ptrB, const std::vector<int> &colB, const std::vector<double> &valB,
-                     std::vector<int> &ptrC, std::vector<int> &colC, std::vector<double> &valC )
+static void spgemm_pattern( int m, int ncol,
+                            const std::vector<int> &ptrA, const std::vector<int> &colA,
+                            const std::vector<int> &ptrB, const std::vector<int> &colB,
+                            std::vector<int> &ptrC, std::vector<int> &colC )
 {
-    std::vector< std::vector< std::pair<int,double> > > rowsC( m );
+    std::vector<int> mark( ncol, -1 );
+    ptrC.assign( m+1, 0 );
+    colC.clear();
 
-    #pragma omp parallel
+    for( int i = 0; i < m; i++ ) {
+        for( int pa = ptrA[i]; pa < ptrA[i+1]; pa++ ) {
+            int k = colA[pa];
+            for( int pb = ptrB[k]; pb < ptrB[k+1]; pb++ ) {
+                int c = colB[pb];
+                if( mark[c] != i ) {
+                    mark[c] = i;
+                    colC.push_back( c );
+                }
+            }
+        }
+        std::sort( colC.begin()+ptrC[i], colC.end() );
+        ptrC[i+1] = (int)colC.size();
+    }
+}
+
+
+/* Values of C = A*B on the pattern made by spgemm_pattern(). Each row
+ * is summed by one thread in a fixed order, so the result does not
+ * depend on threading.
+ */
+static void spgemm_values( int m, int ncol, int nthreads,
+                           const std::vector<int> &ptrA, const std::vector<int> &colA, const std::vector<double> &valA,
+                           const std::vector<int> &ptrB, const std::vector<int> &colB, const std::vector<double> &valB,
+                           const std::vector<int> &ptrC, const std::vector<int> &colC, std::vector<double> &valC )
+{
+    if( m < GMG_PAR_MIN_ROWS )
+        nthreads = 1;
+
+    #pragma omp parallel num_threads(nthreads)
     {
-        std::unordered_map<int,double> acc;
-        #pragma omp for schedule(dynamic,64)
+        std::vector<double> acc( ncol, 0.0 );
+
+        #pragma omp for schedule(static)
         for( int i = 0; i < m; i++ ) {
-            acc.clear();
             for( int pa = ptrA[i]; pa < ptrA[i+1]; pa++ ) {
                 int k = colA[pa];
                 double va = valA[pa];
-                if( va == 0.0 )
-                    continue;
                 for( int pb = ptrB[k]; pb < ptrB[k+1]; pb++ )
                     acc[ colB[pb] ] += va*valB[pb];
             }
-
-            std::vector< std::pair<int,double> > &row = rowsC[i];
-            row.reserve( acc.size() );
-            for( std::unordered_map<int,double>::const_iterator it = acc.begin(); it != acc.end(); ++it )
-                row.push_back( std::make_pair(it->first, it->second) );
-            std::sort( row.begin(), row.end() );
-        }
-    }
-
-    ptrC.assign( m+1, 0 );
-    for( int i = 0; i < m; i++ )
-        ptrC[i+1] = ptrC[i] + (int)rowsC[i].size();
-    colC.resize( ptrC.back() );
-    valC.resize( ptrC.back() );
-    for( int i = 0; i < m; i++ ) {
-        int p = ptrC[i];
-        for( size_t k = 0; k < rowsC[i].size(); k++, p++ ) {
-            colC[p] = rowsC[i][k].first;
-            valC[p] = rowsC[i][k].second;
+            for( int p = ptrC[i]; p < ptrC[i+1]; p++ ) {
+                valC[p] = acc[ colC[p] ];
+                acc[ colC[p] ] = 0.0;
+            }
         }
     }
 }
 
 
-void GMG_Precond::galerkin_coarsen( const Level &fine, Level &coarse ) const
+/* Pattern of the Galerkin operator coarse = R*(fine*P) and of the
+ * intermediate product fine*P.
+ */
+void GMG_Precond::galerkin_pattern( const Level &fine, Level &coarse ) const
 {
-    // AP = A_fine * P   (fine.n x coarse.n)
-    std::vector<int> ap_ptr, ap_col;
-    std::vector<double> ap_val;
-    spgemm( fine.n, fine.ptr, fine.col, fine.val,
-            coarse.p_ptr, coarse.p_col, coarse.p_val,
-            ap_ptr, ap_col, ap_val );
-
-    // A_coarse = R * AP   (coarse.n x coarse.n)
-    spgemm( coarse.n, coarse.r_ptr, coarse.r_col, coarse.r_val,
-            ap_ptr, ap_col, ap_val,
-            coarse.ptr, coarse.col, coarse.val );
+    spgemm_pattern( fine.n, coarse.n, fine.ptr, fine.col,
+                    coarse.p_ptr, coarse.p_col, coarse.ap_ptr, coarse.ap_col );
+    spgemm_pattern( coarse.n, coarse.n, coarse.r_ptr, coarse.r_col,
+                    coarse.ap_ptr, coarse.ap_col, coarse.ptr, coarse.col );
+    coarse.ap_val.assign( coarse.ap_col.size(), 0.0 );
+    coarse.val.assign( coarse.col.size(), 0.0 );
 }
 
 
-/* Greedy 2-coloring of the symmetrized sparsity graph, identical in
- * spirit to RBSOR_Precond::color_graph() (see that file for the full
- * rationale); duplicated here rather than shared so that GMG_Precond
- * has no compile-time dependency on RBSOR_Precond.
+/* Values of the Galerkin operator on the pattern made by
+ * galerkin_pattern().
+ */
+void GMG_Precond::galerkin_values( const Level &fine, Level &coarse ) const
+{
+    const int nt = nthreads();
+    spgemm_values( fine.n, coarse.n, nt, fine.ptr, fine.col, fine.val,
+                   coarse.p_ptr, coarse.p_col, coarse.p_val,
+                   coarse.ap_ptr, coarse.ap_col, coarse.ap_val );
+    spgemm_values( coarse.n, coarse.n, nt, coarse.r_ptr, coarse.r_col, coarse.r_val,
+                   coarse.ap_ptr, coarse.ap_col, coarse.ap_val,
+                   coarse.ptr, coarse.col, coarse.val );
+}
+
+
+/* Greedy colouring of the rows: every row gets the lowest colour that
+ * no row coupled to it has, where two rows are coupled if either one
+ * has an entry in the other's column. Rows of one colour can therefore
+ * be relaxed in any order, or in parallel, with the same result. A
+ * 5-point stencil gives the usual red-black pair, a 9-point stencil
+ * (every Galerkin level in 2D) four colours.
+ *
+ * node_map is _node_map for level 0, NULL otherwise. Eliminated rows
+ * get no colour, so the smoother never visits them.
  */
 void GMG_Precond::color_graph( Level &lev, const std::vector<int32_t> *node_map ) const
 {
-    /* node_map, when non-NULL, is _node_map: rows whose mesh slot is
-     * eliminated (node_map < 0) are left OUT of the colour lists entirely,
-     * so the smoother never visits them.
-     *
-     * They are inert by construction, not merely unimportant. build_level0()
-     * gives an eliminated slot a single entry, the identity (m,m)=1, and
-     * maps every live row's columns through _row_to_node, which can only
-     * ever produce free nodes -- so nothing anywhere points AT an eliminated
-     * row. solve() fills their rhs with 0. Relaxing one therefore computes
-     *     x[m] <- (1-w)*x[m] + w*0
-     * from x[m] = 0, i.e. it does nothing at all, once per sweep, four
-     * sweeps per V-cycle, twice per BiCGSTAB iteration.
-     *
-     * They were previously visited because the existing skip in relax() is
-     * on inv_diag == 0, and an identity row's diagonal is 1, not 0.
-     *
-     * Only level 0 has eliminated slots -- coarser levels are pure Galerkin
-     * unknowns -- so node_map is passed there and NULL everywhere else. A
-     * coarse row that ends up entirely decoupled still gets zero diagonal
-     * and is still caught by relax()'s existing inv_diag test.
-     */
-    int n = lev.n;
-    std::vector<uint8_t> color( n, 0xFF );
+    const int n = lev.n;
+    const int max_colors = 64;
+    std::vector<int8_t> color( n, -1 );
+    std::vector<uint64_t> taken( n, 0 ); // colours of the earlier rows that have an entry in column i
 
+    lev.color.clear();
     for( int i = 0; i < n; i++ ) {
         if( node_map && (*node_map)[i] < 0 )
             continue;
-        bool red_taken = false, black_taken = false;
+
+        uint64_t t = taken[i];
         for( int p = lev.ptr[i]; p < lev.ptr[i+1]; p++ ) {
             int j = lev.col[p];
-            if( j == i || j < 0 || j >= n )
-                continue;
-            if( color[j] == 0 ) red_taken = true;
-            else if( color[j] == 1 ) black_taken = true;
+            if( j != i && color[j] >= 0 )
+                t |= uint64_t(1) << color[j];
         }
-        if( !red_taken ) color[i] = 0;
-        else if( !black_taken ) color[i] = 1;
-        else color[i] = 2;
-    }
 
-    for( int i = 0; i < n; i++ ) {
-        if( node_map && (*node_map)[i] < 0 ) continue;
-        if( color[i] == 2 ) continue;
+        int c = 0;
+        while( c < max_colors && (t & (uint64_t(1) << c)) )
+            c++;
+        if( c == max_colors )
+            throw( Error( ERROR_LOCATION, "matrix row coupled to too many others to colour" ) );
+
+        color[i] = c;
+        if( c == (int)lev.color.size() )
+            lev.color.push_back( std::vector<uint32_t>() );
+        lev.color[c].push_back( i );
+
         for( int p = lev.ptr[i]; p < lev.ptr[i+1]; p++ ) {
             int j = lev.col[p];
-            if( j == i || j < 0 || j >= n )
-                continue;
-            if( color[j] == color[i] )
-                color[ std::max(i,j) ] = 2;
+            if( j != i )
+                taken[j] |= uint64_t(1) << c;
         }
-    }
-
-    lev.red.clear(); lev.black.clear(); lev.leftover.clear();
-    for( int i = 0; i < n; i++ ) {
-        if( node_map && (*node_map)[i] < 0 ) continue;
-        if( color[i] == 0 ) lev.red.push_back( (uint32_t)i );
-        else if( color[i] == 1 ) lev.black.push_back( (uint32_t)i );
-        else lev.leftover.push_back( (uint32_t)i );
-    }
-
-    if( !lev.leftover.empty() ) {
-        ibsimu.message( 2 ) << "GMG_Precond: " << lev.leftover.size()
-                            << " of " << n
-                            << " rows could not be 2-coloured at this level, "
-                            << "processing them serially\n";
-        ibsimu.flush();
     }
 }
 
 
-/* Stores the *raw* reciprocal diagonal 1/aii, not w/aii -- the
- * relaxation factor is applied explicitly by relax()/relax_serial()
- * instead, so that the same precomputed inv_diag can be reused with
- * different w for pre-/post-smoothing (w=1, plain Gauss-Seidel -- a
- * good high-frequency error *smoother*) versus the coarsest-level
- * solve (w>1 over-relaxation can give substantially faster asymptotic
- * *convergence*, which is what actually matters there; see
- * coarse_w in the constructor).
- */
 void GMG_Precond::find_diagonals( Level &lev ) const
 {
-    int n = lev.n;
-    lev.diag_idx.assign( n, -1 );
-    lev.inv_diag.assign( n, 0.0 );
-    for( int i = 0; i < n; i++ ) {
+    lev.diag_idx.assign( lev.n, -1 );
+    lev.inv_diag.assign( lev.n, 0.0 );
+    for( int i = 0; i < lev.n; i++ ) {
         for( int p = lev.ptr[i]; p < lev.ptr[i+1]; p++ ) {
             if( lev.col[p] == i ) {
                 lev.diag_idx[i] = p;
-                if( lev.val[p] != 0.0 )
-                    lev.inv_diag[i] = 1.0 / lev.val[p];
                 break;
             }
         }
@@ -541,58 +485,43 @@ void GMG_Precond::find_diagonals( Level &lev ) const
 }
 
 
-/* Precompute the scatter tables used by construct() to apply the
- * level0->level1 Galerkin update cheaply. Only level 0's diagonal
- * changes between construct() calls (see the class-level comment on
- * the corresponding members in gmg_precond.hpp), so writing
- * A0 = A0_ref + diag(delta) (A0_ref being whatever level 0 looked like
- * when this was last called from prepare(), delta the change since
- * then) gives, via the Galerkin definition A1 = R0*A0*P0:
- *
- *   A1 = R0*A0_ref*P0 + R0*diag(delta)*P0
- *      = A1_ref                + R0*diag(delta)*P0
- *
- * A1_ref is exactly the level-1 operator galerkin_coarsen() already
- * built in prepare() (cached below as _lvl1_lin_val). For the second
- * term, using R0 = c*P0^T (c = 1/2^dim, see build_transfer_operators()):
- *
- *   R0*diag(delta)*P0 = c * P0^T * diag(delta) * P0
- *
- * so its (I,J) entry is c * sum_m delta[m]*P0[m,I]*P0[m,J] -- a sum
- * over fine rows m, each contributing a small (<= (2^dim)^2) dense
- * outer product of its own P-row with itself. This function walks
- * every fine row once and, for every (I,J) pair its P-row touches,
- * looks up that entry's position in level 1's (fixed-pattern) CSR
- * storage, recording the (fine row, level1.val index, coefficient)
- * triple. construct() then just scatter-accumulates
- * delta[m]*coefficient into level1.val at those indices every call --
- * O(fine.n * average-stencil^2) cheap array writes instead of a
- * general hash-map-based sparse-sparse product over the largest
- * matrix in the hierarchy, every single Newton iteration.
- *
- * The lookup below assumes every (I,J) pair produced this way already
- * exists in level 1's pattern; that holds because A1_ref's own
- * pattern is the union of contributions from every nonzero of A0_ref
- * (off-diagonal *and* diagonal), and A0_ref's diagonal is a fully
- * generic (essentially never exactly zero) physical value at every
- * free node, so the diagonal-only pattern is already a subset of
- * A1_ref's pattern. If some pathological entry is ever missing anyway
- * (e.g. a genuinely zero reference diagonal at some node), the
- * contribution is just dropped rather than throwing: this is a
- * preconditioner, so the very worst case is a slightly less accurate
- * M^-1, never an incorrect BiCGSTAB/Newton result.
+/* inv_diag = 1/aii, or 0 for a row with no usable diagonal, which the
+ * smoother then skips. A coarse node whose fine nodes are all
+ * eliminated has such a row. The relaxation factor is applied by the
+ * smoother, so that the same inv_diag serves any w.
  */
-void GMG_Precond::build_delta_update_tables( void )
+void GMG_Precond::update_inv_diag( Level &lev ) const
+{
+    for_rows( lev.n, nthreads(), [&]( int i ) {
+        int di = lev.diag_idx[i];
+        lev.inv_diag[i] = (di >= 0 && lev.val[di] != 0.0 ? 1.0/lev.val[di] : 0.0);
+    } );
+}
+
+
+/* Tables for the cheap update of level 1 in construct(). Only the
+ * diagonal of level 0 changes after prepare(), so with delta = (level 0
+ * diagonal now) - (level 0 diagonal at prepare())
+ *
+ *   A1 = R*(A0_ref + diag(delta))*P = A1_ref + c * P^T*diag(delta)*P ,
+ *
+ * c = 1/2^dim. Entry (I,J) of the last term is
+ * c * sum_m delta[m]*P[m,I]*P[m,J], so each fine row m adds
+ * c*P[m,I]*P[m,J]*delta[m] to every level 1 entry (I,J) it
+ * interpolates from. The (m, coefficient) pairs are stored here per
+ * level 1 entry, in CSR form and in ascending m.
+ */
+void GMG_Precond::build_delta_tables( void )
 {
     _lvl0_diag_ref.clear();
+    _lvl0_delta.clear();
     _lvl1_lin_val.clear();
+    _delta_ptr.clear();
     _delta_src.clear();
-    _delta_dst.clear();
     _delta_coef.clear();
-    _delta_group.clear();
 
     if( _level.size() < 2 )
-        return; // no coarser level exists to update this way
+        return;
 
     const Level &lev0 = _level[0];
     const Level &lev1 = _level[1];
@@ -603,135 +532,102 @@ void GMG_Precond::build_delta_update_tables( void )
         if( di >= 0 )
             _lvl0_diag_ref[m] = lev0.val[di];
     }
-
+    _lvl0_delta.assign( lev0.n, 0.0 );
     _lvl1_lin_val = lev1.val;
 
     double c = 1.0;
     for( uint32_t d = 0; d < _dim; d++ )
         c *= 0.5;
 
-    int nfine = (int)lev1.p_ptr.size()-1;
-
-    int nthr = omp_get_max_threads();
-    std::vector< std::vector<int32_t> > src_buf( nthr );
-    std::vector< std::vector<int32_t> > dst_buf( nthr );
-    std::vector< std::vector<double> >  coef_buf( nthr );
-
-    #pragma omp parallel
-    {
-        int tid = omp_get_thread_num();
-        std::vector<int32_t> &src  = src_buf[tid];
-        std::vector<int32_t> &dst  = dst_buf[tid];
-        std::vector<double>  &coef = coef_buf[tid];
-
-        #pragma omp for schedule(dynamic,256)
-        for( int m = 0; m < nfine; m++ ) {
-            int p0 = lev1.p_ptr[m], p1 = lev1.p_ptr[m+1];
-            for( int a = p0; a < p1; a++ ) {
-                int Ia = lev1.p_col[a];
-                double wa = lev1.p_val[a];
-                for( int b = p0; b < p1; b++ ) {
-                    int Ib = lev1.p_col[b];
-                    double wb = lev1.p_val[b];
-
-                    int found = -1;
-                    for( int p = lev1.ptr[Ia]; p < lev1.ptr[Ia+1]; p++ ) {
-                        if( lev1.col[p] == Ib ) {
-                            found = p;
-                            break;
-                        }
+    // (level 1 entry, fine row, coefficient), in ascending fine row.
+    std::vector<int32_t> dst, src;
+    std::vector<double> coef;
+    for( int m = 0; m < lev0.n; m++ ) {
+        int p0 = lev1.p_ptr[m], p1 = lev1.p_ptr[m+1];
+        for( int a = p0; a < p1; a++ ) {
+            int Ia = lev1.p_col[a];
+            for( int b = p0; b < p1; b++ ) {
+                int Ib = lev1.p_col[b];
+                for( int p = lev1.ptr[Ia]; p < lev1.ptr[Ia+1]; p++ ) {
+                    if( lev1.col[p] == Ib ) {
+                        dst.push_back( p );
+                        src.push_back( m );
+                        coef.push_back( c*lev1.p_val[a]*lev1.p_val[b] );
+                        break;
                     }
-                    if( found < 0 )
-                        continue; // see function comment -- defensive, should not happen
-
-                    src.push_back( m );
-                    dst.push_back( found );
-                    coef.push_back( c*wa*wb );
                 }
             }
         }
     }
 
-    size_t total = 0;
-    for( int t = 0; t < nthr; t++ )
-        total += src_buf[t].size();
-    _delta_src.reserve( total );
-    _delta_dst.reserve( total );
-    _delta_coef.reserve( total );
-    for( int t = 0; t < nthr; t++ ) {
-        _delta_src.insert( _delta_src.end(), src_buf[t].begin(), src_buf[t].end() );
-        _delta_dst.insert( _delta_dst.end(), dst_buf[t].begin(), dst_buf[t].end() );
-        _delta_coef.insert( _delta_coef.end(), coef_buf[t].begin(), coef_buf[t].end() );
+    // Counting sort by level 1 entry; keeps the fine rows ascending.
+    _delta_ptr.assign( lev1.val.size()+1, 0 );
+    for( size_t k = 0; k < dst.size(); k++ )
+        _delta_ptr[ dst[k]+1 ]++;
+    for( size_t p = 0; p < lev1.val.size(); p++ )
+        _delta_ptr[p+1] += _delta_ptr[p];
+
+    _delta_src.resize( dst.size() );
+    _delta_coef.resize( dst.size() );
+    std::vector<size_t> cursor( _delta_ptr.begin(), _delta_ptr.end()-1 );
+    for( size_t k = 0; k < dst.size(); k++ ) {
+        size_t q = cursor[ dst[k] ]++;
+        _delta_src[q]  = src[k];
+        _delta_coef[q] = coef[k];
+    }
+}
+
+
+/* Dense LU factorisation with partial pivoting of the coarsest
+ * operator, for coarse_solve(). Leaves _lu empty if the level is too
+ * large or the operator is singular; coarse_solve() then relaxes.
+ */
+void GMG_Precond::factor_coarsest( void )
+{
+    const Level &lev = _level.back();
+    const int n = lev.n;
+
+    _lu.clear();
+    if( n > GMG_DIRECT_MAX_ROWS )
+        return;
+
+    _lu.assign( (size_t)n*n, 0.0 );
+    _lu_piv.assign( n, 0 );
+    for( int i = 0; i < n; i++ ) {
+        if( lev.inv_diag[i] == 0.0 ) {
+            // A row the smoother skips, see update_inv_diag().
+            // coarse_solve() keeps its unknown at zero.
+            _lu[i*n+i] = 1.0;
+            continue;
+        }
+        for( int p = lev.ptr[i]; p < lev.ptr[i+1]; p++ )
+            _lu[ i*n+lev.col[p] ] = lev.val[p];
     }
 
-    /* GROUP THE TRIPLES BY DESTINATION.
-     *
-     * The apply loop used to scatter these with atomic_add_double(), which
-     * is correct but NOT reproducible: floating-point addition is not
-     * associative, so the value landing in lev1.val depended on the order
-     * the threads happened to arrive in. That made the preconditioner --
-     * and therefore epot -- differ in its last bits between two runs of the
-     * same binary on the same input.
-     *
-     * That is not a harmless last-bit difference. It is the first link in a
-     * chain: the trajectory integrator's step controller drives the local
-     * error estimate to sit AT its tolerance by construction, so an
-     * arbitrarily small change in the field flips accept/reject decisions.
-     * Measured on the ECR cut case, two runs of one binary differed by
-     * hundreds of ODE steps out of two million in cycle 0 alone, and the
-     * iteration then amplified that over cycles.
-     *
-     * Sorting by destination lets each destination be summed by exactly one
-     * thread, in a fixed index order. Deterministic, and faster -- the CAS
-     * loop is gone.
-     *
-     * The sort key is the FULL TRIPLE (dst, src, coef), not dst alone.
-     * An earlier version used stable_sort on dst only, reasoning that the
-     * build order was deterministic because the per-thread buffers are
-     * concatenated in thread order. That reasoning was wrong: the build
-     * loop above is schedule(dynamic,256), so WHICH rows land in which
-     * thread's buffer varies from run to run, and a stable sort faithfully
-     * preserves that varying order within each destination group. The
-     * summation order therefore still varied, and so did the result -- the
-     * bug survived the fix that was supposed to remove it.
-     *
-     * Ordering on the whole triple is canonical regardless of how the
-     * triples were generated, so it is robust to the schedule clause rather
-     * than dependent on it. Any triples identical in all three fields are
-     * interchangeable, so ties among them cannot affect the sum.
-     */
-    const size_t ntot = _delta_dst.size();
-    std::vector<size_t> perm( ntot );
-    std::iota( perm.begin(), perm.end(), (size_t)0 );
-    std::sort( perm.begin(), perm.end(),
-               [&]( size_t a, size_t b ) {
-                   if( _delta_dst[a] != _delta_dst[b] )
-                       return( _delta_dst[a] < _delta_dst[b] );
-                   if( _delta_src[a] != _delta_src[b] )
-                       return( _delta_src[a] < _delta_src[b] );
-                   return( _delta_coef[a] < _delta_coef[b] );
-               } );
+    for( int k = 0; k < n; k++ ) {
+        int piv = k;
+        for( int i = k+1; i < n; i++ ) {
+            if( fabs( _lu[i*n+k] ) > fabs( _lu[piv*n+k] ) )
+                piv = i;
+        }
+        if( _lu[piv*n+k] == 0.0 ) {
+            _lu.clear();
+            return;
+        }
+        _lu_piv[k] = piv;
+        if( piv != k )
+            std::swap_ranges( &_lu[k*n], &_lu[k*n]+n, &_lu[piv*n] );
 
-    std::vector<int32_t> s2( ntot ), d2( ntot );
-    std::vector<double>  c2( ntot );
-    for( size_t i = 0; i < ntot; i++ ) {
-        s2[i] = _delta_src[ perm[i] ];
-        d2[i] = _delta_dst[ perm[i] ];
-        c2[i] = _delta_coef[ perm[i] ];
+        const double inv = 1.0/_lu[k*n+k];
+        for( int i = k+1; i < n; i++ ) {
+            const double f = _lu[i*n+k]*inv;
+            _lu[i*n+k] = f;
+            if( f != 0.0 ) {
+                for( int j = k+1; j < n; j++ )
+                    _lu[i*n+j] -= f*_lu[k*n+j];
+            }
+        }
     }
-    _delta_src.swap( s2 );
-    _delta_dst.swap( d2 );
-    _delta_coef.swap( c2 );
-
-    _delta_group.clear();
-    for( size_t i = 0; i < ntot; ) {
-        size_t j = i;
-        while( j < ntot && _delta_dst[j] == _delta_dst[i] )
-            j++;
-        _delta_group.push_back( i );
-        i = j;
-    }
-    _delta_group.push_back( ntot );
 }
 
 
@@ -743,8 +639,7 @@ void GMG_Precond::prepare( const CRowMatrix &A )
     int nfull = (int)( _nx0 * (_dim>=2?_ny0:1) * (_dim>=3?_nz0:1) );
 
     if( _node_map.empty() ) {
-        // No elimination map supplied -- fall back to assuming every
-        // mesh node has its own row (A.rows() == nx*ny*nz).
+        // No map given: every mesh node has its own row.
         if( A.rows() != nfull )
             throw( ErrorDim( ERROR_LOCATION, "matrix size does not match nx*ny*nz given to "
                               "GMG_Precond, and no node map was supplied via set_node_map(). "
@@ -781,6 +676,7 @@ void GMG_Precond::prepare( const CRowMatrix &A )
     build_level0( A );
     color_graph( _level[0], &_node_map );
     find_diagonals( _level[0] );
+    update_inv_diag( _level[0] );
 
     uint32_t maxlevels = (_nlevels_req == 0 ? 0xFFFFFFFF : _nlevels_req);
 
@@ -799,17 +695,26 @@ void GMG_Precond::prepare( const CRowMatrix &A )
 
         const std::vector<int32_t> *fine_map = (_level.size() == 1 ? &_node_map : NULL);
         build_transfer_operators( fine, coarse, fine_map );
-        galerkin_coarsen( fine, coarse );
+        galerkin_pattern( fine, coarse );
+        galerkin_values( fine, coarse );
         color_graph( coarse, NULL );
         find_diagonals( coarse );
+        update_inv_diag( coarse );
 
         _level.push_back( std::move(coarse) );
     }
 
-    build_delta_update_tables();
+    build_delta_tables();
+    if( _level.size() >= 2 ) {
+        // Level 1 is updated through the delta tables from here on, so
+        // its intermediate product is not needed again.
+        Level &lev1 = _level[1];
+        std::vector<int>().swap( lev1.ap_ptr );
+        std::vector<int>().swap( lev1.ap_col );
+        std::vector<double>().swap( lev1.ap_val );
+    }
+    factor_coarsest();
 
-    // Scratch buffers, one pair per level, sized once and reused by
-    // every call to solve().
     _x.assign( _level.size(), std::vector<double>() );
     _b.assign( _level.size(), std::vector<double>() );
     _r.assign( _level.size(), std::vector<double>() );
@@ -819,25 +724,12 @@ void GMG_Precond::prepare( const CRowMatrix &A )
         _r[l].assign( _level[l].n, 0.0 );
     }
 
-    // Report how much of level 0 the smoother actually sweeps. Level 0 is
-    // full-mesh sized by construction (the geometric transfer operators
-    // need a structured grid), so on a geometry with many eliminated nodes
-    // -- Dirichlet electrodes, or a Neumann mask -- the gap between this
-    // and the level size is the work the colour lists now skip.
-    {
-        size_t swept = _level[0].red.size() + _level[0].black.size()
-                     + _level[0].leftover.size();
-        ibsimu.message( 1 ) << "GMG_Precond: smoother sweeps " << swept
-                            << " of " << _level[0].n << " level-0 rows ("
-                            << (100.0*swept/_level[0].n) << " %), "
-                            << (_level[0].n - swept)
-                            << " eliminated rows skipped\n";
-    }
-
     ibsimu.message( 1 ) << "GMG_Precond: built " << _level.size() << " level(s), sizes:";
     for( size_t l = 0; l < _level.size(); l++ )
         ibsimu.message( 1 ) << " " << _level[l].n;
     ibsimu.message( 1 ) << "\n";
+    ibsimu.message( 1 ) << "GMG_Precond: coarsest level solved by "
+                        << (_lu.empty() ? "relaxation" : "LU") << "\n";
     if( nfull > 0 )
         ibsimu.message( 1 ) << "GMG_Precond: " << (nfull-A.rows()) << " of " << nfull
                             << " mesh nodes (" << (100.0*(nfull-A.rows())/nfull)
@@ -848,28 +740,10 @@ void GMG_Precond::prepare( const CRowMatrix &A )
 }
 
 
-/* prepare() (called once, lazily, from here on first use) builds
- * everything that depends only on A's sparsity PATTERN: level sizing,
- * the geometric transfer operators P/R, and the red/black/leftover
- * coloring at every level -- all fixed for the lifetime of this
- * preconditioner, since the discretization's nonzero pattern never
- * changes (only the nonlinear plasma model's Jacobian VALUES do, via
- * its diagonal contribution). prepare() also performs an initial
- * values pass (level-0 embedding + Galerkin coarsening) as a side
- * effect of bootstrapping the hierarchy, which is why construct()
- * does not need to repeat that work on the very first call.
- *
- * Every call after the first must still refresh VALUE-dependent state
- * throughout the hierarchy: level 0's embedded values (from A, which
- * generally differs from the matrix prepare() last saw -- e.g. a new
- * Newton round or new major cycle), level 0's diagonal, and every
- * coarser level's Galerkin-coarsened operator + diagonal (rebuilt from
- * the now-current fine values). Skipping this after the first call was
- * a real bug: it silently reused a hierarchy frozen at whatever
- * Jacobian prepare() happened to see once, for the rest of the
- * preconditioner's lifetime, degrading (though never breaking
- * correctness of) BiCGSTAB's convergence rate more and more as the
- * actual matrix drifted from that frozen snapshot.
+/* Values-only refresh of the hierarchy that prepare() built. Only the
+ * diagonal of A may differ from the matrix prepare() saw (the plasma
+ * and compensation terms of the Jacobian); any other change needs
+ * clear() first.
  */
 void GMG_Precond::construct( const CRowMatrix &A )
 {
@@ -878,249 +752,39 @@ void GMG_Precond::construct( const CRowMatrix &A )
         return;
     }
 
+    const int nt = nthreads();
+
     refresh_level0_values( A );
-    find_diagonals( _level[0] );
+    update_inv_diag( _level[0] );
 
     if( _level.size() >= 2 ) {
-        // Cheap incremental update of level 1's Galerkin operator --
-        // see build_delta_update_tables() for the derivation. This
-        // replaces what used to be a full general sparse-sparse
-        // Galerkin product here (the single most expensive one in the
-        // hierarchy, since level 0 is by far the largest level) with
-        // an O(nnz) reset + scatter-accumulate.
-        Level &lev1 = _level[1];
-        lev1.val = _lvl1_lin_val;
-
+        // Level 1 = its prepare() values + R*diag(delta)*P, see
+        // build_delta_tables(). Each entry is summed by one thread in
+        // a fixed order, so the result does not depend on threading.
         const Level &lev0 = _level[0];
-        size_t ntriples = _delta_src.size();
+        Level &lev1 = _level[1];
 
-        // One destination per iteration, summed in fixed index order -- no
-        // atomics, and bit-reproducible. See the grouping in
-        // build_delta_triples().
-        (void)ntriples;
-        const size_t ngroup = _delta_group.size() - 1;
-        #pragma omp parallel for schedule(static)
-        for( size_t g = 0; g < ngroup; g++ ) {
+        for_rows( lev0.n, nt, [&]( int m ) {
+            int di = lev0.diag_idx[m];
+            _lvl0_delta[m] = (di >= 0 ? lev0.val[di] - _lvl0_diag_ref[m] : 0.0);
+        } );
+
+        for_rows( (int)lev1.val.size(), nt, [&]( int p ) {
             double acc = 0.0;
-            for( size_t k = _delta_group[g]; k < _delta_group[g+1]; k++ ) {
-                int m = _delta_src[k];
-                int di = lev0.diag_idx[m];
-                double curdiag = (di >= 0 ? lev0.val[di] : 0.0);
-                double delta = curdiag - _lvl0_diag_ref[m];
-                if( delta == 0.0 )
-                    continue;
-                acc += delta*_delta_coef[k];
-            }
-            if( acc != 0.0 )
-                lev1.val[ _delta_dst[ _delta_group[g] ] ] += acc;
-        }
+            for( size_t k = _delta_ptr[p]; k < _delta_ptr[p+1]; k++ )
+                acc += _delta_coef[k]*_lvl0_delta[ _delta_src[k] ];
+            lev1.val[p] = _lvl1_lin_val[p] + acc;
+        } );
 
-        find_diagonals( lev1 );
+        update_inv_diag( lev1 );
     }
 
     for( size_t l = 2; l < _level.size(); l++ ) {
-        galerkin_coarsen( _level[l-1], _level[l] );
-        find_diagonals( _level[l] );
-    }
-}
-
-
-/* *****************************************************************************
- * Smoother (same red-black SOR as RBSOR_Precond, per level)
- */
-
-void GMG_Precond::relax( const Level &lev, std::vector<double> &x, const std::vector<double> &b,
-                          const std::vector<uint32_t> &rows, double w ) const
-{
-    const int *ptr = lev.ptr.data();
-    const int *col = lev.col.data();
-    const double *val = lev.val.data();
-    const double *inv_diag = lev.inv_diag.data();
-    const double w2 = 1.0-w;
-
-    #pragma omp for schedule(static)
-    for( size_t k = 0; k < rows.size(); k++ ) {
-
-        uint32_t i = rows[k];
-        double inv = inv_diag[i];
-        if( inv == 0.0 )
-            continue;
-
-        double sum = b[i];
-        int p0 = ptr[i], p1 = ptr[i+1];
-        for( int p = p0; p < p1; p++ ) {
-            int j = col[p];
-            if( j != (int)i )
-                sum -= val[p]*x[j];
-        }
-        x[i] = w*sum*inv + w2*x[i];
-    }
-}
-
-
-/* Leftover (un-colourable) rows, updated serially in index order --
- * identical rationale to RBSOR_Precond::sweep_serial(). Called from
- * inside an "omp single" section by the caller.
- */
-void GMG_Precond::relax_serial( const Level &lev, std::vector<double> &x, const std::vector<double> &b,
-                                 const std::vector<uint32_t> &rows, double w ) const
-{
-    const double w2 = 1.0-w;
-
-    for( size_t k = 0; k < rows.size(); k++ ) {
-        uint32_t i = rows[k];
-        int di = lev.diag_idx[i];
-        if( di < 0 )
-            continue;
-        double aii = lev.val[di];
-        if( aii == 0.0 )
-            continue;
-
-        double sum = b[i];
-        for( int p = lev.ptr[i]; p < lev.ptr[i+1]; p++ ) {
-            int j = lev.col[p];
-            if( j == (int)i )
-                continue;
-            sum -= lev.val[p]*x[j];
-        }
-        double xnew = sum/aii;
-        x[i] = w*xnew + w2*x[i];
-    }
-}
-
-
-/* Squared L2 norm of the residual r = b - A*x on level lev, computed
- * in parallel (residual() already is), then reduced to a single
- * scalar visible to every thread via "single ... copyprivate" -- the
- * standard OpenMP idiom for "one thread computes a value, all threads
- * need to see it", used here rather than a reduction clause because
- * this is called from deep inside the recursive vcycle() call chain,
- * not directly inside the enclosing "omp parallel" block, so there is
- * no single shared reduction variable in scope to reduce into.
- */
-double GMG_Precond::residual_norm2( const Level &lev, const std::vector<double> &x, const std::vector<double> &b,
-                                     std::vector<double> &r ) const
-{
-    residual( lev, x, b, r );
-
-    double s = 0.0;
-    #pragma omp single copyprivate(s)
-    {
-        double acc = 0.0;
-        for( int i = 0; i < lev.n; i++ )
-            acc += r[i]*r[i];
-        s = acc;
-    }
-    return( s );
-}
-
-
-/* Coarsest-level solve: relax until the residual has dropped by a
- * factor of at least _coarse_rtol relative to where it started, or
- * _ncoarse_sweeps sweeps have been done, whichever comes first. This
- * replaces always doing a fixed number of sweeps -- on an easy right
- * hand side (e.g. later BiCGSTAB iterations, once the correction is
- * already small) a handful of sweeps is often enough, while on a hard
- * one _ncoarse_sweeps acts as a safety cap rather than a promise of
- * convergence. _last_coarse_sweeps records how many sweeps were
- * actually used on the most recent call, for tuning/diagnostics (see
- * last_coarse_sweeps()).
- */
-void GMG_Precond::smooth_to_convergence( const Level &lev, std::vector<double> &x, const std::vector<double> &b,
-                                          uint32_t max_sweeps, double rtol, double w ) const
-{
-    std::vector<double> &r = _r.back(); // scratch buffer sized for the coarsest level
-
-    double rn2_0 = residual_norm2( lev, x, b, r );
-    uint32_t s = 0;
-
-    if( rn2_0 > 0.0 ) {
-        for( ; s < max_sweeps; s++ ) {
-            relax( lev, x, b, lev.red, w );
-            relax( lev, x, b, lev.black, w );
-            #pragma omp single
-            {
-                if( !lev.leftover.empty() )
-                    relax_serial( lev, x, b, lev.leftover, w );
-            }
-
-            double rn2 = residual_norm2( lev, x, b, r );
-            if( rn2 <= rtol*rtol*rn2_0 ) {
-                s++;
-                break;
-            }
-        }
+        galerkin_values( _level[l-1], _level[l] );
+        update_inv_diag( _level[l] );
     }
 
-    #pragma omp single
-    _last_coarse_sweeps = s;
-}
-
-
-void GMG_Precond::smooth( const Level &lev, std::vector<double> &x, const std::vector<double> &b,
-                           uint32_t nsweeps, double w ) const
-{
-    for( uint32_t s = 0; s < nsweeps; s++ ) {
-        relax( lev, x, b, lev.red, w );
-        relax( lev, x, b, lev.black, w );
-        #pragma omp single
-        {
-            if( !lev.leftover.empty() )
-                relax_serial( lev, x, b, lev.leftover, w );
-        }
-    }
-}
-
-
-void GMG_Precond::residual( const Level &lev, const std::vector<double> &x, const std::vector<double> &b,
-                             std::vector<double> &r ) const
-{
-    const int *ptr = lev.ptr.data();
-    const int *col = lev.col.data();
-    const double *val = lev.val.data();
-
-    #pragma omp for schedule(static)
-    for( int i = 0; i < lev.n; i++ ) {
-        double sum = b[i];
-        for( int p = ptr[i]; p < ptr[i+1]; p++ )
-            sum -= val[p]*x[col[p]];
-        r[i] = sum;
-    }
-}
-
-
-void GMG_Precond::restrict_vec( const Level &coarse, const std::vector<double> &rfine,
-                                 std::vector<double> &rcoarse ) const
-{
-    const int *ptr = coarse.r_ptr.data();
-    const int *col = coarse.r_col.data();
-    const double *val = coarse.r_val.data();
-
-    #pragma omp for schedule(static)
-    for( int i = 0; i < coarse.n; i++ ) {
-        double sum = 0.0;
-        for( int p = ptr[i]; p < ptr[i+1]; p++ )
-            sum += val[p]*rfine[col[p]];
-        rcoarse[i] = sum;
-    }
-}
-
-
-void GMG_Precond::prolong_add( const Level &coarse, const std::vector<double> &ecoarse,
-                                std::vector<double> &xfine ) const
-{
-    const int *ptr = coarse.p_ptr.data();
-    const int *col = coarse.p_col.data();
-    const double *val = coarse.p_val.data();
-    int nfine = (int)coarse.p_ptr.size()-1;
-
-    #pragma omp for schedule(static)
-    for( int i = 0; i < nfine; i++ ) {
-        double sum = 0.0;
-        for( int p = ptr[i]; p < ptr[i+1]; p++ )
-            sum += val[p]*ecoarse[col[p]];
-        xfine[i] += sum;
-    }
+    factor_coarsest();
 }
 
 
@@ -1128,44 +792,182 @@ void GMG_Precond::prolong_add( const Level &coarse, const std::vector<double> &e
  * V-cycle
  */
 
-void GMG_Precond::vcycle( uint32_t level, std::vector<double> &x, const std::vector<double> &b ) const
+/* SOR update of the rows of one colour. Rows of a colour do not read
+ * each other (see color_graph()), so the result does not depend on
+ * threading.
+ */
+void GMG_Precond::relax( const Level &lev, const std::vector<uint32_t> &rows,
+                          std::vector<double> &x, const std::vector<double> &b, double w ) const
 {
-    const Level &lev = _level[level];
+    const int *ptr = lev.ptr.data();
+    const int *col = lev.col.data();
+    const double *val = lev.val.data();
+    const double *inv_diag = lev.inv_diag.data();
+    const uint32_t *row = rows.data();
+    const double *bp = b.data();
+    double *xp = x.data();
+    const double w2 = 1.0-w;
 
-    if( level+1 == _level.size() ) {
-        // Coarsest level: relax until converged (relative to its own
-        // starting residual) or the sweep cap is hit. Uses its own
-        // relaxation factor (_coarse_w) rather than the smoothing w,
-        // since here fast convergence is wanted rather than good
-        // high-frequency damping -- see the constructor docs.
-        smooth_to_convergence( lev, x, b, _ncoarse_sweeps, _coarse_rtol, _coarse_w );
+    for_rows( (int)rows.size(), nthreads(), [=]( int k ) {
+        int i = row[k];
+        double inv = inv_diag[i];
+        if( inv == 0.0 )
+            return;
+
+        double sum = bp[i];
+        for( int p = ptr[i]; p < ptr[i+1]; p++ ) {
+            int j = col[p];
+            if( j != i )
+                sum -= val[p]*xp[j];
+        }
+        xp[i] = w*sum*inv + w2*xp[i];
+    } );
+}
+
+
+void GMG_Precond::smooth( const Level &lev, std::vector<double> &x, const std::vector<double> &b,
+                           uint32_t nsweeps, double w ) const
+{
+    for( uint32_t s = 0; s < nsweeps; s++ ) {
+        for( size_t c = 0; c < lev.color.size(); c++ )
+            relax( lev, lev.color[c], x, b, w );
+    }
+}
+
+
+/* r = b - A*x
+ */
+void GMG_Precond::residual( const Level &lev, const std::vector<double> &x, const std::vector<double> &b,
+                             std::vector<double> &r ) const
+{
+    const int *ptr = lev.ptr.data();
+    const int *col = lev.col.data();
+    const double *val = lev.val.data();
+    const double *xp = x.data();
+    const double *bp = b.data();
+    double *rp = r.data();
+
+    for_rows( lev.n, nthreads(), [=]( int i ) {
+        double sum = bp[i];
+        for( int p = ptr[i]; p < ptr[i+1]; p++ )
+            sum -= val[p]*xp[col[p]];
+        rp[i] = sum;
+    } );
+}
+
+
+/* rcoarse = R*rfine
+ */
+void GMG_Precond::restrict_vec( const Level &coarse, const std::vector<double> &rfine,
+                                 std::vector<double> &rcoarse ) const
+{
+    const int *ptr = coarse.r_ptr.data();
+    const int *col = coarse.r_col.data();
+    const double *val = coarse.r_val.data();
+    const double *fp = rfine.data();
+    double *cp = rcoarse.data();
+
+    for_rows( coarse.n, nthreads(), [=]( int i ) {
+        double sum = 0.0;
+        for( int p = ptr[i]; p < ptr[i+1]; p++ )
+            sum += val[p]*fp[col[p]];
+        cp[i] = sum;
+    } );
+}
+
+
+/* xfine += P*ecoarse
+ */
+void GMG_Precond::prolong_add( const Level &coarse, const std::vector<double> &ecoarse,
+                                std::vector<double> &xfine ) const
+{
+    const int *ptr = coarse.p_ptr.data();
+    const int *col = coarse.p_col.data();
+    const double *val = coarse.p_val.data();
+    const double *cp = ecoarse.data();
+    double *fp = xfine.data();
+
+    for_rows( (int)xfine.size(), nthreads(), [=]( int i ) {
+        double sum = 0.0;
+        for( int p = ptr[i]; p < ptr[i+1]; p++ )
+            sum += val[p]*cp[col[p]];
+        fp[i] += sum;
+    } );
+}
+
+
+/* Solves the coarsest level: exactly with the LU factors of
+ * factor_coarsest() if there are any, otherwise by relaxing until the
+ * residual has dropped by the factor _coarse_rtol or _ncoarse_sweeps
+ * sweeps are done.
+ */
+void GMG_Precond::coarse_solve( std::vector<double> &x, const std::vector<double> &b ) const
+{
+    const Level &lev = _level.back();
+    const int n = lev.n;
+    _last_coarse_sweeps = 0;
+
+    if( !_lu.empty() ) {
+        for( int i = 0; i < n; i++ )
+            x[i] = (lev.inv_diag[i] != 0.0 ? b[i] : 0.0);
+        for( int k = 0; k < n; k++ )
+            std::swap( x[k], x[ _lu_piv[k] ] );
+        for( int i = 1; i < n; i++ ) {
+            double sum = x[i];
+            for( int j = 0; j < i; j++ )
+                sum -= _lu[i*n+j]*x[j];
+            x[i] = sum;
+        }
+        for( int i = n-1; i >= 0; i-- ) {
+            double sum = x[i];
+            for( int j = i+1; j < n; j++ )
+                sum -= _lu[i*n+j]*x[j];
+            x[i] = sum/_lu[i*n+i];
+        }
         return;
     }
 
-    // Pre-smoothing
+    std::vector<double> &r = _r.back();
+    double rn2 = 0.0;
+    residual( lev, x, b, r );
+    for( int i = 0; i < n; i++ )
+        rn2 += r[i]*r[i];
+    const double target = _coarse_rtol*_coarse_rtol*rn2;
+
+    while( rn2 > target && _last_coarse_sweeps < _ncoarse_sweeps ) {
+        smooth( lev, x, b, 1, _coarse_w );
+        _last_coarse_sweeps++;
+
+        rn2 = 0.0;
+        residual( lev, x, b, r );
+        for( int i = 0; i < n; i++ )
+            rn2 += r[i]*r[i];
+    }
+}
+
+
+void GMG_Precond::vcycle( uint32_t level, std::vector<double> &x, const std::vector<double> &b ) const
+{
+    if( level+1 == _level.size() ) {
+        coarse_solve( x, b );
+        return;
+    }
+
+    const Level &lev = _level[level];
+    const Level &clev = _level[level+1];
+    std::vector<double> &r = _r[level];
+    std::vector<double> &bc = _b[level+1];
+    std::vector<double> &xc = _x[level+1];
+
     smooth( lev, x, b, _npre, _w );
 
-    // Residual on this level
-    std::vector<double> &r = _r[level];
+    // Coarse correction: solve A_coarse*xc = R*(b - A*x) from xc = 0
     residual( lev, x, b, r );
-
-    // Restrict residual to become the coarse right-hand side
-    const Level &clev = _level[level+1];
-    std::vector<double> &bc = _b[level+1];
     restrict_vec( clev, r, bc );
-
-    // Zero initial guess for the coarse correction
-    std::vector<double> &xc = _x[level+1];
-    #pragma omp single
     std::fill( xc.begin(), xc.end(), 0.0 );
-
-    // Recurse to solve (approximately) for the correction
     vcycle( level+1, xc, bc );
-
-    // Prolong correction back up and apply it
     prolong_add( clev, xc, x );
 
-    // Post-smoothing
     smooth( lev, x, b, _npost, _w );
 }
 
@@ -1181,53 +983,26 @@ void GMG_Precond::solve( Vector &x, const Vector &b ) const
     if( x.size() != b.size() )
         x.resize( b.size() );
 
-    // Embed the dof-sized b into the full-mesh-sized level-0 working
-    // vector: eliminated mesh slots get rhs=0 (their identity row
-    // then keeps them at x=0 throughout, i.e. they are inert). Fixed
-    // linear operator, always starting from zero -- same rationale as
-    // RBSOR_Precond::solve().
-    //
-    // These four passes (two full-mesh fills, then the dof-sized
-    // scatter in and gather out at the end) used to run single-threaded
-    // while everything inside the V-cycle itself was parallel. That is
-    // not a negligible tail: solve() is called TWICE per BiCGSTAB
-    // iteration, so on a large mesh these serial memory-bound sweeps
-    // showed up as a fixed serial cost on every preconditioner
-    // application. They are all trivially data-parallel -- the fills
-    // write disjoint elements, and _row_to_node is a permutation-like
-    // injective map (each dof owns exactly one distinct mesh node), so
-    // the scatter/gather have no write conflicts either.
-    std::vector<double> &x0 = _x[0];
-    std::vector<double> &b0 = _b[0];
-
-    uint32_t nthreads = (_nthreads ? _nthreads : (uint32_t)omp_get_max_threads());
-
-    const size_t n0 = x0.size();
-    double *x0p = x0.data();
-    double *b0p = b0.data();
-    const int32_t *r2n = _row_to_node.data();
+    // The V-cycle works on the full mesh, starting from zero. An
+    // eliminated node has rhs 0 and stays at 0.
+    const int nt = nthreads();
+    const int32_t *node_map = _node_map.data();
+    const int32_t *row_to_node = _row_to_node.data();
+    double *x0 = _x[0].data();
+    double *b0 = _b[0].data();
     const double *bp = b.get_data();
-
-    #pragma omp parallel num_threads(nthreads)
-    {
-        #pragma omp for schedule(static) nowait
-        for( size_t n = 0; n < n0; n++ )
-            x0p[n] = 0.0;
-        #pragma omp for schedule(static)
-        for( size_t n = 0; n < b0.size(); n++ )
-            b0p[n] = 0.0;
-
-        #pragma omp for schedule(static)
-        for( int d = 0; d < dof; d++ )
-            b0p[ r2n[d] ] = bp[d];
-
-        for( uint32_t c = 0; c < _ncycles; c++ )
-            vcycle( 0, x0, b0 );
-    }
-
-    // Extract the dof-sized solution back out of the embedded vector.
     double *xp = x.get_data();
-    #pragma omp parallel for num_threads(nthreads) schedule(static)
-    for( int d = 0; d < dof; d++ )
-        xp[d] = x0p[ r2n[d] ];
+
+    for_rows( _level[0].n, nt, [=]( int m ) {
+        int32_t r = node_map[m];
+        b0[m] = (r >= 0 ? bp[r] : 0.0);
+        x0[m] = 0.0;
+    } );
+
+    for( uint32_t c = 0; c < _ncycles; c++ )
+        vcycle( 0, _x[0], _b[0] );
+
+    for_rows( dof, nt, [=]( int d ) {
+        xp[d] = x0[ row_to_node[d] ];
+    } );
 }

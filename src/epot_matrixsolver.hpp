@@ -108,161 +108,90 @@ protected:
     uint32_t               _dof;           /*!< \brief Degrees of freedom. */
     Node2DoF               _n2d;           /*!< \brief Nodes to degrees of freedom map. */
 
-    /*! \brief Inverse of _n2d for free nodes: DOF index -> mesh node index.
+    /*! \brief Inverse of _n2d for free nodes: row -> mesh node index.
      *
-     *  _n2d stores a MESH index for fixed nodes but a DOF index for free
-     *  ones, and set_link() receives its row as a DOF index and a fixed
-     *  neighbour as a MESH index. Anything that needs to do geometry on a
-     *  row -- currently the Neumann-mask mirror -- must convert back first;
-     *  arithmetic mixing the two spaces yields valid-looking, wrong columns.
+     *  _n2d holds a row number for a free node and a mesh node index for
+     *  a fixed one, so the two must not be mixed in index arithmetic.
      */
     std::vector<int32_t>   _dof2node;
     CRowMatrix            *_fd_mat;        /*!< \brief Finite Difference matrix. */
     Vector                *_fd_vec;        /*!< \brief Finite Difference vector. */
 
-    /*! \brief Derivative vector for nonlinear solution (the D(X) in
-     *  J = J0 + I*D(X)).
+    /*! \brief Electron confinement mask of the compensation model's
+     *  ascent variant: 1 where an electron starting at rest is confined, 0
+     *  where it reaches a solid or leaves the compensation region.
      *
-     *  Owned by value and resized once per preprocess() rather than
-     *  new'd/delete'd inside every get_resjac() call: that allocated and
-     *  freed a _dof-sized vector on every single Newton iteration, and
-     *  leaked it outright whenever the build_mat_vec() call between the
-     *  new and the delete threw. Cleared at the top of get_resjac()
-     *  instead, which also preserves the old behaviour that rows never
-     *  visited by update_nonlinear_node() (i.e. when no plasma model is
-     *  active) read back as exactly zero.
+     *  Covers the node window _cm_i0.._cm_i0+_cm_ni-1 etc. only, the
+     *  bounding box of the compensation region. Nodes outside are not
+     *  confined. Made by update_comp_mask().
      */
-    /*! \brief Trapped/escaped flag per mesh node, for the ascent variant.
-     *
-     *  1 = a cold electron released at rest here is confined; 0 = it reaches
-     *  a solid or leaves the compensation region. Rebuilt from the current
-     *  Newton iterate by update_comp_mask() before each nonlinear scan. */
     std::vector<uint8_t>   _comp_mask;
-
-    /*! \brief Node-index window the mask covers.
-     *
-     *  The mask is stored box-local, not mesh-global, so that memory and the
-     *  ascent sweep scale with the compensated volume. Nodes outside the
-     *  window are treated as unconfined. */
     uint32_t               _cm_i0, _cm_j0, _cm_k0;
     uint32_t               _cm_ni, _cm_nj, _cm_nk;
 
-    /*! \brief Steepest-ascent confinement test, region-confined.
+    /*! \brief Make _comp_mask for the current solution.
      *
-     *  Escape means DESCENDING to a wall, and ascent never descends, so run
-     *  over the whole mesh this test would report every node trapped -- every
-     *  path drains into the source plasma, which is a genuine interior
-     *  maximum of phi. Confined to the compensation region it is exactly the
-     *  right test, because leaving the region through its upstream face IS
-     *  the escape, and that is a condition ascent can see. */
+     *  From every node the potential is followed uphill, which is where a
+     *  cold electron goes. The node is confined if the path ends at a
+     *  potential maximum inside the compensation region.
+     */
     void update_comp_mask( void );
 
 public:
-    /*! \brief Copy the trapped/escaped mask out, 1.0 = confined.
+
+    /*! \brief Copy the confinement mask to \a out, 1.0 = confined.
      *
-     *  The mask is what the ascent variant actually applied, so any
-     *  diagnostic that reconstructs rho_e afterwards MUST use it. Rebuilding
-     *  rho_e from phi - Vref alone describes the plain model instead, and
-     *  reports a compensation onset at the region edge with a ~47 kV
-     *  residual while the solve itself was correct. Empty until a solve has
-     *  run with the ascent variant armed.
+     *  This is the mask that the last solve used, so a diagnostic of the
+     *  electron density has to use it too. Empty before the first solve
+     *  with the ascent variant.
      */
     void get_comp_mask( MeshScalarField &out ) const;
 
 protected:
 
+    /*! \brief Solution dependent part of the jacobian diagonal, the D(X)
+     *  in J = J0 - I*D(X). Written by update_nonlinear_node().
+     */
     Vector                 _d_vec;
     const Vector          *_sol;           /*!< \brief Current solution vector. */
 
     MeshScalarField       *_epot;
     const MeshScalarField *_scharge;
 
-    /*! \brief Per-row buffers used to make build_mat_vec() thread-safe.
+    /*! \brief Linear system, kept from one solve to the next.
      *
-     *  CRowMatrix::construct_add() appends each entry at a single
-     *  shared cursor (the next free slot is only known once every
-     *  earlier row has finished writing), so it cannot be called
-     *  directly from multiple threads working on different rows at
-     *  once. Instead, set_link() buffers each row's (column, value)
-     *  pairs here -- indexed by dof/row so each row's slot is written
-     *  by exactly one thread -- and build_mat_vec() copies them into
-     *  _fd_mat via construct_add() afterwards, in a cheap serial
-     *  compaction pass that does no stencil math.
+     *  The node numbering (_n2d, _dof2node), the matrix J0 (_fd_mat with
+     *  the diagonal _fd_mat_diag0) and the boundary part of the right hand
+     *  side (_fd_vec_bc) depend neither on the solution nor on the space
+     *  charge. build_linear() makes them, and preprocess() calls it only
+     *  when linear_inputs_changed() reports a change or after
+     *  reset_matrix().
+     *
+     *  Per solve, preprocess() adds the space charge term to get
+     *  _fd_vec_base. Per Newton iteration, build_mat_vec() adds the plasma
+     *  terms on top of that and get_resjac() writes the jacobian diagonal
+     *  J0(a,a) - D(a) into _fd_mat.
+     */
+    Vector                  _fd_vec_bc;       /*!< \brief Boundary part of rhs. */
+    Vector                  _fd_vec_base;     /*!< \brief Boundary and space charge part of rhs. */
+    std::vector<uint8_t>    _row_scharge;     /*!< \brief Does the row take a space charge term? */
+    std::vector<double>     _fd_mat_diag0;    /*!< \brief Diagonal of J0. */
+    std::vector<int>        _fd_mat_diag_idx; /*!< \brief Index of each row's diagonal in the value array of _fd_mat. */
+
+    /*! \brief State the linear system was built from, see
+     *  linear_inputs_changed().
+     */
+    uint32_t                _key_revision;    /*!< \brief Geometry revision. */
+    std::vector<uint32_t>   _key_mesh;        /*!< \brief Node tags. */
+    std::vector<double>     _key_epot;        /*!< \brief Potential of fixed nodes. */
+
+    /*! \brief Row entries collected by set_link() during build_linear(),
+     *  empty otherwise.
      */
     std::vector<std::vector<std::pair<int32_t,double> > > _row_entries;
 
-    /*! \brief True once the linear (geometry-only) part of the matrix
-     *  and rhs has been built and cached for the current preprocess()
-     *  .. postprocess() bracket.
-     *
-     *  The matrix stencil (neighbour coefficients, boundary/near-solid
-     *  weighting, Dirichlet-neighbour rhs contributions) and the
-     *  constant space-charge rhs term depend only on the mesh,
-     *  boundary conditions and \a scharge -- none of which change
-     *  between Newton iterations of a single subsolve() call. Only the
-     *  plasma-dependent rhs term and diagonal (_d_vec) actually depend
-     *  on the current solution guess \a X, and those are recomputed
-     *  every call by update_nonlinear_node(). Set back to false by
-     *  reset_matrix(), so it is naturally rebuilt once per solve.
-     */
-    bool                    _linear_built;
-
-    /*! \brief Cached constant (epot-independent) part of the rhs
-     *  vector, snapshotted right after the linear part is built.
-     *  Restored into _fd_vec at the start of every later build_mat_vec()
-     *  call so the nonlinear pass only has to add the plasma term on
-     *  top, instead of re-deriving it from scratch.
-     */
-    Vector                 *_fd_vec_base;
-
-    /*! \brief Cached pure-linear diagonal of _fd_mat (J0(a,a) for each
-     *  row a), captured right after the linear part is built.
-     *
-     *  get_resjac() forms the true Jacobian diagonal each Newton
-     *  iteration as J0(a,a) - D(a) (see build_mat_vec()'s doc comment
-     *  at the top of the file for the R = J0*X - B(X), J = J0 + I*D(X)
-     *  convention). With _fd_mat now a cached, persistent matrix
-     *  instead of one rebuilt from scratch every call, get_resjac()
-     *  can no longer just subtract D(a) from whatever is currently in
-     *  the diagonal -- that would accumulate corrections across
-     *  iterations instead of re-deriving them from the fixed linear
-     *  diagonal. This cache is what lets it set() the diagonal fresh
-     *  from J0(a,a) each time instead.
-     */
-    std::vector<double>     _fd_mat_diag0;
-
-    /*! \brief Flat index into _fd_mat's value array of each row's
-     *  diagonal element, resolved once right after the linear build.
-     *
-     *  get_resjac() rewrites the whole Jacobian diagonal on every Newton
-     *  iteration -- twice, in fact: once to restore J0(a,a) before the
-     *  J0*X multiply, once to write J0(a,a)-D(a) afterwards. Going
-     *  through CRowMatrix::set(a,a) means linear-scanning row a to
-     *  locate the diagonal on each of those 2*_dof accesses, i.e. work
-     *  proportional to the whole nonzero count per Newton iteration, with
-     *  a data-dependent inner branch. The positions never move (the
-     *  matrix structure is fixed for the whole preprocess() ..
-     *  postprocess() bracket, and order_ascending() has already run), so
-     *  they are resolved once here and every later sweep becomes a
-     *  direct indexed write into CRowMatrix::value_ptr().
-     *
-     *  Cleared by reset_matrix(), and rebuilt alongside _fd_mat_diag0,
-     *  so it can never outlive the structure it indexes into.
-     */
-    std::vector<int>        _fd_mat_diag_idx;
-
-    /*! \brief Accumulated time spent in build_mat_vec()'s one-time-per-
-     *  major-cycle linear (geometry+rhs) build -- the part gated by
-     *  _linear_built. Reset by reset_build_timing().
-     */
-    double                  _time_linbuild;
-
-    /*! \brief Accumulated time spent in build_mat_vec()'s nonlinear
-     *  (plasma term) update pass, summed across every call within the
-     *  current subsolve() (i.e. every Newton round and step-size
-     *  backtracking re-evaluation). Reset by reset_build_timing().
-     */
-    double                  _time_nonlin;
+    double                  _time_linbuild;   /*!< \brief Time spent in build_linear(). */
+    double                  _time_nonlin;     /*!< \brief Time spent in the plasma term update. */
 
     /*! \brief Constructor.
      */
@@ -298,191 +227,112 @@ protected:
 
     /*! \brief Preprocess.
      *
-     *  Modify solid mesh suitable for solver, build n2d map and
-     *  linear matrix. Make right-hand-side.
+     *  Modify solid mesh suitable for solver, build the linear system if
+     *  it is not current and make the constant right-hand-side. Returns
+     *  true if the linear system was rebuilt, in which case anything
+     *  derived from the matrix (a preconditioner) is stale.
      */
-    void preprocess( MeshScalarField &epot, const MeshScalarField &scharge );
+    bool preprocess( MeshScalarField &epot, const MeshScalarField &scharge );
 
     /*! \brief Postprocess.
      *
-     *  Return solid mesh back to original state and remove temporary
-     *  variables.
+     *  Return solid mesh back to original state.
      */
     void postprocess( void );
 
-    /*! \brief Reset matrix representation.
+    /*! \brief Drop the linear system. It is rebuilt at the next solve.
      */
     void reset_matrix( void );
 
-    /*! \brief Zero the per-solve build_mat_vec() timing accumulators
-     *  (_time_linbuild, _time_nonlin). Called once at the start of each
-     *  EpotBiCGSTABSolver::subsolve() so the values reported afterward
-     *  reflect that solve only, not an accumulation across the whole
-     *  program run.
+    /*! \brief Zero the timers below. Called at the start of a solve.
      */
     void reset_build_timing( void ) {
 	_time_linbuild = 0.0;
 	_time_nonlin = 0.0;
     }
 
-    /*! \brief Time (seconds) spent in this solve's one-time linear
-     *  (geometry+rhs) matrix build.
+    /*! \brief Time in seconds spent in build_linear() in this solve.
      */
     double time_linbuild( void ) const { return( _time_linbuild ); }
 
-    /*! \brief Time (seconds) spent in this solve's nonlinear (plasma
-     *  term) update passes, summed over every Newton round/backtrack.
+    /*! \brief Time in seconds spent in the plasma term updates of this
+     *  solve.
      */
     double time_nonlin( void ) const { return( _time_nonlin ); }
 
 private:
 
-    /*! \brief Build linear matrix and right-hand-side.
+    /*! \brief Has the geometry, a node tag or a fixed potential changed
+     *  since the previous call?
+     */
+    bool linear_inputs_changed( void );
+
+    /*! \brief Build node numbering, linear matrix and boundary part of
+     *  right-hand-side.
+     */
+    void build_linear( void );
+
+    /*! \brief Set matrix to J0 and build right-hand-side at the current
+     *  solution.
      */
     void build_mat_vec( void );
 
+    /*! \brief Add the term \a val * phi(\a b) to the equation of free node \a a,
+     *  where \a b is an entry of _n2d. A link into a Neumann mask is
+     *  redirected to the mirror node.
+     */
     void set_link( uint32_t a, uint32_t b, double val );
 
     /*! \brief Neumann-mask solids are implemented here, via set_link(). */
     virtual bool supports_neumann_mask( void ) const { return( true ); }
 
-    /*! \brief Add the epot-dependent plasma contribution (rhs term and
-     *  diagonal derivative) for free node \a a at mesh location
-     *  (i,j,k)/x. Called once per Newton iteration for every free node,
-     *  after the cached linear part has been restored into _fd_vec.
-     *  This is the part of the old per-node add_*_node() bodies that
-     *  actually depends on the current solution guess (via _sol) and
-     *  so cannot be cached across Newton iterations. No-op if the
-     *  solver is not using a plasma model.
+    /*! \brief Add the plasma and compensation terms of free node \a a
+     *  at the current solution.
      */
     void update_nonlinear_node( uint32_t a, uint32_t i, uint32_t j, uint32_t k, const Vec3D &x );
 
-    /*! \brief Return the relative permittivity at mesh location
-     *  (\a i, \a j, \a k).
-     *
-     *  1.0 (vacuum) unless Geometry::dielectric_material_at() is
-     *  nonzero there, in which case the solid's Bound (BOUND_DIELECTRIC)
-     *  supplies epsilon_r. Geometry::dielectric_material_at() is O(1)
-     *  and always correct (independent of any stencil/tag
-     *  reclassification -- box edge, near-solid, etc.), so this no
-     *  longer needs its own fast-path/fallback distinction: that used
-     *  to live here as material_number() (raw-tag fast path) and
-     *  self_material_at() (geometric fallback for a reclassified node),
-     *  backed by a solver-private _dielectric_mat cache populated via a
-     *  Geometry::inside() query per node the first time it was needed.
-     *  Both collapsed into this one call once Geometry started
-     *  providing the same already-correct answer directly, for free
-     *  (computed once, during mesh build, rather than reactively).
+    /*! \brief Relative permittivity at node (\a i, \a j, \a k): that
+     *  of the dielectric solid the node is in, otherwise 1.
      */
     double node_epsilon_r( uint32_t i, uint32_t j, uint32_t k ) const;
 
-    /*! \brief Effective coefficient for the face linking free node
-     *  (\a i, \a j, \a k) -- of permittivity \a eps_self and dielectric
-     *  material number \a self_material (0 if plain vacuum) -- to its
-     *  neighbour at (\a ni, \a nj, \a nk), reached in direction \a sign
-     *  (+1/-1) along axis \a coord (0,1,2) and whose raw mesh tag is
-     *  \a neighbor_mesh.
+    /*! \brief Weight of the link from node \a i to its neighbour in
+     *  direction \a sign (-1/+1) on axis \a coord.
      *
-     *  Three cases:
+     *  The node has relative permittivity \a eps_self and is inside
+     *  dielectric solid \a self_material (0 = vacuum). The weight is the
+     *  permittivity of the face between the nodes, in units where a link
+     *  between two vacuum nodes is 1:
      *
-     *  - Neighbour is Dirichlet and is the simulation box edge itself
-     *    (boundary number 1-6, not a user-defined solid): there is no
-     *    material information at a fixed node -- its lower bits
-     *    identify *which* edge, not a permittivity -- so \a eps_self is
-     *    used. This is exact, not an approximation: a dielectric node
-     *    next to the box edge is, by construction, always exactly one
-     *    full cell away from it (see
-     *    Geometry::override_dielectric_box_boundary_3d()), so there is
-     *    no sub-cell position to resolve.
+     *  - same medium at both nodes, or the neighbour on a box face or in
+     *    a Neumann mask: eps_self.
+     *  - neighbour inside an electrode whose surface is at alpha*h:
+     *    eps_self/alpha.
+     *  - a material interface at alpha*h: the two media in series,
+     *    face_epsilon_alpha().
      *
-     *  - Neighbour is Dirichlet and is a real user-defined solid
-     *    (boundary/solid number >=7, e.g. an STL electrode): unlike the
-     *    box edge, this can sit at any sub-cell distance from \a self.
-     *    Bisected against that solid's own geometry
-     *    (Geometry::solid_face_frac()) to find the true distance alpha,
-     *    then eps_self/alpha -- a single resistor of length alpha*h
-     *    through self's own medium, since beyond the conductor surface
-     *    is a known constant (its fixed voltage), not another variable
-     *    material. Reduces to the old flush-contact assumption exactly
-     *    at alpha=1 (a full cell away). This is what makes a dielectric
-     *    touching a conductor at an arbitrary (e.g. STL-to-STL) position
-     *    work correctly, not just when the two happen to be flush.
-     *
-     *  - Neighbour's material (material_number() of \a neighbor_mesh,
-     *    treating near-solid/Neumann/fine-boundary as plain vacuum, 0)
-     *    matches \a self_material: same medium on both sides of this
-     *    face, no correction needed, coefficient is simply \a eps_self.
-     *
-     *  - Neighbour's material (material_number() of \a neighbor_mesh,
-     *    treating near-solid/Neumann/fine-boundary as plain vacuum, 0)
-     *    matches \a self_material: same medium on both sides of this
-     *    face, no correction needed, coefficient is simply \a eps_self.
-     *
-     *  - Otherwise, a genuine material interface crosses this face.
-     *    Its exact sub-cell position is found by bisecting against
-     *    whichever side is an actual dielectric solid (self's own
-     *    material if self is dielectric, else the neighbour's) via
-     *    Geometry::solid_face_frac() -- this is what makes the result
-     *    correct for an arbitrary (e.g. STL-imported) surface, not just
-     *    one that happens to sit exactly halfway between two mesh
-     *    nodes. The two half-cell permittivities are then combined in
-     *    series, weighted by that fractional distance (alpha):
-     *    1/(alpha/eps_self + (1-alpha)/eps_neighbor); this reduces
-     *    exactly to the plain harmonic mean at alpha=0.5 (the
-     *    grid-aligned case) and to eps_self (=eps_neighbor) whenever
-     *    there is in fact no permittivity jump, regardless of alpha.
-     *    Two different dielectric solids directly touching each other
-     *    (both self_material and the neighbour's material nonzero and
-     *    different) are not fully/rigorously handled -- self's own
-     *    material is used for the bisection as a reasonable fallback,
-     *    a documented limitation rather than a crash risk.
-     *
-     *    Geometry::solid_face_frac() always bisects assuming its
-     *    (i,j,k) argument sits outside the target solid; when self is
-     *    in fact the dielectric being bisected against, the bisection
-     *    is done from the neighbour's side instead (walking back with
-     *    -sign) and complemented (1-alpha) -- see the .cpp for why the
-     *    naive self-side call silently returns a nonsense fraction in
-     *    that case.
+     *  The surface positions come from Geometry::solid_face_frac(). The
+     *  1/r factors of a cylindrical geometry are not included.
      */
-    double vacuum_face_coefficient( int32_t i, int32_t j, int32_t k,
-				     int32_t ni, int32_t nj, int32_t nk,
-				     int sign, int coord,
-				     uint32_t neighbor_mesh, uint32_t self_material,
-				     double eps_self ) const;
+    double vacuum_face_coefficient( const int32_t i[3], int coord, int sign,
+				     uint32_t self_material, double eps_self ) const;
 
-    /*! \brief Effective permittivity in series across a face at
-     *  fractional distance \a alpha (0,1] from the \a eps_self side,
-     *  1/(alpha/eps_self + (1-alpha)/eps_neighbor). See
-     *  vacuum_face_coefficient() for the derivation and reduction
-     *  checks (alpha=0.5 gives the plain harmonic mean; eps_self ==
-     *  eps_neighbor gives that common value regardless of alpha).
+    /*! \brief Permittivity of two media in series,
+     *  1/(alpha/eps_self + (1-alpha)/eps_neighbor), the interface being
+     *  at fraction \a alpha of the way from this node to the neighbour.
      */
     static double face_epsilon_alpha( double eps_self, double eps_neighbor, double alpha );
 
-    // add_near_solid_node_1d/2d/cyl/3d's conductor/dielectric/vacuum
-    // triple-point detection, and add_neumann_node_1d/2d/cyl/3d's own
-    // permittivity lookup, now call _geom.dielectric_material_at(i,j,k)
-    // directly -- see that function's doc comment in geometry.hpp. This
-    // used to be a private O(1)-lookup wrapper around a solver-only
-    // _dielectric_mat cache (populated once, ever, via a
-    // Geometry::inside() fallback query per node); promoting the same
-    // logic onto Geometry itself (populated for free during mesh build
-    // instead) let every consumer -- this class, scharge cleanup,
-    // surface triangulation -- share one already-correct answer, so the
-    // solver-private copy of it was removed.
-
+    /* Stencil of a free node (i,j,k) at x, by node type. Each adds the
+     * node's matrix row and the boundary part of its right hand side.
+     */
     void add_vacuum_node( uint32_t i, uint32_t j, uint32_t k, const Vec3D &x );
-    void add_near_solid_node_1d( uint32_t i, const Vec3D &x );
-    void add_near_solid_node_2d( uint32_t i, uint32_t j, const Vec3D &x );
-    void add_near_solid_node_cyl( uint32_t i, uint32_t j, const Vec3D &x );
-    void add_near_solid_node_3d( uint32_t i, uint32_t j, uint32_t k, const Vec3D &x );
     void add_near_solid_node( uint32_t i, uint32_t j, uint32_t k, const Vec3D &x );
-    void add_neumann_node_1d( uint32_t i, const Vec3D &x );
-    void add_neumann_node_2d( uint32_t i, uint32_t j, const Vec3D &x );
-    void add_neumann_node_cyl( uint32_t i, uint32_t j, const Vec3D &x );
-    void add_neumann_node_3d( uint32_t i, uint32_t j, uint32_t k, const Vec3D &x );
     void add_neumann_node( uint32_t i, uint32_t j, uint32_t k, const Vec3D &x );
+    double near_solid_axis( uint32_t a, const int32_t i[3], int coord,
+			    uint8_t bnd, uint8_t cut, double alpha, double beta, const Vec3D &x );
+    double near_solid_radial( uint32_t a, const int32_t i[3],
+			      uint8_t bnd, uint8_t cut, double alpha, double beta, const Vec3D &x );
 
 public:
 
@@ -498,7 +348,8 @@ public:
      */
     virtual void save( std::ostream &s ) const;
 
-    // epot_matrixsolver.hpp, public section
+    /*! \brief Make the mesh node index -> row map, -1 for fixed nodes.
+     */
     void build_node_map( std::vector<int32_t> &map ) const;
 };
 

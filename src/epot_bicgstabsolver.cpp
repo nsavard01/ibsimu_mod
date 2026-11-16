@@ -250,14 +250,9 @@ void EpotBiCGSTABSolver::reset_problem( void )
 }
 
 
-/* Nothing to drop. The cached matrix holds only the linear (geometry)
- * part -- build_mat_vec() re-applies the nonlinear diagonal and rhs from
- * scratch every Newton iteration -- and GMG_Precond::construct() refreshes
- * every level's values on each call. If the fixed-node set did change,
- * subsolve()'s set_node_map() sees the new map and forces a full
- * prepare() anyway. Clearing here instead rebuilt the GMG hierarchy
- * (~20% of run time) on every major cycle for drivers that call
- * set_pexp_plasma() each cycle.
+/* Nothing to drop: plasma parameters enter only through terms that
+ * build_mat_vec() and the preconditioner's construct() recompute on every
+ * Newton iteration.
  */
 void EpotBiCGSTABSolver::reset_nonlinear_parameters( void )
 {
@@ -378,16 +373,20 @@ void EpotBiCGSTABSolver::subsolve( MeshScalarField &epot, const MeshScalarField 
     time_gmg_prepare = time_gmg_construct = 0.0;
     reset_build_timing();
 
-    // Preprocess and set starting guess
-    preprocess( epot, scharge );
+    // Preprocess. A rebuilt linear system makes the preconditioner stale.
+    if( preprocess( epot, scharge ) )
+	_pc->clear();
 
-	GMG_Precond *gmg = dynamic_cast<GMG_Precond*>( _pc );
-	if( gmg ) {
-		std::vector<int32_t> node_map;
-		build_node_map( node_map );   // EpotMatrixSolver::build_node_map(), see earlier
-		gmg->set_node_map( node_map );
-	}
-	
+    // GMG needs to know where each matrix row sits on the mesh. An
+    // unchanged map does not invalidate its hierarchy.
+    GMG_Precond *gmg = dynamic_cast<GMG_Precond*>( _pc );
+    if( gmg ) {
+	std::vector<int32_t> node_map;
+	build_node_map( node_map );
+	gmg->set_node_map( node_map );
+    }
+
+    // Starting guess
     Vector X;
     set_initial_guess( epot, X );
     double maxsize = _geom.size().max();

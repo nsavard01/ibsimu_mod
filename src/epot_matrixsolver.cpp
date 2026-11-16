@@ -119,10 +119,10 @@ void EpotMatrixSolver::Node2DoF::debug_print( std::ostream &os ) const
 
 EpotMatrixSolver::EpotMatrixSolver( Geometry &geom )
     : EpotSolver(geom), _dof(0), _fd_mat(0), _fd_vec(0),
+      _cm_i0(0), _cm_j0(0), _cm_k0(0), _cm_ni(0), _cm_nj(0), _cm_nk(0),
       _sol(0),
-      _linear_built(false), _fd_vec_base(0),
-      _time_linbuild(0.0), _time_nonlin(0.0),
-      _cm_i0(0), _cm_j0(0), _cm_k0(0), _cm_ni(0), _cm_nj(0), _cm_nk(0)
+      _key_revision(0),
+      _time_linbuild(0.0), _time_nonlin(0.0)
 {
 
 }
@@ -141,131 +141,58 @@ EpotMatrixSolver::~EpotMatrixSolver()
         delete _fd_mat;
     if( _fd_vec )
         delete _fd_vec;
-    if( _fd_vec_base )
-        delete _fd_vec_base;
 }
 
 
-/* Set a link in matrix system.
+/* Add the term val*phi(b) to the equation of free node a.
  *
- * Makes the node a dependent on node b. If b is positive this means
- * that element (a,b) of matrix A is set to value val. If b is
- * negative, the node has a fixed potential and the dependence should
- * be added to the vector side of the system of equations on row
- * a. The value of potential at node b is stored in epot(-b).
+ * a is the row and b an entry of _n2d:
+ *   - a free node: val is added to matrix element (a,b).
+ *   - a fixed node of known potential: the term goes to the right hand
+ *     side.
+ *   - a node inside a Neumann mask: the mask surface is a symmetry plane
+ *     through node a, as a Neumann face of the simulation box is, so the
+ *     term goes to the mirror image of b about a. If there is no image
+ *     (off the mesh, or masked as well) it goes to the diagonal, which
+ *     puts the symmetry plane half a cell further out.
  */
 void EpotMatrixSolver::set_link( uint32_t a, uint32_t b, double val )
 {
-    //std::cout << "set_link( a = " << a << ", b = " << b << ", val = " << val << ")\n";
+    const int32_t row = (int32_t)(a & N2D_INDEX_MASK);
+    const int32_t nb  = (int32_t)(b & N2D_INDEX_MASK);
 
-    if( (b & N2D_TYPE_MASK) == N2D_TYPE_FIXED ) {
+    // The entries of a row are collected in _row_entries, see build_linear().
+    if( (b & N2D_TYPE_MASK) != N2D_TYPE_FIXED ) {
+	_row_entries[row].push_back( std::make_pair( nb, val ) );
+	return;
+    }
 
-	/* A link pointing INTO a Neumann-mask solid is a symmetry face:
-	 * redirect it onto the MIRROR-IMAGE node instead of moving it to the
-	 * right hand side.
-	 *
-	 * This matches what ibsimu already does on a Neumann BOX wall, which
-	 * is the convention the rest of the code is built around and which
-	 * should have been the starting point. add_neumann_node_2d() emits
-	 *     set_link( a, _n2d(i,j-1), 2.0*eps_self );   cof += 2.0*eps_self
-	 * -- weight 2*eps on the single INTERIOR neighbour. That is the
-	 * standard five-point stencil with the ghost eliminated by
-	 *     phi_(j+1) := phi_(j-1),
-	 * i.e. a NODE-CENTRED mirror whose zero-derivative plane lies exactly
-	 * ON the boundary node. The factor of two on one neighbour is its
-	 * signature.
-	 *
-	 * The mirror image of neighbour b about node a is 2a - b in linear
-	 * index space, for any axis and any geometry mode, because the mesh
-	 * index is affine: a neighbour is a +-1 or +-nx or +-nx*ny offset, so
-	 * negating the offset negates the index difference. Redirecting the
-	 * face weight there gives, for a node with mask on +y,
-	 *     w_m*phi_(j-1) + w_p*phi_(j-1) - (w_m+w_p)*phi_j
-	 * which for uniform eps is exactly 2*eps*phi_(j-1) - 2*eps*phi_j --
-	 * the box-wall stencil above. The duplicate-column merge in
-	 * build_mat_vec() folds the two entries on column (j-1) into one.
-	 *
-	 * The PREVIOUS version of this sent the weight to the row's own
-	 * diagonal, which imposes phi_ghost = phi_self. That is also a valid
-	 * zero-flux condition, but a FACE-centred one: its symmetry plane
-	 * sits half a cell OUTSIDE the last live node. Particles reflect off
-	 * the analytic solid surface at the node, so field and particles were
-	 * mirroring half a cell apart, leaving a half-cell the field treated
-	 * as symmetric but no particle ever entered. It also did not match
-	 * the *= 2.0 space-charge correction that scharge_finalize_*() applies
-	 * at box walls, which exists precisely because a node-centred mirror
-	 * node owns half a control volume.
-	 *
-	 * Doing it in set_link() still means it applies to every stencil
-	 * builder at once -- add_vacuum_node(), add_neumann_node_1d/2d/cyl/3d(),
-	 * add_near_solid_node_1d/2d/cyl/3d() -- with no per-site changes.
-	 *
-	 * The masked node's own index is a MESH node index here: preprocess()
-	 * sets _n2d(a) = N2D_TYPE_FIXED | a for every fixed node, so the
-	 * index survives unchanged and _geom.mesh() can be queried directly.
-	 */
-	if( SMESH_NODE_IS_NEUMANN_MASK( _geom.mesh( (int32_t)(b & N2D_INDEX_MASK) ) ) ) {
+    // For a fixed node nb is a mesh node index, not a row.
+    if( !SMESH_NODE_IS_NEUMANN_MASK( _geom.mesh( nb ) ) ) {
+	(*_fd_vec)(row) += -val * (*_epot)( nb );
+	return;
+    }
 
-	    /* Mirror in MESH index space. The row index a is a DOF index and
-	     * b (being FIXED) carries a MESH index, so 2*a - b would subtract
-	     * one index space from the other and land on an arbitrary column.
-	     * _dof2node maps the row back to its mesh node first. */
-	    const int32_t dof_a  = (int32_t)(a & N2D_INDEX_MASK);
-	    const int32_t node_a = _dof2node[dof_a];
-	    const int32_t node_b = (int32_t)(b & N2D_INDEX_MASK);
-	    const int32_t node_m = 2*node_a - node_b;   /* image of b about a */
-
-	    if( node_m >= 0 && node_m < (int32_t)_geom.nodecount() ) {
-
-		uint32_t n2d_m = _n2d(node_m);
-
-		if( (n2d_m & N2D_TYPE_MASK) != N2D_TYPE_FIXED ) {
-		    /* Image is a free node: it carries a DOF index, which is
-		     * what a matrix column must be. */
-		    _row_entries[dof_a].push_back(
-			std::make_pair( (int32_t)(n2d_m & N2D_INDEX_MASK), val ) );
-		    return;
-		} else if( !SMESH_NODE_IS_NEUMANN_MASK( _geom.mesh( node_m ) ) ) {
-		    /* Image is a Dirichlet node: its potential is known, so
-		     * the term belongs on the right hand side, exactly as an
-		     * ordinary fixed neighbour would. */
-		    (*_fd_vec)(a) += -val * (*_epot)( node_m );
-		    return;
-		}
-		/* Image is itself masked -- fall through. */
-	    }
-
-	    /* No usable image: off the mesh, or masked on both sides (a live
-	     * region one node wide). Fold onto the diagonal instead, which is
-	     * the face-centred mirror phi_ghost = phi_self. Less accurate,
-	     * but local and diagonally dominant rather than referencing a
-	     * node whose value means nothing. */
-	    _row_entries[dof_a].push_back( std::make_pair( dof_a, val ) );
+    // Mirror image of b about a, which must be on the same mesh line.
+    const int32_t node_a = _dof2node[row];
+    const int32_t node_m = 2*node_a - nb;
+    const int32_t nx = _geom.size(0), nxy = nx*_geom.size(1);
+    const int32_t d = ( nb > node_a ? nb-node_a : node_a-nb );
+    if( node_m >= 0 && node_m < (int32_t)_geom.nodecount() &&
+	( d == 1 ? node_m/nx == node_a/nx : d == nx ? node_m/nxy == node_a/nxy : true ) ) {
+	const uint32_t n2d_m = _n2d(node_m);
+	if( (n2d_m & N2D_TYPE_MASK) != N2D_TYPE_FIXED ) {
+	    _row_entries[row].push_back( std::make_pair( (int32_t)(n2d_m & N2D_INDEX_MASK), val ) );
+	    return;
+	} else if( !SMESH_NODE_IS_NEUMANN_MASK( _geom.mesh( node_m ) ) ) {
+	    (*_fd_vec)(row) += -val * (*_epot)( node_m );
 	    return;
 	}
-
-	//std::cout << "epot = " << (*_epot)(b & N2D_INDEX_MASK) << "\n";
-        (*_fd_vec)(a) += -val * (*_epot)(b & N2D_INDEX_MASK);
-    } else {
-	//std::cout << "matrix construct\n";
-	// Buffered instead of a direct CRowMatrix::construct_add() call
-	// so build_mat_vec() can fill different rows from different
-	// threads -- see _row_entries' doc comment in the header. Row
-	// a's buffer is only ever touched by the single thread that
-	// owns node/row a in build_mat_vec()'s parallel loop.
-	_row_entries[a & N2D_INDEX_MASK].push_back(
-	    std::make_pair( (int32_t)(b & N2D_INDEX_MASK), val ) );
     }
+    _row_entries[row].push_back( std::make_pair( row, val ) );
 }
 
 
-/* Epot-dependent plasma contribution to rhs/diagonal for free node a.
- * Consolidated out of add_vacuum_node()/add_near_solid_node()/
- * add_neumann_node(), which used to each carry an identical copy of
- * this block. Called once per Newton iteration (not cached), since it
- * is the one part of matrix/rhs construction that genuinely depends on
- * the current solution guess X via _sol.
- */
 void EpotMatrixSolver::get_comp_mask( MeshScalarField &out ) const
 {
     const uint32_t nx = _geom.size(0), ny = _geom.size(1), nz = _geom.size(2);
@@ -288,17 +215,15 @@ void EpotMatrixSolver::update_comp_mask( void )
     const uint32_t nx = _geom.size(0), ny = _geom.size(1), nz = _geom.size(2);
     const double h = _geom.h();
 
-    // Node-index window. Cost and memory scale with the COMPENSATED VOLUME
-    // rather than the mesh -- which is what makes this usable in 3D, where a
-    // mesh-wide next[] would run to hundreds of MB for a region occupying a
-    // few percent of the domain.
+    // Node window: the bounding box of the compensation region if set,
+    // otherwise the whole mesh. The work arrays below cover the window only.
     int64_t i0 = 0, j0 = 0, k0 = 0, i1 = (int64_t)nx-1, j1 = (int64_t)ny-1, k1 = (int64_t)nz-1;
-    if( _comp_bbox_set ) {
+    if( _comp.bbox_set ) {
 	const uint32_t n[3] = { nx, ny, nz };
 	int64_t lo[3], hi[3];
 	for( int a = 0; a < 3; a++ ) {
-	    lo[a] = (int64_t)std::floor( (_comp_bmin[a] - _geom.origo(a)) / h );
-	    hi[a] = (int64_t)std::ceil ( (_comp_bmax[a] - _geom.origo(a)) / h );
+	    lo[a] = (int64_t)std::floor( (_comp.bmin[a] - _geom.origo(a)) / h );
+	    hi[a] = (int64_t)std::ceil ( (_comp.bmax[a] - _geom.origo(a)) / h );
 	    if( lo[a] < 0 ) lo[a] = 0;
 	    if( hi[a] > (int64_t)n[a]-1 ) hi[a] = (int64_t)n[a]-1;
 	}
@@ -316,8 +241,6 @@ void EpotMatrixSolver::update_comp_mask( void )
     auto inbox = [&]( int64_t i, int64_t j, int64_t k ) -> bool {
 	return( i>=i0 && i<=i1 && j>=j0 && j<=j1 && k>=k0 && k<=k1 );
     };
-    // phi read per node rather than copied: a double per node would be
-    // hundreds of MB in 3D for no gain.
     auto phi_at = [&]( int64_t i, int64_t j, int64_t k ) -> double {
 	size_t a_full = ((size_t)k*ny + j)*nx + i;
 	uint32_t mesh = _geom.mesh( a_full );
@@ -326,16 +249,17 @@ void EpotMatrixSolver::update_comp_mask( void )
 	return (*_sol)( _n2d( a_full ) & N2D_INDEX_MASK );
     };
     auto in_region = [&]( int64_t i, int64_t j, int64_t k ) -> bool {
-	if( !_comp_region_func ) return( true );
+	if( !_comp.region ) return( true );
 	Vec3D x( _geom.origo(0) + h*i, _geom.origo(1) + h*j, _geom.origo(2) + h*k );
-	return( (*_comp_region_func)(x) );
+	return( (*_comp.region)(x) );
     };
 
-    // next[] = uphill neighbour (box-local); -1 interior maximum,
-    // -2 absorbed, left the box, or left the region.
+    // next[] = window index of the neighbour of highest potential;
+    // -1 if the node is a maximum, -2 if that neighbour is in a solid or
+    // outside the window or the region.
     std::vector<int64_t> next( N, -1 );
     const int di[6] = {-1,1,0,0,0,0}, dj[6] = {0,0,-1,1,0,0}, dk[6] = {0,0,0,0,-1,1};
-#pragma omp parallel for collapse(3) schedule(static)
+#pragma omp parallel for num_threads(ibsimu.get_thread_count()) collapse(3) schedule(static)
     for( int64_t k = k0; k <= k1; k++ ) {
 	for( int64_t j = j0; j <= j1; j++ ) {
 	    for( int64_t i = i0; i <= i1; i++ ) {
@@ -358,7 +282,8 @@ void EpotMatrixSolver::update_comp_mask( void )
 	}
     }
 
-    // Resolve each chain to its terminus, memoised.
+    // Follow next[] from every node. Nodes whose path ends at a maximum
+    // are confined.
     std::vector<uint8_t> done( N, 0 );
     std::vector<size_t> chain;
     for( size_t a0 = 0; a0 < N; a0++ ) {
@@ -379,39 +304,24 @@ void EpotMatrixSolver::update_comp_mask( void )
 }
 
 
+/* Plasma and compensation terms of free node a, mesh node (i,j,k) at x,
+ * at the current solution: the charge term is added to the right hand side
+ * and its derivative is written to _d_vec. Called for every free node on
+ * every Newton iteration.
+ */
 void EpotMatrixSolver::update_nonlinear_node( uint32_t a, uint32_t i, uint32_t j, uint32_t k, const Vec3D &x )
 {
     const bool have_plasma = ( _plasma == PLASMA_PEXP || _plasma == PLASMA_NSIMP ||
                                _plasma == PLASMA_SHIELD );
-    if( !have_plasma && !_comp )
+    if( !have_plasma && !_comp.enabled )
 	return;
 
-    // A dielectric solid's interior is a fixed, chargeless medium --
-    // never actual plasma -- regardless of how close it sits to a real
-    // plasma region. This function is called for every free node
-    // (vacuum, near-solid, and dielectric interior alike, since a
-    // dielectric's own row is otherwise an ordinary free node -- see
-    // build_mesh_parallel_thread_3d()), so without this check the
-    // nonlinear electron/Boltzmann source term below gets added to a
-    // dielectric's own (correctly eps-weighted, charge-free) row too,
-    // pulling its potential toward the plasma equilibrium instead of
-    // solving the linear Laplace equation it should. This also catches
-    // a dielectric node reclassified NEAR_SOLID/NEUMANN at a box edge
-    // or next to a conductor, where the raw tag alone no longer says
-    // "dielectric".
-    //
-    // Geometry::dielectric_material_at() is an O(1) read (see its doc
-    // comment) that's already correct regardless of any such
-    // reclassification, computed once for free during mesh build --
-    // this function runs every Newton iteration (and every step-size
-    // backtracking re-evaluation) for every free node, so it matters
-    // that this isn't a Geometry::inside() query repeated on every call.
+    // There is no plasma inside a dielectric.
     const bool dielectric_free = ( _geom.dielectric_material_at( i, j, k ) == 0 );
 
-    // The two models are ACCUMULATED, not selected between. A source plasma
-    // and a compensated drift coexist in one mesh and a run needs both; they
-    // are gated by SEPARATE region functions because they occupy different
-    // parts of it.
+    // The plasma model and the compensation model are added up. Each has
+    // its own region function, and one mesh can hold both a source plasma
+    // and a compensated drift.
     double fd = 0.0, d = 0.0;
 
     if( dielectric_free && have_plasma ) {
@@ -438,31 +348,29 @@ void EpotMatrixSolver::update_nonlinear_node( uint32_t a, uint32_t i, uint32_t j
 	}
     }
 
-    if( dielectric_free && _comp ) {
+    if( dielectric_free && _comp.enabled ) {
 	bool incomp = true;
-	if( _comp_region_func )
-	    incomp = (*_comp_region_func)(x);
-	if( incomp && _comp_ascent ) {
+	if( _comp.region )
+	    incomp = (*_comp.region)(x);
+	if( incomp && _comp.ascent ) {
+	    // Only where update_comp_mask() found the electrons confined.
 	    if( i < _cm_i0 || i >= _cm_i0+_cm_ni || j < _cm_j0 || j >= _cm_j0+_cm_nj ||
 		k < _cm_k0 || k >= _cm_k0+_cm_nk )
-		incomp = false;      // outside the confinement box
+		incomp = false;
 	    else {
 		size_t a_loc = ((size_t)(k-_cm_k0)*_cm_nj + (j-_cm_j0))*_cm_ni + (i-_cm_i0);
 		if( a_loc >= _comp_mask.size() || !_comp_mask[a_loc] )
-		    incomp = false;  // not confined here: no trapped population
+		    incomp = false;
 	    }
 	}
 	if( incomp ) {
-	    // Prefactor is the LOCAL ion density, exactly as the shield model
-	    // takes its own -- so _scharge must hold ION charge only, with the
-	    // compensating charge generated here rather than supplied.
+	    // The electron density is rho_e = -rho_i*g with the local ion
+	    // density rho_i, so _scharge must hold the ion charge only.
 	    double rho_i = (*_scharge)(i,j,k);
-	    if( rho_i > _compRhoMin ) {
+	    if( rho_i > _comp.rho_min ) {
 		double p = (*_sol)(a);
 		double g, dg;
 		comp_newton( g, dg, p );
-		// rho_e = -rho_i*g contributes -rho_e*h^2/eps0 = +rho_i*g*h^2/eps0,
-		// the same sign convention the other models use.
 		double R = rho_i*_geom.h()*_geom.h()/EPSILON0;
 		fd += R*g;
 		d  += R*dg;
@@ -475,15 +383,11 @@ void EpotMatrixSolver::update_nonlinear_node( uint32_t a, uint32_t i, uint32_t j
 }
 
 
-/* See the doc comment on node_epsilon_r() in the header. */
 double EpotMatrixSolver::node_epsilon_r( uint32_t i, uint32_t j, uint32_t k ) const
 {
     uint32_t solid_number = _geom.dielectric_material_at( i, j, k );
     if( solid_number == 0 )
-	return( 1.0 ); // plain vacuum
-    // boundary(), not get_boundary(): solid_number came straight from
-    // dielectric_material_at() so it is valid by construction, and this
-    // runs per node -- no need to copy a Bound or re-range-check it.
+	return( 1.0 );
     return( _geom.boundary( solid_number ).value() );
 }
 
@@ -494,1075 +398,309 @@ double EpotMatrixSolver::face_epsilon_alpha( double eps_self, double eps_neighbo
 }
 
 
-/* See the doc comment on vacuum_face_coefficient() in the header. */
-double EpotMatrixSolver::vacuum_face_coefficient( int32_t i, int32_t j, int32_t k,
-						   int32_t ni, int32_t nj, int32_t nk,
-						   int sign, int coord,
-						   uint32_t neighbor_mesh, uint32_t self_material,
-						   double eps_self ) const
+double EpotMatrixSolver::vacuum_face_coefficient( const int32_t i[3], int coord, int sign,
+						   uint32_t self_material, double eps_self ) const
 {
-    uint32_t node_id = neighbor_mesh & SMESH_NODE_ID_MASK;
+    int32_t n[3] = { i[0], i[1], i[2] };
+    n[coord] += sign;
+    const uint32_t neighbor_mesh = _geom.mesh( n[0], n[1], n[2] );
 
-    /* Neumann mask on the far side: this face carries no flux at all, so
-     * its coefficient is about to be cancelled by set_link()'s redirect
-     * (it sends the value to the row's own diagonal, where it exactly
-     * undoes the caller's cof += w). The returned number is therefore
-     * arbitrary -- but computing it properly is not merely wasted work,
-     * it is meaningless work: the code below would see nb_material == 0
-     * (dielectric_material_at() returns 0 for a mask, since a mask is not
-     * BOUND_DIELECTRIC), decide there is a genuine material interface, and
-     * bisect against the dielectric with bracket_ndist() from a point that
-     * may well be INSIDE it -- which violates that routine's stated
-     * precondition and returns a meaningless fraction.
-     *
-     * eps_self keeps it finite and dimensionally sane for anyone reading a
-     * matrix dump. It cannot affect the solution.
-     */
+    // Neumann mask: set_link() sends this link to the mirror node, in the
+    // medium of this node.
     if( SMESH_NODE_IS_NEUMANN_MASK( neighbor_mesh ) )
 	return( eps_self );
 
-    if( node_id == SMESH_NODE_ID_DIRICHLET ) {
-	uint32_t boundary_number = neighbor_mesh & SMESH_BOUNDARY_NUMBER_MASK;
+    if( (neighbor_mesh & SMESH_NODE_ID_MASK) == SMESH_NODE_ID_DIRICHLET ) {
+	// A face of the simulation box is always a full cell away.
+	const uint32_t boundary_number = neighbor_mesh & SMESH_BOUNDARY_NUMBER_MASK;
 	if( boundary_number < 7 )
-	    // Simulation box edge, not a user-defined solid -- its
-	    // position is exactly the mesh's own coordinate system (no
-	    // Solid::inside() to bisect against, and no ambiguity: a
-	    // dielectric node next to it is, by construction, always
-	    // exactly one full cell away -- see
-	    // Geometry::override_dielectric_box_boundary_3d()). Assume
-	    // self's own medium extends right up to it, as before.
 	    return( eps_self );
 
-	// A real solid electrode (n>=7): unlike the box edge, this can
-	// sit at any sub-cell distance from self, e.g. an STL electrode
-	// touching an STL dielectric. Bisect against that solid's own
-	// geometry to find the true distance, rather than assuming
-	// flush contact (alpha=1, eps_self unweighted, as an earlier
-	// version of this function did). self (dielectric or vacuum) is
-	// always geometrically outside the conductor solid, so -- unlike
-	// the dielectric-vs-dielectric case below -- this never needs
-	// the reversed/complemented bisection.
-	//
-	// Physically: beyond the conductor surface is a known constant
-	// (its fixed voltage), not another variable material, so the
-	// flux from self to it is a single resistor of length
-	// alpha*h through self's own medium: eps_self/alpha. This
-	// reduces to the old eps_self exactly at alpha=1 (conductor a
-	// full cell away), and grows without bound as alpha->0 (the
-	// conductor sitting arbitrarily close), consistent with how the
-	// existing near-solid conductor formulas also blow up in that
-	// limit.
-	double alpha = _geom.solid_face_frac( i, j, k, boundary_number, sign, coord );
+	// Electrode surface at alpha*h, reached through the medium of this
+	// node.
+	const double alpha = _geom.solid_face_frac( i[0], i[1], i[2], boundary_number, sign, coord );
 	return( eps_self / alpha );
     }
 
-    // The neighbour's raw tag alone is not enough here: a Neumann (or
-    // near-solid/fine-boundary) neighbour's own tag may itself have
-    // been overridden away from a dielectric tag that reached that
-    // node -- e.g. a Neumann side wall at a z-level that a dielectric
-    // slab varying along z actually occupies there.
-    // Geometry::dielectric_material_at() recovers the true answer
-    // directly (O(1), independent of any such reclassification -- see
-    // its doc comment), so no on-demand Geometry::inside() fallback or
-    // solver-private cache is needed here at all.
-    uint32_t nb_material = _geom.dielectric_material_at( ni, nj, nk );
+    // dielectric_material_at() is right also for a neighbour whose node tag
+    // says something else (Neumann, near-solid).
+    const uint32_t nb_material = _geom.dielectric_material_at( n[0], n[1], n[2] );
     if( nb_material == self_material )
-	return( eps_self ); // same medium on both sides of this face -- no correction needed
+	return( eps_self );
 
-    // Genuine material interface on this face -- find its true sub-cell
-    // position by bisecting against whichever side is an actual
-    // dielectric solid, rather than assuming it sits exactly halfway
-    // (only true for a grid-aligned interface).
-    //
-    // Geometry::solid_face_frac() (bracket_ndist()) bisects assuming
-    // its (i,j,k) argument is OUTSIDE the target solid, walking towards
-    // it -- true whenever the *neighbour* is the dielectric (self is
-    // plain vacuum here). But when *self* is the dielectric being
-    // bisected against (self_material == bisect_solid), self is
-    // INSIDE that solid, not outside, and calling it from self's side
-    // would search assuming the wrong monotonicity and return
-    // garbage (caught by a non-grid-aligned analytic verification
-    // test, not by inspection) -- so in that case bisect from the
-    // neighbour (guaranteed to be on the outside, since its material
-    // differs) walking back with the opposite sign instead, and take
-    // the complementary fraction.
-    uint32_t bisect_solid = ( self_material != 0 ) ? self_material : nb_material;
-    double eps_neighbor = ( nb_material != 0 ) ? _geom.boundary( nb_material ).value() : 1.0;
+    // Material interface at alpha*h: the two media in series.
+    // solid_face_frac() has to start from a node outside the solid, so if
+    // it is this node that is inside, the search runs from the neighbour
+    // and the fraction is complemented. Where two dielectrics touch, the
+    // surface of this node's solid is used.
+    const double eps_neighbor = ( nb_material != 0 ) ? _geom.boundary( nb_material ).value() : 1.0;
     double alpha;
-    if( bisect_solid == self_material )
-	alpha = 1.0 - _geom.solid_face_frac( ni, nj, nk, bisect_solid, -sign, coord );
+    if( self_material != 0 )
+	alpha = 1.0 - _geom.solid_face_frac( n[0], n[1], n[2], self_material, -sign, coord );
     else
-	alpha = _geom.solid_face_frac( i, j, k, bisect_solid, sign, coord );
+	alpha = _geom.solid_face_frac( i[0], i[1], i[2], nb_material, sign, coord );
     return( face_epsilon_alpha( eps_self, eps_neighbor, alpha ) );
 }
 
 
+/* Stencil of a node with no conductor surface and no box face within a
+ * cell. The node is in vacuum or inside a dielectric.
+ */
 void EpotMatrixSolver::add_vacuum_node( uint32_t i, uint32_t j, uint32_t k, const Vec3D &x )
 {
-    (void)x; // no longer used here -- see update_nonlinear_node()
-    uint32_t a = _n2d(i,j,k) & N2D_INDEX_MASK;
+    (void)x;
+    const uint32_t a = _n2d(i,j,k) & N2D_INDEX_MASK;
+    const int32_t ijk[3] = { (int32_t)i, (int32_t)j, (int32_t)k };
+    const uint32_t dim = _geom.dim();
+    const bool cyl = ( _geom.geom_mode() == MODE_CYL );
+    const uint32_t self_material = _geom.dielectric_material_at( i, j, k );
+    const double eps_self = node_epsilon_r( i, j, k );
 
-    // Relative permittivity of this node, and material number (0 =
-    // plain vacuum, else the dielectric solid this node is inside).
-    // Per direction, vacuum_face_coefficient() compares this against
-    // the neighbour's own material: matching materials (including
-    // vacuum-vacuum, the common case) reduce to a plain eps_self link,
-    // exactly reproducing the original fixed 1.0/-2.0/-4.0/-6.0 stencil
-    // whenever no dielectric is involved anywhere near this node. A
-    // genuine material interface on a face gets a fractional-distance-
-    // weighted coefficient found by bisecting against the true (e.g.
-    // STL-imported) solid surface -- see vacuum_face_coefficient() --
-    // so, unlike the initial grid-aligned-only implementation, this is
-    // correct for an arbitrarily positioned dielectric-vacuum
-    // interface. A dielectric next to a Dirichlet conductor (fixed
-    // node) at an arbitrary sub-cell position is not yet corrected this
-    // way -- see vacuum_face_coefficient()'s doc comment for that
-    // scoped limitation.
-    uint32_t self_material = _geom.dielectric_material_at( i, j, k );
-    double eps_self = node_epsilon_r( i, j, k );
+    // Weight of the link to the lower/upper neighbour on each axis. With no
+    // dielectric nearby this is the standard stencil, all weights 1 (times
+    // 1-+1/(2j) for the radial axis of a cylindrical geometry).
+    double w[3][2];
     double cof = 0.0;
-
-    switch( _geom.geom_mode() ) {
-    case MODE_1D: {
-        double wm = vacuum_face_coefficient( i,j,k, i-1,j,k, -1,0, _geom.mesh(i-1,j,k), self_material, eps_self );
-        double wp = vacuum_face_coefficient( i,j,k, i+1,j,k, +1,0, _geom.mesh(i+1,j,k), self_material, eps_self );
-        set_link( a, _n2d(i-1,j,k), wm );
-        set_link( a, _n2d(i+1,j,k), wp );
-        cof = wm+wp;
-        break; }
-    case MODE_2D: {
-        double wxm = vacuum_face_coefficient( i,j,k, i-1,j,k, -1,0, _geom.mesh(i-1,j,k), self_material, eps_self );
-        double wxp = vacuum_face_coefficient( i,j,k, i+1,j,k, +1,0, _geom.mesh(i+1,j,k), self_material, eps_self );
-        double wym = vacuum_face_coefficient( i,j,k, i,j-1,k, -1,1, _geom.mesh(i,j-1,k), self_material, eps_self );
-        double wyp = vacuum_face_coefficient( i,j,k, i,j+1,k, +1,1, _geom.mesh(i,j+1,k), self_material, eps_self );
-        set_link( a, _n2d(i,j-1,k), wym );
-        set_link( a, _n2d(i-1,j,k), wxm );
-        set_link( a, _n2d(i+1,j,k), wxp );
-        set_link( a, _n2d(i,j+1,k), wyp );
-        cof = wxm+wxp+wym+wyp;
-        break; }
-    case MODE_CYL: {
-        double wxm = vacuum_face_coefficient( i,j,k, i-1,j,k, -1,0, _geom.mesh(i-1,j,k), self_material, eps_self );
-        double wxp = vacuum_face_coefficient( i,j,k, i+1,j,k, +1,0, _geom.mesh(i+1,j,k), self_material, eps_self );
-        double wym = (1.0-0.5/j)*vacuum_face_coefficient( i,j,k, i,j-1,k, -1,1, _geom.mesh(i,j-1,k), self_material, eps_self );
-        double wyp = (1.0+0.5/j)*vacuum_face_coefficient( i,j,k, i,j+1,k, +1,1, _geom.mesh(i,j+1,k), self_material, eps_self );
-        set_link( a, _n2d(i,j-1,k), wym );
-        set_link( a, _n2d(i-1,j,k), wxm );
-        set_link( a, _n2d(i+1,j,k), wxp );
-        set_link( a, _n2d(i,j+1,k), wyp );
-        cof = wxm+wxp+wym+wyp;
-        break; }
-    case MODE_3D: {
-        double wxm = vacuum_face_coefficient( i,j,k, i-1,j,k, -1,0, _geom.mesh(i-1,j,k), self_material, eps_self );
-        double wxp = vacuum_face_coefficient( i,j,k, i+1,j,k, +1,0, _geom.mesh(i+1,j,k), self_material, eps_self );
-        double wym = vacuum_face_coefficient( i,j,k, i,j-1,k, -1,1, _geom.mesh(i,j-1,k), self_material, eps_self );
-        double wyp = vacuum_face_coefficient( i,j,k, i,j+1,k, +1,1, _geom.mesh(i,j+1,k), self_material, eps_self );
-        double wzm = vacuum_face_coefficient( i,j,k, i,j,k-1, -1,2, _geom.mesh(i,j,k-1), self_material, eps_self );
-        double wzp = vacuum_face_coefficient( i,j,k, i,j,k+1, +1,2, _geom.mesh(i,j,k+1), self_material, eps_self );
-        set_link( a, _n2d(i,j,k-1), wzm );
-        set_link( a, _n2d(i,j-1,k), wym );
-        set_link( a, _n2d(i-1,j,k), wxm );
-        set_link( a, _n2d(i+1,j,k), wxp );
-        set_link( a, _n2d(i,j+1,k), wyp );
-        set_link( a, _n2d(i,j,k+1), wzp );
-        cof = wxm+wxp+wym+wyp+wzm+wzp;
-        break; }
+    for( uint32_t c = 0; c < dim; c++ ) {
+	w[c][0] = vacuum_face_coefficient( ijk, c, -1, self_material, eps_self );
+	w[c][1] = vacuum_face_coefficient( ijk, c, +1, self_material, eps_self );
+	if( cyl && c == 1 ) {
+	    w[c][0] *= (1.0-0.5/j);
+	    w[c][1] *= (1.0+0.5/j);
+	}
+	cof += w[c][0];
+	cof += w[c][1];
     }
 
+    // Links in ascending column order.
+    for( uint32_t c = dim; c-- > 0; ) {
+	int32_t m[3] = { ijk[0], ijk[1], ijk[2] };
+	m[c]--;
+	set_link( a, _n2d(m[0],m[1],m[2]), w[c][0] );
+    }
+    for( uint32_t c = 0; c < dim; c++ ) {
+	int32_t p[3] = { ijk[0], ijk[1], ijk[2] };
+	p[c]++;
+	set_link( a, _n2d(p[0],p[1],p[2]), w[c][1] );
+    }
     set_link( a, _n2d(i,j,k), -cof );
 
-    // Nonlinear (plasma) contribution to rhs/diagonal is epot-dependent
-    // and is added separately, once per Newton iteration, by
-    // update_nonlinear_node() -- see build_mat_vec(). Everything in
-    // this function is geometry-only (now including permittivity,
-    // which is a fixed material property) and gets cached after the
-    // first build.
-
-    // Right hand side. Left as-is (no epsilon_r factor) even inside a
-    // dielectric: this is the flux-conservative form of
-    // div(eps*grad(phi)) = -rho/eps0, so the permittivity belongs
-    // entirely on the coefficients above, not the rhs.
-    //
-    // self_material == 0 guards this rather than trusting scharge to
-    // already be zero inside a dielectric's bulk: PIC/linear deposition
-    // has no notion of Geometry at all (see scharge_clear_solid_nodes()'s
-    // doc comment in scharge.hpp), so without this guard, correctness
-    // here would depend on every scharge-producing code path upstream
-    // remembering to clean solid nodes out first -- exactly the kind of
-    // cross-module invariant that's easy to silently break later. This
-    // is a genuine dielectric interior node (this function is shared
-    // between plain vacuum and dielectric interior -- see the dielectric
-    // material/permittivity comment above), so it truly has no free
-    // charge in its own bulk equation, unlike add_near_solid_node()'s and
-    // add_neumann_node()'s unconditional reads of the same scharge term,
-    // which are genuine vacuum locations that can legitimately have real
-    // nearby charge and must keep reading it.
-    if( _plasma != PLASMA_SHIELD && self_material == 0 )
-	(*_fd_vec)(a) += -(*_scharge)(i,j,k)*_geom.h()*_geom.h()/EPSILON0;
+    // The permittivity is in the weights, so the space charge term added
+    // in preprocess() has no epsilon_r in it. A node inside a dielectric
+    // takes no space charge at all.
+    if( self_material != 0 )
+	_row_scharge[a] = 0;
 }
 
 
-void EpotMatrixSolver::add_near_solid_node_1d( uint32_t i, const Vec3D &x )
+/* Links of near-solid node a to its two neighbours along axis coord, for
+ * every axis but the radial one of a cylindrical geometry. Returns the
+ * weight that these links add to the diagonal.
+ *
+ * bnd: bit 0/1 set if the node is on the lower/upper face of the box.
+ * cut: bit 0/1 set if a conductor surface cuts the link to the lower/upper
+ *      neighbour, at distance alpha/beta (fraction of h, 1 if not cut).
+ */
+double EpotMatrixSolver::near_solid_axis( uint32_t a, const int32_t i[3], int coord,
+					   uint8_t bnd, uint8_t cut, double alpha, double beta,
+					   const Vec3D &x )
 {
-    uint32_t a = _n2d(i) & N2D_INDEX_MASK;
-    uint8_t bindex = boundary_index(i);
+    int32_t m[3] = { i[0], i[1], i[2] };
+    int32_t p[3] = { i[0], i[1], i[2] };
+    m[coord]--;
+    p[coord]++;
 
-    const uint8_t *nearsolid_ptr = _geom.nearsolid_ptr( _geom.mesh(i) & SMESH_NEAR_SOLID_INDEX_MASK );
-    uint8_t sflag = nearsolid_ptr[0];
-    uint8_t *ptr = (uint8_t *)&nearsolid_ptr[1];
-
-    // Xmin direction
-    double alpha = 1.0;
-    if( sflag & 0x01 ) {
-	alpha = *ptr/255.0;
-	ptr++;
+    // Neumann face of the box: the neighbour outside is the mirror image
+    // of the one inside.
+    if( bnd & 0x01 ) {
+	const double w = 2.0/(beta*beta);
+	set_link( a, _n2d(p[0],p[1],p[2]), w );
+	(*_fd_vec)(a) += 2.0*_geom.h()*_geom.get_boundary(1+2*coord).value(x) / beta;
+	return( w );
+    } else if( bnd & 0x02 ) {
+	const double w = 2.0/(alpha*alpha);
+	set_link( a, _n2d(m[0],m[1],m[2]), w );
+	(*_fd_vec)(a) += 2.0*_geom.h()*_geom.get_boundary(2+2*coord).value(x) / alpha;
+	return( w );
     }
 
-    // Xmax direction
-    double beta = 1.0;
-    if( sflag & 0x02 ) {
-	beta = *ptr/255.0;
-	ptr++;
-    }
-
-    // Factors for X axis. See add_near_solid_node_3d() for the
-    // rationale of the conductor/dielectric same-axis triple-point
-    // handling -- unlike the 2d/cyl/3d variants, this function has no
-    // separate "neither side near a conductor" branch (impossible here:
-    // being in add_near_solid_node_1d at all means is_near_solid() was
-    // true, and X is the only axis, so sflag always has at least one
-    // bit set), so the triple-point check applies directly in the
-    // final else below.
-    if( bindex & EPOT_SOLVER_BXMIN ) {
-	set_link( a, _n2d(i), -2.0/(beta*beta) );
-	set_link( a, _n2d(i+1), 2.0/(beta*beta) );
-	(*_fd_vec)(a) += 2.0*_geom.h()*_geom.get_boundary(1).value(x) / beta;
-    } else if( bindex & EPOT_SOLVER_BXMAX ) {
-	set_link( a, _n2d(i), -2.0/(alpha*alpha) );
-	set_link( a, _n2d(i-1), 2.0/(alpha*alpha) );
-	(*_fd_vec)(a) += 2.0*_geom.h()*_geom.get_boundary(2).value(x) / alpha;
+    const bool cm = cut & 0x01;
+    const bool cp = cut & 0x02;
+    double wm, wp, cof;
+    if( (cm || cp) &&
+	(cm || _geom.dielectric_material_at(m[0],m[1],m[2]) == 0) &&
+	(cp || _geom.dielectric_material_at(p[0],p[1],p[2]) == 0) ) {
+	// Vacuum all the way to the conductor(s): Shortley-Weller.
+	wm = 2.0/((alpha+beta)*alpha);
+	wp = 2.0/((alpha+beta)*beta);
+	cof = 2.0/(alpha*beta);
     } else {
-	bool xm_conductor = sflag & 0x01;
-	bool xp_conductor = sflag & 0x02;
-	bool xm_dielectric = !xm_conductor && _geom.dielectric_material_at(i-1,0,0) != 0;
-	bool xp_dielectric = !xp_conductor && _geom.dielectric_material_at(i+1,0,0) != 0;
-
-	if( xm_dielectric || xp_dielectric ) {
-	    double wm = xm_conductor ? 1.0/alpha :
-		vacuum_face_coefficient( i,0,0, i-1,0,0, -1,0, _geom.mesh(i-1), 0, 1.0 );
-	    double wp = xp_conductor ? 1.0/beta :
-		vacuum_face_coefficient( i,0,0, i+1,0,0, +1,0, _geom.mesh(i+1), 0, 1.0 );
-	    set_link( a, _n2d(i), -(wm+wp) );
-	    set_link( a, _n2d(i-1), wm );
-	    set_link( a, _n2d(i+1), wp );
-	} else {
-	    set_link( a, _n2d(i), -2.0/(alpha*beta) );
-	    set_link( a, _n2d(i-1), 2.0/((alpha+beta)*alpha) );
-	    set_link( a, _n2d(i+1), 2.0/((alpha+beta)*beta) );
-	}
+	// No conductor on this axis, or a conductor on one side and a
+	// dielectric on the other. Shortley-Weller assumes a smooth
+	// potential through both neighbours, which a permittivity jump
+	// breaks, so each face gets its own conductance instead. The node
+	// itself is in vacuum, so that is 1/distance towards a conductor.
+	wm = cm ? 1.0/alpha : vacuum_face_coefficient( i, coord, -1, 0, 1.0 );
+	wp = cp ? 1.0/beta  : vacuum_face_coefficient( i, coord, +1, 0, 1.0 );
+	cof = wm+wp;
     }
+    set_link( a, _n2d(m[0],m[1],m[2]), wm );
+    set_link( a, _n2d(p[0],p[1],p[2]), wp );
+    return( cof );
 }
 
 
-void EpotMatrixSolver::add_near_solid_node_2d( uint32_t i, uint32_t j, const Vec3D &x )
+/* The same as near_solid_axis() for the radial axis of a cylindrical
+ * geometry.
+ */
+double EpotMatrixSolver::near_solid_radial( uint32_t a, const int32_t i[3],
+					     uint8_t bnd, uint8_t cut, double alpha, double beta,
+					     const Vec3D &x )
 {
-    uint32_t a = _n2d(i,j) & N2D_INDEX_MASK;
-    uint8_t bindex = boundary_index(i,j);
-
-    const uint8_t *nearsolid_ptr = _geom.nearsolid_ptr( _geom.mesh(i,j) & SMESH_NEAR_SOLID_INDEX_MASK );
-    uint8_t sflag = nearsolid_ptr[0];
-    uint8_t *ptr = (uint8_t *)&nearsolid_ptr[1];
-
-    double cof = 0.0;
-
-    // Xmin direction
-    double alpha = 1.0;
-    if( sflag & 0x01 ) {
-	alpha = *ptr/255.0;
-	ptr++;
-    }
-
-    // Xmax direction
-    double beta = 1.0;
-    if( sflag & 0x02 ) {
-	beta = *ptr/255.0;
-	ptr++;
-    }
-
-    // Factors for X axis. See add_near_solid_node_3d() for the
-    // rationale of the sflag-gated third branch, including the
-    // conductor/dielectric same-axis triple-point handling.
-    if( bindex & EPOT_SOLVER_BXMIN ) {
-	cof += 2.0/(beta*beta);
-	set_link( a, _n2d(i+1,j), 2.0/(beta*beta) );
-	(*_fd_vec)(a) += 2.0*_geom.h()*_geom.get_boundary(1).value(x) / beta;
-    } else if( bindex & EPOT_SOLVER_BXMAX ) {
-	cof += 2.0/(alpha*alpha);
-	set_link( a, _n2d(i-1,j), 2.0/(alpha*alpha) );
-	(*_fd_vec)(a) += 2.0*_geom.h()*_geom.get_boundary(2).value(x) / alpha;
-    } else if( sflag & 0x03 ) {
-	bool xm_conductor = sflag & 0x01;
-	bool xp_conductor = sflag & 0x02;
-	bool xm_dielectric = !xm_conductor && _geom.dielectric_material_at(i-1,j,0) != 0;
-	bool xp_dielectric = !xp_conductor && _geom.dielectric_material_at(i+1,j,0) != 0;
-
-	if( xm_dielectric || xp_dielectric ) {
-	    double wm = xm_conductor ? 1.0/alpha :
-		vacuum_face_coefficient( i,j,0, i-1,j,0, -1,0, _geom.mesh(i-1,j), 0, 1.0 );
-	    double wp = xp_conductor ? 1.0/beta :
-		vacuum_face_coefficient( i,j,0, i+1,j,0, +1,0, _geom.mesh(i+1,j), 0, 1.0 );
-	    set_link( a, _n2d(i-1,j), wm );
-	    set_link( a, _n2d(i+1,j), wp );
-	    cof += wm+wp;
-	} else {
-	    cof += 2.0/(alpha*beta);
-	    set_link( a, _n2d(i-1,j), 2.0/((alpha+beta)*alpha) );
-	    set_link( a, _n2d(i+1,j), 2.0/((alpha+beta)*beta) );
-	}
-    } else {
-	double wm = vacuum_face_coefficient( i,j,0, i-1,j,0, -1,0, _geom.mesh(i-1,j), 0, 1.0 );
-	double wp = vacuum_face_coefficient( i,j,0, i+1,j,0, +1,0, _geom.mesh(i+1,j), 0, 1.0 );
-	set_link( a, _n2d(i-1,j), wm );
-	set_link( a, _n2d(i+1,j), wp );
-	cof += wm+wp;
-    }
-
-    // Ymin direction
-    alpha = 1.0;
-    if( sflag & 0x04 ) {
-	alpha = *ptr/255.0;
-	ptr++;
-    }
-
-    // Ymax direction
-    beta = 1.0;
-    if( sflag & 0x08 ) {
-	beta = *ptr/255.0;
-	ptr++;
-    }
-
-    // Factors for Y axis
-    if( bindex & EPOT_SOLVER_BYMIN ) {
-	cof += 2.0/(beta*beta);
-	set_link( a, _n2d(i,j+1), 2.0/(beta*beta) );
-	(*_fd_vec)(a) += 2.0*_geom.h()*_geom.get_boundary(3).value(x) / beta;
-    } else if( bindex & EPOT_SOLVER_BYMAX ) {
-	cof += 2.0/(alpha*alpha);
-	set_link( a, _n2d(i,j-1), 2.0/(alpha*alpha) );
-	(*_fd_vec)(a) += 2.0*_geom.h()*_geom.get_boundary(4).value(x) / alpha;
-    } else if( sflag & 0x0c ) {
-	bool ym_conductor = sflag & 0x04;
-	bool yp_conductor = sflag & 0x08;
-	bool ym_dielectric = !ym_conductor && _geom.dielectric_material_at(i,j-1,0) != 0;
-	bool yp_dielectric = !yp_conductor && _geom.dielectric_material_at(i,j+1,0) != 0;
-
-	if( ym_dielectric || yp_dielectric ) {
-	    double wm = ym_conductor ? 1.0/alpha :
-		vacuum_face_coefficient( i,j,0, i,j-1,0, -1,1, _geom.mesh(i,j-1), 0, 1.0 );
-	    double wp = yp_conductor ? 1.0/beta :
-		vacuum_face_coefficient( i,j,0, i,j+1,0, +1,1, _geom.mesh(i,j+1), 0, 1.0 );
-	    set_link( a, _n2d(i,j-1), wm );
-	    set_link( a, _n2d(i,j+1), wp );
-	    cof += wm+wp;
-	} else {
-	    cof += 2.0/(alpha*beta);
-	    set_link( a, _n2d(i,j-1), 2.0/((alpha+beta)*alpha) );
-	    set_link( a, _n2d(i,j+1), 2.0/((alpha+beta)*beta) );
-	}
-    } else {
-	double wm = vacuum_face_coefficient( i,j,0, i,j-1,0, -1,1, _geom.mesh(i,j-1), 0, 1.0 );
-	double wp = vacuum_face_coefficient( i,j,0, i,j+1,0, +1,1, _geom.mesh(i,j+1), 0, 1.0 );
-	set_link( a, _n2d(i,j-1), wm );
-	set_link( a, _n2d(i,j+1), wp );
-	cof += wm+wp;
-    }
-
-    // Middle node
-    set_link( a, _n2d(i,j), -cof );
-}
-
-
-void EpotMatrixSolver::add_near_solid_node_cyl( uint32_t i, uint32_t j, const Vec3D &x )
-{
-    uint32_t a = _n2d(i,j) & N2D_INDEX_MASK;
-    uint8_t bindex = boundary_index(i,j);
-
-    const uint8_t *nearsolid_ptr = _geom.nearsolid_ptr( _geom.mesh(i,j) & SMESH_NEAR_SOLID_INDEX_MASK );
-    uint8_t sflag = nearsolid_ptr[0];
-    uint8_t *ptr = (uint8_t *)&nearsolid_ptr[1];
-
-    double cof = 0.0;
-
-    // Xmin direction
-    double alpha = 1.0;
-    if( sflag & 0x01 ) {
-	alpha = *ptr/255.0;
-	ptr++;
-    }
-
-    // Xmax direction
-    double beta = 1.0;
-    if( sflag & 0x02 ) {
-	beta = *ptr/255.0;
-	ptr++;
-    }
-
-    // Factors for X axis (axial). See add_near_solid_node_3d() for the
-    // rationale of the sflag-gated third branch, including the
-    // conductor/dielectric same-axis triple-point handling. (Y, the
-    // radial axis below, is a separate, still-unresolved limitation --
-    // see its own comment.)
-    if( bindex & EPOT_SOLVER_BXMIN ) {
-	cof += 2.0/(beta*beta);
-	set_link( a, _n2d(i+1,j), 2.0/(beta*beta) );
-	(*_fd_vec)(a) += 2.0*_geom.h()*_geom.get_boundary(1).value(x) / beta;
-    } else if( bindex & EPOT_SOLVER_BXMAX ) {
-	cof += 2.0/(alpha*alpha);
-	set_link( a, _n2d(i-1,j), 2.0/(alpha*alpha) );
-	(*_fd_vec)(a) += 2.0*_geom.h()*_geom.get_boundary(2).value(x) / alpha;
-    } else if( sflag & 0x03 ) {
-	bool xm_conductor = sflag & 0x01;
-	bool xp_conductor = sflag & 0x02;
-	bool xm_dielectric = !xm_conductor && _geom.dielectric_material_at(i-1,j,0) != 0;
-	bool xp_dielectric = !xp_conductor && _geom.dielectric_material_at(i+1,j,0) != 0;
-
-	if( xm_dielectric || xp_dielectric ) {
-	    double wm = xm_conductor ? 1.0/alpha :
-		vacuum_face_coefficient( i,j,0, i-1,j,0, -1,0, _geom.mesh(i-1,j), 0, 1.0 );
-	    double wp = xp_conductor ? 1.0/beta :
-		vacuum_face_coefficient( i,j,0, i+1,j,0, +1,0, _geom.mesh(i+1,j), 0, 1.0 );
-	    set_link( a, _n2d(i-1,j), wm );
-	    set_link( a, _n2d(i+1,j), wp );
-	    cof += wm+wp;
-	} else {
-	    cof += 2.0/(alpha*beta);
-	    set_link( a, _n2d(i-1,j), 2.0/((alpha+beta)*alpha) );
-	    set_link( a, _n2d(i+1,j), 2.0/((alpha+beta)*beta) );
-	}
-    } else {
-	double wm = vacuum_face_coefficient( i,j,0, i-1,j,0, -1,0, _geom.mesh(i-1,j), 0, 1.0 );
-	double wp = vacuum_face_coefficient( i,j,0, i+1,j,0, +1,0, _geom.mesh(i+1,j), 0, 1.0 );
-	set_link( a, _n2d(i-1,j), wm );
-	set_link( a, _n2d(i+1,j), wp );
-	cof += wm+wp;
-    }
-
-    // Ymin direction
-    alpha = 1.0;
-    if( sflag & 0x04 ) {
-	alpha = *ptr/255.0;
-	ptr++;
-    }
-
-    // Ymax direction
-    beta = 1.0;
-    if( sflag & 0x08 ) {
-	beta = *ptr/255.0;
-	ptr++;
-    }
-
-    // Factors for Y axis (radial). The cylindrical curvature terms are
-    // baked into these coefficients, so unlike the other axes they are not
-    // a flat Shortley-Weller form and the dielectric-aware version had to
-    // be derived rather than copied.
-    //
-    // DERIVATION (conservative / finite-volume, which is what a material
-    // interface requires -- flux must be continuous across it):
-    //
-    //   Control volume for node j spans the inner face at
-    //   r_- = r_j - alpha*h/2 and the outer face at r_+ = r_j + beta*h/2.
-    //   The radial flux through a face is eps_face * r_face * dphi/dr, so
-    //   in this file's row scaling (a uniform vacuum node has cof = 4 and
-    //   rhs = -rho h^2 / eps0) each face coefficient is
-    //
-    //       w = eps_face * (r_face / r_j) / (face distance in units of h)
-    //
-    //   giving  w_m = eps_m * (j - alpha/2) / (j*alpha)
-    //           w_p = eps_p * (j + beta /2) / (j*beta )
-    //
-    // Checked in three limits:
-    //   alpha=beta=1  -> eps_m*(1-1/(2j)), eps_p*(1+1/(2j)), i.e. exactly
-    //                    add_vacuum_node()'s cylindrical form;
-    //   j -> infinity -> eps_m/alpha, eps_p/beta, i.e. exactly the axial
-    //                    dielectric branch above;
-    //   eps = 1       -> (alpha+beta)/2 times the Taylor form kept below.
-    //
-    // That last ratio is not an error: it is the same relationship the
-    // AXIAL axis already has between its plain branch (2/((alpha+beta)*alpha),
-    // a Taylor expansion, more accurate for smooth coefficients) and its
-    // dielectric branch (1/alpha, conservative, exact in flux). They agree
-    // for uniform spacing and differ only in cut cells, and the
-    // conservative one is the correct choice when eps jumps.
-    //
-    // Validated against the analytic coaxial two-layer dielectric solution
-    // phi = C - (A/eps) ln r: this form converges at second order, whereas
-    // ignoring eps on the radial faces leaves a ~24% error that does NOT
-    // shrink with the mesh -- a wrong equation rather than a resolution
-    // problem.
-    if( bindex & EPOT_SOLVER_BYMIN ) {
-	// On-axis. The factor 4 is the coordinate-singularity limit of the
-	// radial operator, not an ordinary face, so -- as in
-	// add_neumann_node_cyl() -- no cut-cell or interface treatment is
-	// attempted for a dielectric sitting exactly on the axis.
-	cof += 4.0;
-	set_link( a, _n2d(i,j+1), 4.0 );
-    } else if( bindex & EPOT_SOLVER_BYMAX ) {
-	// Node on the rmax face. Left as the vacuum form: reaching here
-	// needs a node that is simultaneously on the outer box face and
-	// within a cell of a conductor, and the box face is a boundary
-	// condition rather than a material interface.
-	cof += 2.0/(alpha*alpha);
-	set_link( a, _n2d(i,j-1), 2.0/(alpha*alpha) );
+    const int32_t j = i[1];
+    if( bnd & 0x01 ) {
+	// On axis: the limit of the radial operator at r=0. A dielectric
+	// touching the axis gets no interface treatment here.
+	set_link( a, _n2d(i[0],j+1), 4.0 );
+	return( 4.0 );
+    } else if( bnd & 0x02 ) {
+	// Neumann face at rmax, in the vacuum form.
+	const double w = 2.0/(alpha*alpha);
+	set_link( a, _n2d(i[0],j-1), w );
 	(*_fd_vec)(a) += (1.0)/(2.0*alpha)*(2.0/alpha+1.0/j)*
 	    2.0*_geom.h()*_geom.get_boundary(4).value(x) / alpha;
-    } else {
-	bool ym_conductor = sflag & 0x04;
-	bool yp_conductor = sflag & 0x08;
-	bool ym_dielectric = !ym_conductor && _geom.dielectric_material_at(i,j-1,0) != 0;
-	bool yp_dielectric = !yp_conductor && _geom.dielectric_material_at(i,j+1,0) != 0;
-
-	if( ym_dielectric || yp_dielectric ) {
-
-	    // A near-solid node is by definition a vacuum node next to a
-	    // conductor, so self is vacuum (self_material 0, eps_self 1)
-	    // and a conductor face contributes eps = 1 with its distance
-	    // already carried by alpha/beta -- passing it through
-	    // vacuum_face_coefficient() would apply that distance twice.
-	    double rj = (double)j;
-	    double em = ym_conductor ? 1.0 :
-		vacuum_face_coefficient( i,j,0, i,j-1,0, -1,1, _geom.mesh(i,j-1), 0, 1.0 );
-	    double ep = yp_conductor ? 1.0 :
-		vacuum_face_coefficient( i,j,0, i,j+1,0, +1,1, _geom.mesh(i,j+1), 0, 1.0 );
-
-	    double wm = em*(rj - 0.5*alpha)/(rj*alpha);
-	    double wp = ep*(rj + 0.5*beta )/(rj*beta );
-
-	    set_link( a, _n2d(i,j-1), wm );
-	    set_link( a, _n2d(i,j+1), wp );
-	    cof += wm+wp;
-
-	} else {
-	    cof += 2.0/(alpha*beta);
-	    set_link( a, _n2d(i,j-1), 1.0/(alpha+beta)*(2.0/alpha-1.0/j) );
-	    set_link( a, _n2d(i,j+1), 1.0/(alpha+beta)*(2.0/beta+1.0/j) );
-	}
+	return( w );
     }
 
-    // Middle node
-    set_link( a, _n2d(i,j), -cof );
+    const bool cm = cut & 0x01;
+    const bool cp = cut & 0x02;
+    double wm, wp, cof;
+    if( (cm || _geom.dielectric_material_at(i[0],j-1,0) == 0) &&
+	(cp || _geom.dielectric_material_at(i[0],j+1,0) == 0) ) {
+	// No dielectric neighbour: Shortley-Weller with the 1/r term.
+	wm = 1.0/(alpha+beta)*(2.0/alpha-1.0/j);
+	wp = 1.0/(alpha+beta)*(2.0/beta+1.0/j);
+	cof = 2.0/(alpha*beta);
+    } else {
+	// A dielectric neighbour: the flux through each face of the
+	// control volume from r_j-alpha*h/2 to r_j+beta*h/2 is
+	// eps_face*r_face*dphi/dr, which in the row scaling of this file
+	// (vacuum node: diagonal 4) gives the face weight
+	//     eps_face * (r_face/r_j) / (distance to the neighbour / h).
+	// For alpha=beta=1 this is the stencil of add_vacuum_node(), and
+	// for large j that of near_solid_axis(). A face towards a
+	// conductor has eps 1, its distance is in alpha/beta already.
+	const double rj = (double)j;
+	const double em = cm ? 1.0 : vacuum_face_coefficient( i, 1, -1, 0, 1.0 );
+	const double ep = cp ? 1.0 : vacuum_face_coefficient( i, 1, +1, 0, 1.0 );
+	wm = em*(rj - 0.5*alpha)/(rj*alpha);
+	wp = ep*(rj + 0.5*beta )/(rj*beta );
+	cof = wm+wp;
+    }
+    set_link( a, _n2d(i[0],j-1), wm );
+    set_link( a, _n2d(i[0],j+1), wp );
+    return( cof );
 }
 
 
-void EpotMatrixSolver::add_near_solid_node_3d( uint32_t i, uint32_t j, uint32_t k, const Vec3D &x )
-{
-    uint32_t a = _n2d(i,j,k) & N2D_INDEX_MASK;
-    uint8_t bindex = boundary_index(i,j,k);
-
-    const uint8_t *nearsolid_ptr = _geom.nearsolid_ptr( _geom.mesh(i,j,k) & SMESH_NEAR_SOLID_INDEX_MASK );
-    uint8_t sflag = nearsolid_ptr[0];
-    uint8_t *ptr = (uint8_t *)&nearsolid_ptr[1];
-
-    double cof = 0.0;
-
-    // Xmin direction
-    double alpha = 1.0;
-    if( sflag & 0x01 ) {
-	alpha = *ptr/255.0;
-	ptr++;
-    }
-
-    // Xmax direction
-    double beta = 1.0;
-    if( sflag & 0x02 ) {
-	beta = *ptr/255.0;
-	ptr++;
-    }
-
-    // Factors for X axis
-    if( bindex & EPOT_SOLVER_BXMIN ) {
-	cof += 2.0/(beta*beta);
-	set_link( a, _n2d(i+1,j,k), 2.0/(beta*beta) );
-	(*_fd_vec)(a) += 2.0*_geom.h()*_geom.get_boundary(1).value(x) / beta;
-    } else if( bindex & EPOT_SOLVER_BXMAX ) {
-	cof += 2.0/(alpha*alpha);
-	set_link( a, _n2d(i-1,j,k), 2.0/(alpha*alpha) );
-	(*_fd_vec)(a) += 2.0*_geom.h()*_geom.get_boundary(2).value(x) / alpha;
-    } else if( sflag & 0x03 ) {
-	// Near a conductor on (at least) one side of this axis. If a
-	// conductor is cached on *both* sides, self's own medium (vacuum,
-	// eps=1) genuinely spans between the two conductors with no
-	// material change anywhere on this axis, so the existing
-	// Taylor-difference Shortley-Weller treatment applies exactly.
-	// But is_solid() (and therefore this near-solid cache) never
-	// recognizes a dielectric -- only a conductor -- so if just *one*
-	// side is cached, the *other* side (defaulted to alpha/beta=1.0
-	// above) might actually be a dielectric-interior cell rather than
-	// plain vacuum: a true conductor/dielectric/vacuum triple point.
-	// The joint Taylor formula has no way to fold in a permittivity
-	// discontinuity (it assumes a well-defined second derivative
-	// through both neighbours; a material interface only guarantees
-	// flux continuity, i.e. a kink, not that). Detect that case via
-	// _dielectric_mat and, only then, recompose this axis from two
-	// independent per-face resistor conductances instead: the
-	// conductor side reuses its already-bisected cached fractional
-	// distance (eps_self/alpha or eps_self/beta, eps_self=1 here --
-	// exactly vacuum_face_coefficient()'s own Dirichlet-branch
-	// formula, just without re-bisecting), and the other side goes
-	// through vacuum_face_coefficient() itself, which bisects/weights
-	// correctly for the dielectric neighbour. When neither uncached
-	// side turns out to be a dielectric, this reduces to the ordinary
-	// case below and the existing Taylor formula is used unchanged.
-	bool xm_conductor = sflag & 0x01;
-	bool xp_conductor = sflag & 0x02;
-	bool xm_dielectric = !xm_conductor && _geom.dielectric_material_at(i-1,j,k) != 0;
-	bool xp_dielectric = !xp_conductor && _geom.dielectric_material_at(i+1,j,k) != 0;
-
-	if( xm_dielectric || xp_dielectric ) {
-	    double wm = xm_conductor ? 1.0/alpha :
-		vacuum_face_coefficient( i,j,k, i-1,j,k, -1,0, _geom.mesh(i-1,j,k), 0, 1.0 );
-	    double wp = xp_conductor ? 1.0/beta :
-		vacuum_face_coefficient( i,j,k, i+1,j,k, +1,0, _geom.mesh(i+1,j,k), 0, 1.0 );
-	    set_link( a, _n2d(i-1,j,k), wm );
-	    set_link( a, _n2d(i+1,j,k), wp );
-	    cof += wm+wp;
-	} else {
-	    cof += 2.0/(alpha*beta);
-	    set_link( a, _n2d(i-1,j,k), 2.0/((alpha+beta)*alpha) );
-	    set_link( a, _n2d(i+1,j,k), 2.0/((alpha+beta)*beta) );
-	}
-    } else {
-	// Neither side of this axis is near a conductor (alpha=beta=1,
-	// both defaulted, no _nearsolid data cached for either) -- this
-	// near-solid node (near a conductor on a *different* axis) can
-	// still be directly adjacent to a dielectric along *this* axis,
-	// so use the same per-face dielectric-aware treatment as
-	// add_vacuum_node()/add_neumann_node() rather than assuming
-	// plain vacuum unconditionally. self_material=0, eps_self=1.0
-	// always here (this function never runs for a dielectric-
-	// interior self node).
-	double wm = vacuum_face_coefficient( i,j,k, i-1,j,k, -1,0, _geom.mesh(i-1,j,k), 0, 1.0 );
-	double wp = vacuum_face_coefficient( i,j,k, i+1,j,k, +1,0, _geom.mesh(i+1,j,k), 0, 1.0 );
-	set_link( a, _n2d(i-1,j,k), wm );
-	set_link( a, _n2d(i+1,j,k), wp );
-	cof += wm+wp;
-    }
-
-    // Ymin direction
-    alpha = 1.0;
-    if( sflag & 0x04 ) {
-	alpha = *ptr/255.0;
-	ptr++;
-    }
-
-    // Ymax direction
-    beta = 1.0;
-    if( sflag & 0x08 ) {
-	beta = *ptr/255.0;
-	ptr++;
-    }
-
-    // Factors for Y axis
-    if( bindex & EPOT_SOLVER_BYMIN ) {
-	cof += 2.0/(beta*beta);
-	set_link( a, _n2d(i,j+1,k), 2.0/(beta*beta) );
-	(*_fd_vec)(a) += 2.0*_geom.h()*_geom.get_boundary(3).value(x) / beta;
-    } else if( bindex & EPOT_SOLVER_BYMAX ) {
-	cof += 2.0/(alpha*alpha);
-	set_link( a, _n2d(i,j-1,k), 2.0/(alpha*alpha) );
-	(*_fd_vec)(a) += 2.0*_geom.h()*_geom.get_boundary(4).value(x) / alpha;
-    } else if( sflag & 0x0c ) {
-	// See the X-axis branch above for the rationale (conductor and
-	// dielectric on opposite sides of the *same* axis).
-	bool ym_conductor = sflag & 0x04;
-	bool yp_conductor = sflag & 0x08;
-	bool ym_dielectric = !ym_conductor && _geom.dielectric_material_at(i,j-1,k) != 0;
-	bool yp_dielectric = !yp_conductor && _geom.dielectric_material_at(i,j+1,k) != 0;
-
-	if( ym_dielectric || yp_dielectric ) {
-	    double wm = ym_conductor ? 1.0/alpha :
-		vacuum_face_coefficient( i,j,k, i,j-1,k, -1,1, _geom.mesh(i,j-1,k), 0, 1.0 );
-	    double wp = yp_conductor ? 1.0/beta :
-		vacuum_face_coefficient( i,j,k, i,j+1,k, +1,1, _geom.mesh(i,j+1,k), 0, 1.0 );
-	    set_link( a, _n2d(i,j-1,k), wm );
-	    set_link( a, _n2d(i,j+1,k), wp );
-	    cof += wm+wp;
-	} else {
-	    cof += 2.0/(alpha*beta);
-	    set_link( a, _n2d(i,j-1,k), 2.0/((alpha+beta)*alpha) );
-	    set_link( a, _n2d(i,j+1,k), 2.0/((alpha+beta)*beta) );
-	}
-    } else {
-	double wm = vacuum_face_coefficient( i,j,k, i,j-1,k, -1,1, _geom.mesh(i,j-1,k), 0, 1.0 );
-	double wp = vacuum_face_coefficient( i,j,k, i,j+1,k, +1,1, _geom.mesh(i,j+1,k), 0, 1.0 );
-	set_link( a, _n2d(i,j-1,k), wm );
-	set_link( a, _n2d(i,j+1,k), wp );
-	cof += wm+wp;
-    }
-
-    // Zmin direction
-    alpha = 1.0;
-    if( sflag & 0x10 ) {
-	alpha = *ptr/255.0;
-	ptr++;
-    }
-
-    // Zmax direction
-    beta = 1.0;
-    if( sflag & 0x20 ) {
-	beta = *ptr/255.0;
-	ptr++;
-    }
-
-    // Factors for Z axis
-    if( bindex & EPOT_SOLVER_BZMIN ) {
-	cof += 2.0/(beta*beta);
-	set_link( a, _n2d(i,j,k+1), 2.0/(beta*beta) );
-	(*_fd_vec)(a) += 2.0*_geom.h()*_geom.get_boundary(5).value(x) / beta;
-    } else if( bindex & EPOT_SOLVER_BZMAX ) {
-	cof += 2.0/(alpha*alpha);
-	set_link( a, _n2d(i,j,k-1), 2.0/(alpha*alpha) );
-	(*_fd_vec)(a) += 2.0*_geom.h()*_geom.get_boundary(6).value(x) / alpha;
-    } else if( sflag & 0x30 ) {
-	// See the X-axis branch above.
-	bool zm_conductor = sflag & 0x10;
-	bool zp_conductor = sflag & 0x20;
-	bool zm_dielectric = !zm_conductor && _geom.dielectric_material_at(i,j,k-1) != 0;
-	bool zp_dielectric = !zp_conductor && _geom.dielectric_material_at(i,j,k+1) != 0;
-
-	if( zm_dielectric || zp_dielectric ) {
-	    double wm = zm_conductor ? 1.0/alpha :
-		vacuum_face_coefficient( i,j,k, i,j,k-1, -1,2, _geom.mesh(i,j,k-1), 0, 1.0 );
-	    double wp = zp_conductor ? 1.0/beta :
-		vacuum_face_coefficient( i,j,k, i,j,k+1, +1,2, _geom.mesh(i,j,k+1), 0, 1.0 );
-	    set_link( a, _n2d(i,j,k-1), wm );
-	    set_link( a, _n2d(i,j,k+1), wp );
-	    cof += wm+wp;
-	} else {
-	    cof += 2.0/(alpha*beta);
-	    set_link( a, _n2d(i,j,k-1), 2.0/((alpha+beta)*alpha) );
-	    set_link( a, _n2d(i,j,k+1), 2.0/((alpha+beta)*beta) );
-	}
-    } else {
-	double wm = vacuum_face_coefficient( i,j,k, i,j,k-1, -1,2, _geom.mesh(i,j,k-1), 0, 1.0 );
-	double wp = vacuum_face_coefficient( i,j,k, i,j,k+1, +1,2, _geom.mesh(i,j,k+1), 0, 1.0 );
-	set_link( a, _n2d(i,j,k-1), wm );
-	set_link( a, _n2d(i,j,k+1), wp );
-	cof += wm+wp;
-    }
-
-    // Middle node
-    set_link( a, _n2d(i,j,k), -cof );
-}
-
-
+/* Stencil of a vacuum node with a conductor surface within a cell.
+ */
 void EpotMatrixSolver::add_near_solid_node( uint32_t i, uint32_t j, uint32_t k, const Vec3D &x )
 {
-    uint32_t a = _n2d(i,j,k) & N2D_INDEX_MASK;
+    const uint32_t a = _n2d(i,j,k) & N2D_INDEX_MASK;
+    const int32_t ijk[3] = { (int32_t)i, (int32_t)j, (int32_t)k };
+    const bool cyl = ( _geom.geom_mode() == MODE_CYL );
+    const uint8_t bindex = boundary_index_general(i,j,k);
 
-    switch( _geom.geom_mode() ) {
-    case MODE_1D:
-	add_near_solid_node_1d(i,x);
-	break;
-    case MODE_2D:
-	add_near_solid_node_2d(i,j,x);
-	break;
-    case MODE_CYL:
-	add_near_solid_node_cyl(i,j,x);
-	break;
-    case MODE_3D:
-	add_near_solid_node_3d(i,j,k,x);
-	break;
-    }
+    // Near-solid data of the node: a flag byte with one bit per direction
+    // (xmin, xmax, ymin, ...) whose link is cut by a conductor surface,
+    // followed by one byte per set bit, the distance to the surface in
+    // units of h/255.
+    const uint8_t *ptr = _geom.nearsolid_ptr( _geom.mesh(i,j,k) & SMESH_NEAR_SOLID_INDEX_MASK );
+    const uint8_t sflag = *ptr++;
 
-    // Nonlinear (plasma) contribution to rhs/diagonal is epot-dependent
-    // and is added separately, once per Newton iteration, by
-    // update_nonlinear_node() -- see build_mat_vec(). Everything in
-    // this function is geometry-only and gets cached after the first
-    // build.
-
-    // Right hand side
-    if( _plasma != PLASMA_SHIELD )
-	(*_fd_vec)(a) += -(*_scharge)(i,j,k)*_geom.h()*_geom.h()/EPSILON0;
-}
-
-
-void EpotMatrixSolver::add_neumann_node_1d( uint32_t i, const Vec3D &x )
-{
-    uint32_t a = _n2d(i) & N2D_INDEX_MASK;
-    uint8_t bindex = boundary_index(i);
-
-    // A Neumann box-wall node's own mesh tag generally cannot carry
-    // material info (it may have been overridden away from a dielectric
-    // tag that reached this edge), so its permittivity has to be
-    // recovered from Geometry::dielectric_material_at() (O(1), correct
-    // regardless of that reclassification) rather than the raw tag
-    // alone. This matters whenever some *other* axis has a material
-    // boundary near this node -- in 1D there is only one axis, so this
-    // mainly keeps add_neumann_node_1d() consistent with the other geom
-    // modes.
-    uint32_t self_material = _geom.dielectric_material_at( i, 0, 0 );
-    double eps_self = ( self_material == 0 ) ? 1.0 : _geom.get_boundary( self_material ).value();
-
-    if( bindex & EPOT_SOLVER_BXMIN ) {
-	double w = 2.0*eps_self;
-	set_link( a, _n2d(i), -w );
-	set_link( a, _n2d(i+1), w );
-	(*_fd_vec)(a) += w*_geom.h()*_geom.get_boundary(1).value( x );
-    } else {
-	double w = 2.0*eps_self;
-	set_link( a, _n2d(i-1), w );
-	set_link( a, _n2d(i), -w );
-	(*_fd_vec)(a) += w*_geom.h()*_geom.get_boundary(2).value( x );
-    }
-}
-
-
-void EpotMatrixSolver::add_neumann_node_2d( uint32_t i, uint32_t j, const Vec3D &x )
-{
-    uint32_t a = _n2d(i,j) & N2D_INDEX_MASK;
-    uint8_t bindex = boundary_index(i,j);
-
-    // See add_neumann_node_1d() -- recover this node's true permittivity
-    // even though its own tag may not carry it, since a material
-    // boundary along the *other* axis can sit right next to a
-    // Neumann-tagged node on this one.
-    uint32_t self_material = _geom.dielectric_material_at( i, j, 0 );
-    double eps_self = ( self_material == 0 ) ? 1.0 : _geom.get_boundary( self_material ).value();
     double cof = 0.0;
-
-    if( bindex & EPOT_SOLVER_BXMIN ) {
-	double w = 2.0*eps_self;
-	set_link( a, _n2d(i+1,j), w );
-	(*_fd_vec)(a) += w*_geom.h()*_geom.get_boundary(1).value( x );
-	cof += w;
-    } else if( bindex & EPOT_SOLVER_BXMAX ) {
-	double w = 2.0*eps_self;
-	set_link( a, _n2d(i-1,j), w );
-	(*_fd_vec)(a) += w*_geom.h()*_geom.get_boundary(2).value( x );
-	cof += w;
-    } else {
-	double wm = vacuum_face_coefficient( i,j,0, i-1,j,0, -1,0, _geom.mesh(i-1,j), self_material, eps_self );
-	double wp = vacuum_face_coefficient( i,j,0, i+1,j,0, +1,0, _geom.mesh(i+1,j), self_material, eps_self );
-	set_link( a, _n2d(i-1,j), wm );
-	set_link( a, _n2d(i+1,j), wp );
-	cof += wm+wp;
+    for( uint32_t c = 0; c < _geom.dim(); c++ ) {
+	const uint8_t bnd = (bindex >> 2*c) & 0x03;
+	const uint8_t cut = (sflag >> 2*c) & 0x03;
+	const double alpha = (cut & 0x01) ? *ptr++/255.0 : 1.0;
+	const double beta  = (cut & 0x02) ? *ptr++/255.0 : 1.0;
+	if( cyl && c == 1 )
+	    cof += near_solid_radial( a, ijk, bnd, cut, alpha, beta, x );
+	else
+	    cof += near_solid_axis( a, ijk, c, bnd, cut, alpha, beta, x );
     }
-
-    if( bindex & EPOT_SOLVER_BYMIN ) {
-	double w = 2.0*eps_self;
-	set_link( a, _n2d(i,j+1), w );
-	(*_fd_vec)(a) += -w*_geom.h()*_geom.get_boundary(3).value( x );
-	cof += w;
-    } else if( bindex & EPOT_SOLVER_BYMAX ) {
-	double w = 2.0*eps_self;
-	set_link( a, _n2d(i,j-1), w );
-	(*_fd_vec)(a) += -w*_geom.h()*_geom.get_boundary(4).value( x );
-	cof += w;
-    } else {
-	double wm = vacuum_face_coefficient( i,j,0, i,j-1,0, -1,1, _geom.mesh(i,j-1), self_material, eps_self );
-	double wp = vacuum_face_coefficient( i,j,0, i,j+1,0, +1,1, _geom.mesh(i,j+1), self_material, eps_self );
-	set_link( a, _n2d(i,j-1), wm );
-	set_link( a, _n2d(i,j+1), wp );
-	cof += wm+wp;
-    }
-
-    set_link( a, _n2d(i,j), -cof );
-}
-
-
-void EpotMatrixSolver::add_neumann_node_cyl( uint32_t i, uint32_t j, const Vec3D &x )
-{
-    uint32_t a = _n2d(i,j) & N2D_INDEX_MASK;
-    uint8_t bindex = boundary_index(i,j);
-
-    // See add_neumann_node_1d().
-    uint32_t self_material = _geom.dielectric_material_at( i, j, 0 );
-    double eps_self = ( self_material == 0 ) ? 1.0 : _geom.get_boundary( self_material ).value();
-    double cof = 0.0;
-
-    if( bindex & EPOT_SOLVER_BYMIN ) {
-	// On-axis
-	if( bindex & EPOT_SOLVER_BXMIN ) {
-	    double w = 2.0*eps_self;
-	    set_link( a, _n2d(i+1,j), w );
-	    (*_fd_vec)(a) += w*_geom.h()*_geom.get_boundary(1).value( x );
-	    cof += w;
-	} else if( bindex & EPOT_SOLVER_BXMAX ) {
-	    double w = 2.0*eps_self;
-	    set_link( a, _n2d(i-1,j), w );
-	    (*_fd_vec)(a) += w*_geom.h()*_geom.get_boundary(2).value( x );
-	    cof += w;
-	} else {
-	    double wm = vacuum_face_coefficient( i,j,0, i-1,j,0, -1,0, _geom.mesh(i-1,j), self_material, eps_self );
-	    double wp = vacuum_face_coefficient( i,j,0, i+1,j,0, +1,0, _geom.mesh(i+1,j), self_material, eps_self );
-	    set_link( a, _n2d(i-1,j), wm );
-	    set_link( a, _n2d(i+1,j), wp );
-	    cof += wm+wp;
-	}
-	// On-axis cylindrical factor of 4 -- a coordinate-singularity
-	// term, not an ordinary face, so (unlike the other links here)
-	// this does not attempt a bisected cut-cell treatment if a
-	// dielectric interface happens to sit exactly on the axis --
-	// scoped the same way as a dielectric-Dirichlet interface is
-	// elsewhere (see vacuum_face_coefficient()'s doc comment).
-	double wr = 4.0*eps_self;
-	set_link( a, _n2d(i,j+1), wr );
-	cof += wr;
-    } else {
-	// Off-axis
-	if( bindex & EPOT_SOLVER_BXMIN ) {
-	    double w = 2.0*eps_self;
-	    set_link( a, _n2d(i+1,j), w );
-	    (*_fd_vec)(a) += w*_geom.h()*_geom.get_boundary(1).value( x );
-	    cof += w;
-	} else if( bindex & EPOT_SOLVER_BXMAX ) {
-	    double w = 2.0*eps_self;
-	    set_link( a, _n2d(i-1,j), w );
-	    (*_fd_vec)(a) += w*_geom.h()*_geom.get_boundary(2).value( x );
-	    cof += w;
-	} else {
-	    double wm = vacuum_face_coefficient( i,j,0, i-1,j,0, -1,0, _geom.mesh(i-1,j), self_material, eps_self );
-	    double wp = vacuum_face_coefficient( i,j,0, i+1,j,0, +1,0, _geom.mesh(i+1,j), self_material, eps_self );
-	    set_link( a, _n2d(i-1,j), wm );
-	    set_link( a, _n2d(i+1,j), wp );
-	    cof += wm+wp;
-	}
-
-	if( bindex & EPOT_SOLVER_BYMAX ) {
-	    double w = 2.0*eps_self;
-	    set_link( a, _n2d(i,j-1), w );
-	    (*_fd_vec)(a) += (1.0+0.5/j)*w*_geom.h()*_geom.get_boundary(2).value( x );
-	    cof += w;
-	} else {
-	    double wm = (1.0-0.5/j)*vacuum_face_coefficient( i,j,0, i,j-1,0, -1,1, _geom.mesh(i,j-1), self_material, eps_self );
-	    double wp = (1.0+0.5/j)*vacuum_face_coefficient( i,j,0, i,j+1,0, +1,1, _geom.mesh(i,j+1), self_material, eps_self );
-	    set_link( a, _n2d(i,j-1), wm );
-	    set_link( a, _n2d(i,j+1), wp );
-	    cof += wm+wp;
-	}
-    }
-
-    set_link( a, _n2d(i,j), -cof );
-}
-
-
-void EpotMatrixSolver::add_neumann_node_3d( uint32_t i, uint32_t j, uint32_t k, const Vec3D &x )
-{
-    uint32_t a = _n2d(i,j,k) & N2D_INDEX_MASK;
-    uint8_t bindex = boundary_index(i,j,k);
-
-    // See add_neumann_node_1d().
-    uint32_t self_material = _geom.dielectric_material_at( i, j, k );
-    double eps_self = ( self_material == 0 ) ? 1.0 : _geom.get_boundary( self_material ).value();
-    double cof = 0.0;
-
-    if( bindex & EPOT_SOLVER_BXMIN ) {
-	double w = 2.0*eps_self;
-	set_link( a, _n2d(i+1,j,k), w );
-	(*_fd_vec)(a) += w*_geom.h()*_geom.get_boundary(1).value( x );
-	cof += w;
-    } else if( bindex & EPOT_SOLVER_BXMAX ) {
-	double w = 2.0*eps_self;
-	set_link( a,_n2d(i-1,j,k), w );
-	(*_fd_vec)(a) += w*_geom.h()*_geom.get_boundary(2).value( x );
-	cof += w;
-    } else {
-	double wm = vacuum_face_coefficient( i,j,k, i-1,j,k, -1,0, _geom.mesh(i-1,j,k), self_material, eps_self );
-	double wp = vacuum_face_coefficient( i,j,k, i+1,j,k, +1,0, _geom.mesh(i+1,j,k), self_material, eps_self );
-	set_link( a, _n2d(i-1,j,k), wm );
-	set_link( a, _n2d(i+1,j,k), wp );
-	cof += wm+wp;
-    }
-
-    if( bindex & EPOT_SOLVER_BYMIN ) {
-	double w = 2.0*eps_self;
-	set_link( a, _n2d(i,j+1,k), w );
-	(*_fd_vec)(a) += w*_geom.h()*_geom.get_boundary(3).value( x );
-	cof += w;
-    } else if( bindex & EPOT_SOLVER_BYMAX ) {
-	double w = 2.0*eps_self;
-	set_link( a, _n2d(i,j-1,k), w );
-	(*_fd_vec)(a) += w*_geom.h()*_geom.get_boundary(4).value( x );
-	cof += w;
-    } else {
-	double wm = vacuum_face_coefficient( i,j,k, i,j-1,k, -1,1, _geom.mesh(i,j-1,k), self_material, eps_self );
-	double wp = vacuum_face_coefficient( i,j,k, i,j+1,k, +1,1, _geom.mesh(i,j+1,k), self_material, eps_self );
-	set_link( a, _n2d(i,j-1,k), wm );
-	set_link( a, _n2d(i,j+1,k), wp );
-	cof += wm+wp;
-    }
-
-    if( bindex & EPOT_SOLVER_BZMIN ) {
-	double w = 2.0*eps_self;
-	set_link( a, _n2d(i,j,k+1), w );
-	(*_fd_vec)(a) += w*_geom.h()*_geom.get_boundary(5).value( x );
-	cof += w;
-    } else if( bindex & EPOT_SOLVER_BZMAX ) {
-	double w = 2.0*eps_self;
-	set_link( a, _n2d(i,j,k-1), w );
-	(*_fd_vec)(a) += w*_geom.h()*_geom.get_boundary(6).value( x );
-	cof += w;
-    } else {
-	double wm = vacuum_face_coefficient( i,j,k, i,j,k-1, -1,2, _geom.mesh(i,j,k-1), self_material, eps_self );
-	double wp = vacuum_face_coefficient( i,j,k, i,j,k+1, +1,2, _geom.mesh(i,j,k+1), self_material, eps_self );
-	set_link( a, _n2d(i,j,k-1), wm );
-	set_link( a, _n2d(i,j,k+1), wp );
-	cof += wm+wp;
-    }
-
     set_link( a, _n2d(i,j,k), -cof );
 }
 
 
+/* Stencil of a node on a Neumann face of the simulation box with no
+ * conductor surface within a cell. The node is in vacuum or inside a
+ * dielectric. The boundary value is the derivative of the potential along
+ * the inward normal of the face.
+ */
 void EpotMatrixSolver::add_neumann_node( uint32_t i, uint32_t j, uint32_t k, const Vec3D &x )
 {
-    uint32_t a = _n2d(i,j,k) & N2D_INDEX_MASK;
+    const uint32_t a = _n2d(i,j,k) & N2D_INDEX_MASK;
+    const int32_t ijk[3] = { (int32_t)i, (int32_t)j, (int32_t)k };
+    const bool cyl = ( _geom.geom_mode() == MODE_CYL );
+    const uint8_t bindex = boundary_index_general(i,j,k);
+    const uint32_t self_material = _geom.dielectric_material_at( i, j, k );
+    const double eps_self = node_epsilon_r( i, j, k );
 
-    switch( _geom.geom_mode() ) {
-    case MODE_1D:
-	add_neumann_node_1d( i, x );
-        break;
-    case MODE_2D:
-	add_neumann_node_2d( i, j, x );
-        break;
-    case MODE_CYL:
-	add_neumann_node_cyl( i, j, x );
-	break;
-    case MODE_3D:
-	add_neumann_node_3d( i, j, k, x );
-        break;
+    double cof = 0.0;
+    for( uint32_t c = 0; c < _geom.dim(); c++ ) {
+	const uint8_t bnd = (bindex >> 2*c) & 0x03;
+	const bool radial = ( cyl && c == 1 );
+	int32_t m[3] = { ijk[0], ijk[1], ijk[2] };
+	int32_t p[3] = { ijk[0], ijk[1], ijk[2] };
+	m[c]--;
+	p[c]++;
+
+	if( radial && (bnd & 0x01) ) {
+	    // On axis: the limit of the radial operator at r=0. A
+	    // dielectric touching the axis gets no interface treatment.
+	    const double w = 4.0*eps_self;
+	    set_link( a, _n2d(p[0],p[1],p[2]), w );
+	    cof += w;
+	} else if( bnd ) {
+	    // On the face: the neighbour outside is the mirror image of
+	    // the one inside.
+	    const bool lower = bnd & 0x01;
+	    const double w = 2.0*eps_self;
+	    set_link( a, lower ? _n2d(p[0],p[1],p[2]) : _n2d(m[0],m[1],m[2]), w );
+	    (*_fd_vec)(a) += ( radial ? (1.0+0.5/j)*w : w )*_geom.h()*
+		_geom.get_boundary( lower ? 1+2*c : 2+2*c ).value( x );
+	    cof += w;
+	} else {
+	    double wm = vacuum_face_coefficient( ijk, c, -1, self_material, eps_self );
+	    double wp = vacuum_face_coefficient( ijk, c, +1, self_material, eps_self );
+	    if( radial ) {
+		wm *= (1.0-0.5/j);
+		wp *= (1.0+0.5/j);
+	    }
+	    set_link( a, _n2d(m[0],m[1],m[2]), wm );
+	    set_link( a, _n2d(p[0],p[1],p[2]), wp );
+	    cof += wm+wp;
+	}
     }
+    set_link( a, _n2d(i,j,k), -cof );
 
-    // Nonlinear (plasma) contribution to rhs/diagonal is epot-dependent
-    // and is added separately, once per Newton iteration, by
-    // update_nonlinear_node() -- see build_mat_vec(). Everything in
-    // this function is geometry-only and gets cached after the first
-    // build.
-
-    // Right hand side
-    if( _plasma != PLASMA_SHIELD )
-	(*_fd_vec)(a) += -(*_scharge)(i,j,k)*_geom.h()*_geom.h()/EPSILON0;
+    // No space charge inside a dielectric, as in add_vacuum_node().
+    if( self_material != 0 )
+	_row_scharge[a] = 0;
 }
 
 
 void EpotMatrixSolver::reset_matrix( void )
 {
-    if( _fd_mat )
-        delete _fd_mat;
-    if( _fd_vec )
-        delete _fd_vec;
-    if( _fd_vec_base )
-        delete _fd_vec_base;
+    delete _fd_mat;
+    delete _fd_vec;
     _fd_mat = 0;
     _fd_vec = 0;
-    _fd_vec_base = 0;
     _dof = 0;
-    _linear_built = false;
     _fd_mat_diag0.clear();
-    // Must be dropped together with the matrix these index into -- see
-    // _fd_mat_diag_idx's doc comment.
     _fd_mat_diag_idx.clear();
-
     _n2d.clear();
 }
 
@@ -1593,256 +731,230 @@ void EpotMatrixSolver::set_solution( MeshScalarField &epot, const Vector &X ) co
 }
 
 
-void EpotMatrixSolver::preprocess( MeshScalarField &epot, const MeshScalarField &scharge )
+/* Has anything the linear system was built from changed since the last call?
+ *
+ * The matrix, the node numbering and the boundary part of the right hand
+ * side depend on the geometry definition, on the node tags as left by
+ * EpotSolver::preprocess() (which fixes nodes for forced potentials and
+ * initial plasma) and on the potential of the fixed nodes. Solver settings
+ * are not checked here: their setters call reset_problem().
+ *
+ * The current state is recorded as the reference for the next call.
+ */
+bool EpotMatrixSolver::linear_inputs_changed( void )
+{
+    const uint32_t n = _geom.nodecount();
+    bool changed = ( _key_revision != _geom.revision() || _key_mesh.size() != n );
+    _key_revision = _geom.revision();
+    _key_mesh.resize( n );
+    _key_epot.resize( n );
+
+    // A Neumann value given as a functor can change without the geometry
+    // knowing about it.
+    for( uint32_t b = 1; b <= 6; b++ ) {
+	const Bound &bound = _geom.boundary( b );
+	if( bound.type() == BOUND_NEUMANN && !bound.is_constant() )
+	    changed = true;
+    }
+
+    for( uint32_t a = 0; a < n; a++ ) {
+	uint32_t mesh = _geom.mesh( a );
+	// A Neumann mask node is fixed, but its potential is never read.
+	double fixed_epot = 0.0;
+	if( (mesh & SMESH_NODE_FIXED) && !SMESH_NODE_IS_NEUMANN_MASK( mesh ) )
+	    fixed_epot = (*_epot)( a );
+	if( mesh != _key_mesh[a] || fixed_epot != _key_epot[a] ) {
+	    _key_mesh[a] = mesh;
+	    _key_epot[a] = fixed_epot;
+	    changed = true;
+	}
+    }
+
+    return( changed );
+}
+
+
+bool EpotMatrixSolver::preprocess( MeshScalarField &epot, const MeshScalarField &scharge )
 {
     _epot = &epot;
     _scharge = &scharge;
     EpotSolver::preprocess( epot );
 
-    reset_matrix();
+    // The linear system is kept from one solve to the next, see the header.
+    const bool rebuild = ( linear_inputs_changed() || !_fd_mat );
+    if( rebuild )
+	build_linear();
+    ibsimu.message( 1 ) << "dof = " << _dof << "\n";
 
-    // Build n2d array and calculate degrees of freedom.
-    //
-    // NOTE the two index spaces stored here, which are NOT interchangeable:
-    //   fixed node -> N2D_TYPE_FIXED | (MESH index)
-    //   free  node -> N2D_TYPE_FREE  | (DOF  index)
-    // set_link()'s row argument is a DOF index, its column argument for a
-    // fixed neighbour is a MESH index. Mixing them silently produces valid-
-    // looking but meaningless matrix columns.
-    _n2d.resize( _geom.size() );
-    _dof2node.clear();
-    _dof2node.reserve( _geom.nodecount() );
-    _dof = 0;
-    for( int32_t a = 0; a < (int32_t)_geom.nodecount(); a++ ) {
-
-	uint32_t mesh = _geom.mesh(a);
-	bool fixed = mesh & SMESH_NODE_FIXED;
-
-	if( fixed )
-	    // Fixed node
-	    _n2d(a) = N2D_TYPE_FIXED | a;
-	else { 
-	    // Free node
-	    _n2d(a) = N2D_TYPE_FREE | _dof;
-	    _dof2node.push_back( a );          // inverse map, see set_link()
-	    _dof++;
-	}
+    // Constant right hand side of this solve: boundary part plus space
+    // charge. With the shield model the charge enters through
+    // update_nonlinear_node() instead.
+    const bool add_scharge = ( _plasma != PLASMA_SHIELD );
+    _fd_vec_base = _fd_vec_bc;
+    for( uint32_t a = 0; a < _dof; a++ ) {
+	if( add_scharge && _row_scharge[a] )
+	    _fd_vec_base(a) += -(*_scharge)(_dof2node[a])*_geom.h()*_geom.h()/EPSILON0;
     }
 
-    ibsimu.message( 1 ) << "dof = " << _dof << "\n";
-    if( _dof == 0 )
-        throw( Error( ERROR_LOCATION, "zero degrees of freedom" ) );
-    
-    // Allocate problem matrix and vector
-    _fd_mat = new CRowMatrix( _dof, _dof );
-    _fd_vec = new Vector( _dof );
-
-    // Sized once here rather than per get_resjac() call; contents are
-    // reset at the top of each of those calls.
-    _d_vec.resize( _dof );
-    _d_vec.clear();
+    return( rebuild );
 }
 
 
+/* Build the part of the system that depends neither on the solution nor on
+ * the space charge: the node numbering, the matrix J0 and the boundary part
+ * of the right hand side.
+ */
+void EpotMatrixSolver::build_linear( void )
+{
+    auto time_t0 = Clock::now();
+    int nthreads = (int)ibsimu.get_thread_count();
+
+    reset_matrix();
+
+    // Node numbering: _n2d holds the mesh node index for a fixed node and
+    // the row number for a free one.
+    _n2d.resize( _geom.size() );
+    _dof2node.clear();
+    _dof2node.reserve( _geom.nodecount() );
+    for( int32_t a = 0; a < (int32_t)_geom.nodecount(); a++ ) {
+	if( _geom.mesh(a) & SMESH_NODE_FIXED ) {
+	    _n2d(a) = N2D_TYPE_FIXED | a;
+	} else {
+	    _n2d(a) = N2D_TYPE_FREE | _dof;
+	    _dof2node.push_back( a );
+	    _dof++;
+	}
+    }
+    if( _dof == 0 )
+        throw( Error( ERROR_LOCATION, "zero degrees of freedom" ) );
+
+    _fd_mat = new CRowMatrix( _dof, _dof );
+    _fd_vec = new Vector( _dof );
+    _fd_vec->clear();
+    _d_vec.resize( _dof );
+    _row_scharge.assign( _dof, 1 );
+
+    // CRowMatrix::construct_add() appends at one shared cursor, so the
+    // parallel loop below can not write to the matrix directly. set_link()
+    // collects each row's entries here instead. Capacity is reserved for
+    // the largest stencil (3D: 6 neighbours + centre) so that no row
+    // reallocates while other threads are working.
+    _row_entries.assign( _dof, std::vector<std::pair<int32_t,double> >() );
+    for( uint32_t a = 0; a < _dof; a++ )
+	_row_entries[a].reserve( 7 );
+
+    // Each node is handled by one thread, which writes only that node's
+    // _row_entries[a], _fd_vec(a) and _row_scharge[a]. A user-supplied
+    // boundary value functor is called from here without locking, so it
+    // must be thread-safe.
+#pragma omp parallel for num_threads(nthreads) collapse(3) schedule(dynamic,64)
+    for( uint32_t k = 0; k < _geom.size(2); k++ ) {
+	for( uint32_t j = 0; j < _geom.size(1); j++ ) {
+	    for( uint32_t i = 0; i < _geom.size(0); i++ ) {
+
+		Vec3D x( _geom.origo(0) + _geom.h()*i,
+			 _geom.origo(1) + _geom.h()*j,
+			 _geom.origo(2) + _geom.h()*k );
+
+		uint32_t mesh = _geom.mesh(i,j,k);
+		uint32_t node_id = mesh & SMESH_NODE_ID_MASK;
+
+		if( mesh & SMESH_NODE_FIXED )
+		    continue;
+		else if( node_id == SMESH_NODE_ID_PURE_VACUUM )
+		    add_vacuum_node( i, j, k, x );
+		else if( node_id == SMESH_NODE_ID_NEAR_SOLID )
+		    add_near_solid_node( i, j, k, x );
+		else if( node_id == SMESH_NODE_ID_NEUMANN )
+		    add_neumann_node( i, j, k, x );
+	    }
+	}
+    }
+
+    // Copy the rows into the matrix in ascending row order, as
+    // construct_add() requires.
+    //
+    // Entries with the same column are merged first: a link that
+    // set_link() redirects from a Neumann mask lands on a column the row
+    // has already (the mirror neighbour or the diagonal).
+    std::vector<double> rowacc;
+    std::vector<int32_t> rowcol;
+    for( uint32_t a = 0; a < _dof; a++ ) {
+	const std::vector<std::pair<int32_t,double> > &row = _row_entries[a];
+
+	rowacc.clear();
+	rowcol.clear();
+	for( size_t n = 0; n < row.size(); n++ ) {
+	    size_t m = 0;
+	    for( ; m < rowcol.size(); m++ ) {
+		if( rowcol[m] == row[n].first ) {
+		    rowacc[m] += row[n].second;
+		    break;
+		}
+	    }
+	    if( m == rowcol.size() ) {
+		rowcol.push_back( row[n].first );
+		rowacc.push_back( row[n].second );
+	    }
+	}
+
+	for( size_t m = 0; m < rowcol.size(); m++ )
+	    _fd_mat->construct_add( a, rowcol[m], rowacc[m] );
+    }
+    _fd_mat->order_ascending();
+    std::vector<std::vector<std::pair<int32_t,double> > >().swap( _row_entries );
+
+    _fd_vec_bc = *_fd_vec;
+
+    // Linear diagonal J0(a,a) and its position in the value array, for
+    // build_mat_vec() and get_resjac().
+    _fd_mat_diag0.resize( _dof );
+    _fd_mat_diag_idx.resize( _dof );
+    for( uint32_t a = 0; a < _dof; a++ ) {
+	int idx = _fd_mat->value_index( a, a );
+	if( idx < 0 ) {
+	    // Every stencil builder emits a centre link, so this row was
+	    // never built. Do not keep the broken system.
+	    reset_matrix();
+	    throw( Error( ERROR_LOCATION, "no diagonal element on matrix row "
+			  + to_string(a) ) );
+	}
+	_fd_mat_diag_idx[a] = idx;
+	_fd_mat_diag0[a] = _fd_mat->value_ptr()[idx];
+    }
+
+    _time_linbuild += std::chrono::duration<double>( Clock::now()-time_t0 ).count();
+}
+
+
+/* Set _fd_mat to the linear matrix J0 and _fd_vec to the right hand side
+ * at the current solution _sol. The solution dependent part of the jacobian
+ * diagonal is returned in _d_vec.
+ */
 void EpotMatrixSolver::build_mat_vec( void )
 {
-    if( _dof == 0  )
+    if( !_fd_mat )
 	throw( Error( ERROR_LOCATION, "preprocess not done" ) );
 
     int nthreads = (int)ibsimu.get_thread_count();
 
-    // Every mesh node's dielectric material used to be precomputed here,
-    // once ever, into a solver-private _dielectric_mat cache (each entry
-    // populated via self_material_at()'s Geometry::inside() fallback,
-    // since the raw tag alone wasn't always enough -- see
-    // Geometry::dielectric_material_at()'s doc comment). That's no
-    // longer needed: Geometry now populates the same information into
-    // its own material() array for free during mesh build, so
-    // update_nonlinear_node()/vacuum_face_coefficient()/add_vacuum_node()
-    // etc. just call Geometry::dielectric_material_at(i,j,k) directly.
+    // Start from the linear system. get_resjac() leaves the jacobian
+    // diagonal in the matrix, so that is restored too.
+    *_fd_vec = _fd_vec_base;
+    double *mval = _fd_mat->value_ptr();
+    for( uint32_t a = 0; a < _dof; a++ )
+	mval[_fd_mat_diag_idx[a]] = _fd_mat_diag0[a];
+    _fd_mat->values_changed();
 
-    if( !_linear_built ) {
-
-	auto time_t0 = Clock::now();
-
-	// One-time build of the linear (geometry-only) part: matrix
-	// stencil coefficients, Dirichlet-neighbour rhs contributions
-	// and the constant space-charge rhs term. None of this depends
-	// on the current solution guess X, only on the mesh, boundary
-	// conditions and scharge, all of which are fixed between here
-	// and the next preprocess()/reset_matrix() call -- so it is
-	// built once and cached, instead of being redone on every
-	// Newton iteration.
-	_fd_mat->clear();
-	_fd_vec->clear();
-
-	// Reset per-row entry buffers (see header doc comment on
-	// _row_entries for why these exist instead of writing straight
-	// into _fd_mat from the parallel loop below). Reserve enough
-	// capacity for the largest possible stencil (3D: 6 neighbours + 1
-	// combined centre term = 7) so no row needs to reallocate while
-	// another thread is concurrently working on a different row.
-	if( _row_entries.size() != _dof )
-	    _row_entries.resize( _dof );
-	for( uint32_t a = 0; a < _dof; a++ ) {
-	    _row_entries[a].clear();
-	    _row_entries[a].reserve( 7 );
-	}
-
-	// Parallel over grid nodes: every node is handled by exactly
-	// one thread, which only ever writes to that node's own
-	// _row_entries[a] slot and its own _fd_vec(a) entry (a is
-	// unique per node), so there is no cross-row data race. This
-	// does mean any user-supplied Boundary::value() callback
-	// reachable from add_vacuum_node()/add_near_solid_node()/
-	// add_neumann_node() must itself be safe to call concurrently
-	// from multiple threads -- this parallel loop calls it with no
-	// locking.
-#pragma omp parallel for num_threads(nthreads) collapse(3) schedule(dynamic,64)
-	for( uint32_t k = 0; k < _geom.size(2); k++ ) {
-	    for( uint32_t j = 0; j < _geom.size(1); j++ ) {
-		for( uint32_t i = 0; i < _geom.size(0); i++ ) {
-
-		    Vec3D x( _geom.origo(0) + _geom.h()*i,
-			     _geom.origo(1) + _geom.h()*j,
-			     _geom.origo(2) + _geom.h()*k );
-
-		    uint32_t a = (k*_geom.size(1)+j)*_geom.size(0)+i;
-		    uint32_t mesh = _geom.mesh(a);
-		    uint32_t node_id = mesh & SMESH_NODE_ID_MASK;
-		    bool fixed = mesh & SMESH_NODE_FIXED;
-
-		    if( fixed ) {
-			//ibsimu.message( 1 ) << "Fixed\n";
-			continue;
-		    } else if( node_id == SMESH_NODE_ID_PURE_VACUUM ) {
-			//ibsimu.message( 1 ) << "Vacuum\n";
-			add_vacuum_node( i, j, k, x );
-		    } else if( node_id == SMESH_NODE_ID_NEAR_SOLID ) {
-			//ibsimu.message( 1 ) << "Near solid\n";
-			add_near_solid_node( i, j, k, x );
-		    } else if( node_id == SMESH_NODE_ID_NEUMANN ) {
-			//ibsimu.message( 1 ) << "Neumann\n";
-			add_neumann_node( i, j, k, x );
-		    }
-		}
-	    }
-	}
-
-	// Compact the per-row buffers into _fd_mat via construct_add(), in
-	// ascending row order, exactly as construct_add() requires. This
-	// pass is pure data movement (no stencil math, no plasma
-	// evaluation) over already-computed entries, so it stays cheap
-	// even though it runs single-threaded.
-	//
-	// Duplicate columns within a row are MERGED here rather than being
-	// handed to construct_add() twice. construct_add() appends
-	// unconditionally -- it does not look for an existing entry -- so
-	// duplicates would survive into the CSR arrays. A matrix-vector
-	// product sums them and so stays correct, but everything that
-	// SEARCHES for a particular entry sees only the first one:
-	// _fd_mat_diag_idx below (which get_resjac() uses to apply the
-	// nonlinear plasma term to the diagonal every Newton iteration),
-	// GMG_Precond::find_diagonals(), and the ILU/RBSOR preconditioners'
-	// diagonal handling would all then act on a fraction of the true
-	// diagonal.
-	//
-	// Set_link()'s Neumann-mask redirect is what makes this reachable:
-	// it emits an extra entry at (a,a) for every masked face, on top of
-	// the diagonal the stencil builder emits at the end. Merging here
-	// rather than relying on the builders always emitting the diagonal
-	// last keeps that independent of call order.
-	std::vector<double> rowacc;
-	std::vector<int32_t> rowcol;
-	for( uint32_t a = 0; a < _dof; a++ ) {
-	    const std::vector<std::pair<int32_t,double> > &row = _row_entries[a];
-
-	    rowacc.clear();
-	    rowcol.clear();
-	    for( size_t n = 0; n < row.size(); n++ ) {
-		size_t m = 0;
-		for( ; m < rowcol.size(); m++ ) {
-		    if( rowcol[m] == row[n].first ) {
-			rowacc[m] += row[n].second;
-			break;
-		    }
-		}
-		if( m == rowcol.size() ) {
-		    rowcol.push_back( row[n].first );
-		    rowacc.push_back( row[n].second );
-		}
-	    }
-
-	    for( size_t m = 0; m < rowcol.size(); m++ )
-		_fd_mat->construct_add( a, rowcol[m], rowacc[m] );
-	}
-
-	// Order matrix
-	_fd_mat->order_ascending();
-
-	// Snapshot the constant rhs so later calls can restore it
-	// instead of rebuilding it from scratch.
-	if( _fd_vec_base )
-	    delete _fd_vec_base;
-	_fd_vec_base = new Vector( *_fd_vec );
-
-	// Snapshot the pure-linear diagonal J0(a,a) so get_resjac() can
-	// re-derive the Jacobian diagonal fresh each Newton iteration
-	// (J0(a,a) - D(a)) instead of repeatedly subtracting from
-	// whatever the now-persistent _fd_mat's diagonal currently holds.
-	//
-	// Also resolve, once, where each diagonal element physically lives
-	// in the matrix's value array, so get_resjac()'s two per-iteration
-	// diagonal sweeps become direct indexed writes rather than
-	// row-scanning set(a,a) calls -- see _fd_mat_diag_idx's doc
-	// comment. Done after order_ascending() above, and the structure
-	// is fixed from here until the next reset_matrix(), so these
-	// indices stay valid for the whole solve.
-	_fd_mat_diag0.resize( _dof );
-	_fd_mat_diag_idx.resize( _dof );
-	for( uint32_t a = 0; a < _dof; a++ ) {
-	    int idx = _fd_mat->value_index( a, a );
-	    if( idx < 0 )
-		// Every free row gets an explicit centre-node link from
-		// add_vacuum_node()/add_near_solid_node()/add_neumann_node(),
-		// so a structurally missing diagonal means the stencil for
-		// this row was never emitted -- a real bug upstream, and one
-		// that would otherwise show up much later as a silently
-		// wrong Jacobian rather than an error here.
-		throw( Error( ERROR_LOCATION, "no diagonal element on matrix row "
-			      + to_string(a) ) );
-	    _fd_mat_diag_idx[a] = idx;
-	    _fd_mat_diag0[a] = _fd_mat->value_ptr()[idx];
-	}
-
-	_linear_built = true;
-	_time_linbuild += std::chrono::duration<double>( Clock::now()-time_t0 ).count();
-
-    } else {
-
-	// Matrix and constant rhs part are unchanged since the last
-	// build (same mesh, boundary conditions and scharge) -- just
-	// restore the cached constant rhs instead of rebuilding it.
-	*_fd_vec = *_fd_vec_base;
-    }
-
-    // Nonlinear update: add the epot-dependent plasma rhs term and
-    // diagonal derivative for every free node. This is the only part
-    // of matrix/rhs construction that actually depends on X (via
-    // _sol), so it is the only part that has to run every Newton
-    // iteration. Skipped entirely when the solver isn't using a
-    // plasma model, and cheap even when it does run since it does none
-    // of the stencil/boundary bookkeeping the linear build does -- just
-    // a mesh scan plus, for plasma-active nodes, the actual nonlinear
-    // evaluation (pexp_newton/nsimp_newton/shield_newton).
+    // Plasma and compensation terms, the only part that depends on the
+    // solution.
     if( _plasma == PLASMA_PEXP || _plasma == PLASMA_NSIMP ||
-	_plasma == PLASMA_SHIELD || _comp ) {
+	_plasma == PLASMA_SHIELD || _comp.enabled ) {
 
 	auto time_t0 = Clock::now();
 
-	// Confinement depends on the current iterate, so it is rebuilt here --
-	// once per nonlinear scan, not once per node.
-	if( _comp && _comp_ascent )
+	// Confinement depends on the current iterate.
+	if( _comp.enabled && _comp.ascent )
 	    update_comp_mask();
 
 #pragma omp parallel for num_threads(nthreads) collapse(3) schedule(dynamic,64)
@@ -1872,7 +984,6 @@ void EpotMatrixSolver::build_mat_vec( void )
 
 void EpotMatrixSolver::postprocess( void )
 { 
-    reset_matrix();
     EpotSolver::postprocess();
 }
 
@@ -1887,50 +998,19 @@ void EpotMatrixSolver::get_vecmat( const CRowMatrix **A, const Vector **B )
 
 void EpotMatrixSolver::get_resjac( const CRowMatrix **J, const Vector **R, const Vector &X )
 {
-    // Build residual and jacobian from linear matric and vector.
-    // Calculate R = J0*X - B(X) and J = J0 + I*D(X)
-    //
-    // _d_vec is a member resized once in preprocess(), not a per-call
-    // allocation. Cleared here so rows that update_nonlinear_node()
-    // never visits (every row, when no plasma model is active) still
-    // read back as exactly zero, exactly as a freshly calloc'd Vector
-    // used to.
+    // R = J0*X - B(X) and J = J0 - I*D(X). build_mat_vec() gives J0 in
+    // _fd_mat, B(X) in _fd_vec and D(X) in _d_vec; _d_vec is cleared first
+    // because rows without a plasma term are not written.
     _d_vec.clear();
-
-    // Construct whole right hand side to _fd_vec, nonlinear component of diagonal
-    // to _d_vec and linear part of jacobian to _fd_mat.
     _sol = &X;
     build_mat_vec();
 
-    // _fd_mat is now a cached, persistent matrix (see build_mat_vec()):
-    // whatever the *previous* get_resjac() call left in its diagonal is
-    // the Jacobian diagonal J0(a,a) - D_prev(a), not the pure linear
-    // J0(a,a). Restore the pure linear diagonal before using _fd_mat as
-    // J0 for the w = J0*X multiply below, otherwise w would silently
-    // pick up the previous iteration's nonlinear correction.
-    //
-    // Written straight into the value array via the diagonal positions
-    // cached in _fd_mat_diag_idx rather than through set(a,a), which
-    // would re-scan row a to find the diagonal on every one of these
-    // 2*_dof accesses -- see _fd_mat_diag_idx's doc comment. Structure
-    // is fixed here (no insertions since order_ascending()), so the
-    // cached indices are valid; values_changed() below tells the matrix
-    // its cached MKL handle is stale, once for the whole sweep instead
-    // of once per element.
-    double *mval = _fd_mat->value_ptr();
-    for( uint32_t a = 0; a < _dof; a++ )
-	mval[_fd_mat_diag_idx[a]] = _fd_mat_diag0[a];
-    _fd_mat->values_changed();
-
-    // Linear part
     Vector w = (*_fd_mat) * X;
 
+    // The diagonal is written straight into the value array.
+    double *mval = _fd_mat->value_ptr();
     for( uint32_t a = 0; a < _dof; a++ ) {
-
 	(*_fd_vec)(a) = w(a) - (*_fd_vec)(a);
-	// Set (not subtract from) the diagonal: it must be re-derived
-	// fresh from the pure-linear J0(a,a) each call, not adjusted
-	// relative to whatever a previous iteration left there.
 	mval[_fd_mat_diag_idx[a]] = _fd_mat_diag0[a] - _d_vec(a);
     }
     _fd_mat->values_changed();
@@ -1938,17 +1018,6 @@ void EpotMatrixSolver::get_resjac( const CRowMatrix **J, const Vector **R, const
     *J = _fd_mat;
     *R = _fd_vec;
 }
-
-
-/*
-bool EpotMatrixSolver::linear( void ) const
-{
-    if( _plasma == PLASMA_NONE || _plasma == PLASMA_PEXP_INITIAL || _plasma == PLASMA_NSIMP_INITIAL )
-        return( true );
-    else
-        return( false );
-}
-*/
 
 
 void EpotMatrixSolver::debug_print( std::ostream &os ) const
@@ -1967,7 +1036,7 @@ void EpotMatrixSolver::debug_print( std::ostream &os ) const
 	os << "fd_vec = NULL\n";
 }
 
-// epot_matrixsolver.cpp
+
 void EpotMatrixSolver::build_node_map( std::vector<int32_t> &map ) const
 {
     map.resize( _geom.nodecount() );

@@ -60,10 +60,7 @@ EpotSolver::EpotSolver( Geometry &geom )
     : _geom(geom), _plasma(PLASMA_NONE), 
       _rhoe(0.0), _Te(0.0), _Up(0.0), 
       _force_pot(0.0), _force_pot_func(0), _force_pot_func2(0), 
-      _init_plasma_func(0), _plasma_calc_func(0),
-      _comp(false), _compTe(1.0), _compVref(0.0), _compRhoMin(0.0),
-      _comp_region_func(0), _comp_ascent(false), _comp_bbox_set(false),
-      _comp_bmin(0,0,0), _comp_bmax(0,0,0)
+      _init_plasma_func(0), _plasma_calc_func(0)
 {
 
 }
@@ -77,12 +74,7 @@ EpotSolver::EpotSolver( const EpotSolver &epsolver, Geometry &geom )
       _force_pot_func2(epsolver._force_pot_func2),
       _init_plasma_func(epsolver._init_plasma_func),
       _plasma_calc_func(epsolver._plasma_calc_func),
-      _comp(epsolver._comp), _compTe(epsolver._compTe),
-      _compVref(epsolver._compVref), _compRhoMin(epsolver._compRhoMin),
-      _comp_region_func(epsolver._comp_region_func),
-      _comp_ascent(epsolver._comp_ascent),
-      _comp_bbox_set(epsolver._comp_bbox_set),
-      _comp_bmin(epsolver._comp_bmin), _comp_bmax(epsolver._comp_bmax)
+      _comp(epsolver._comp)
 {
 
 }
@@ -113,15 +105,7 @@ void EpotSolver::set_parameters( const EpotSolver &epsolver )
     _force_pot_func2 = epsolver._force_pot_func2;
     _init_plasma_func = epsolver._init_plasma_func;
     _plasma_calc_func = epsolver._plasma_calc_func;
-    _comp             = epsolver._comp;
-    _compTe           = epsolver._compTe;
-    _compVref         = epsolver._compVref;
-    _compRhoMin       = epsolver._compRhoMin;
-    _comp_region_func = epsolver._comp_region_func;
-    _comp_ascent      = epsolver._comp_ascent;
-    _comp_bbox_set    = epsolver._comp_bbox_set;
-    _comp_bmin        = epsolver._comp_bmin;
-    _comp_bmax        = epsolver._comp_bmax;
+    _comp = epsolver._comp;
 }
 
 
@@ -139,28 +123,6 @@ void EpotSolver::set_forced_potential_volume( CallbackFunctorD_V *force_pot_func
 }
 
 
-namespace {
-    /* A dielectric solid's interior is tagged the same way as plain
-     * vacuum (SMESH_NODE_ID_PURE_VACUUM[_FIX] -- see
-     * Geometry::build_mesh_parallel_thread_3d()), and a dielectric
-     * reaching a simulation box wall or a real conductor gets its tag
-     * reclassified to SMESH_NODE_ID_NEUMANN/DIRICHLET/NEAR_SOLID there
-     * instead -- the right call for the matrix discretisation itself
-     * (the box's own condition, or the conductor's, applies right at
-     * that surface), but it means the raw tag alone can't answer "is
-     * this dielectric" uniformly. Geometry::dielectric_material_at() is
-     * the shared, always-correct answer to that question -- O(1),
-     * independent of any such reclassification (see its doc comment) --
-     * so this is now a thin wrapper around it rather than its own
-     * fast-path/geometric-fallback pair.
-     */
-    bool is_dielectric_at( const Geometry &geom, uint32_t i, uint32_t j, uint32_t k )
-    {
-	return( geom.dielectric_material_at( i, j, k ) != 0 );
-    }
-}
-
-
 void EpotSolver::set_initial_plasma( double Up,
 				     CallbackFunctorB_V *init_plasma_func )
 {
@@ -173,28 +135,6 @@ void EpotSolver::set_initial_plasma( double Up,
 }
 
 
-/* See the doc comment in epot_solver.hpp. Deliberately does not touch
- * _plasma/_init_plasma_func/reset_problem() at all -- unlike
- * set_initial_plasma(), this doesn't define a plasma model by itself,
- * it only fills in a starting guess for scharge that the caller then
- * passes to solve() alongside a real set_pexp_plasma()/
- * set_nsimp_plasma() call.
- *
- * Solid nodes are always skipped, regardless of what plasma_region_func
- * says: a Dirichlet (conductor) node is eliminated from the matrix
- * entirely, so scharge there is simply never read, but a dielectric
- * node is an ordinary *free* row (see is_dielectric_at()'s doc comment)
- * whose right-hand side directly includes -scharge*h*h/EPSILON0 (see
- * add_vacuum_node() and friends) -- setting rho there injects a large,
- * entirely spurious free-charge source term straight into the
- * dielectric's own Poisson equation, which has no mobile charge at all.
- * This is exactly the same category of mistake set_initial_plasma()'s
- * fixed-potential path had (see is_dielectric_at() and its call sites
- * in preprocess()), just landing on scharge here instead of a forced
- * potential. plasma_region_func only needs to describe the plasma's
- * geometric extent (e.g. "z < 0"); it does not need to know where the
- * solids are.
- */
 void EpotSolver::set_initial_plasma_rho( MeshScalarField &scharge, double rho,
 					 CallbackFunctorB_V *plasma_region_func ) const
 {
@@ -216,9 +156,9 @@ void EpotSolver::set_initial_plasma_rho( MeshScalarField &scharge, double rho,
 
 		uint32_t mesh = _geom.mesh(i,j,k);
 		if( (mesh & SMESH_NODE_ID_MASK) == SMESH_NODE_ID_DIRICHLET )
-		    continue; // conductor -- eliminated row, never read
-		if( is_dielectric_at( _geom, i, j, k ) )
-		    continue; // real dielectric material -- no mobile charge, see above
+		    continue;
+		if( _geom.dielectric_material_at( i, j, k ) )
+		    continue;
 
 		scharge(i,j,k) = rho;
 	    }
@@ -227,10 +167,8 @@ void EpotSolver::set_initial_plasma_rho( MeshScalarField &scharge, double rho,
 }
 
 
-/* True when a nonlinear plasma model of type \a type is already active, so
- * a setter re-arming the same type changes only Jacobian values -- see
- * reset_nonlinear_parameters(). A change of model type (in particular to or
- * from an INITIAL model, which fixes nodes) still needs reset_problem().
+/* Is the nonlinear plasma model of type \a type in use already? If so, a
+ * setter changes its parameters only, see reset_nonlinear_parameters().
  */
 static inline bool same_nonlinear_plasma( plasma_mode_e current, plasma_mode_e type,
 					  const CallbackFunctorB_V *init_plasma_func )
@@ -338,25 +276,13 @@ void EpotSolver::pexp_newton( double &rhs, double &drhs, double epot ) const
 }
 
 
-/* Compensation shape function.
- *
- *   g(phi)  = 1 - exp( -(phi - Vref)/Te )   for phi > Vref, else 0
- *   dg/dphi = (1/Te) exp( -(phi - Vref)/Te ) for phi > Vref, else 0
- *
- * Two properties matter for Newton. g is BOUNDED in [0,1), so the term can
- * never exceed the local ion charge -- it neutralises, it cannot overshoot,
- * unlike pexp which grows without limit. And g is monotone, so the Jacobian
- * contribution keeps a consistent sign.
- *
- * g is continuous at phi = Vref but its derivative jumps from 0 to 1/Te
- * there. That kink sits exactly at the edge of the compensated region. It is
- * left in rather than smoothed because the discontinuity is in the SECOND
- * derivative of the residual, which Newton tolerates, and smoothing it would
- * blur the transition the model exists to predict.
+/* g(phi) = 1 - exp( -(phi-Vref)/Te ) for phi > Vref, otherwise 0, and its
+ * derivative. g is in [0,1), so the electron charge never exceeds the ion
+ * charge.
  */
 void EpotSolver::comp_newton( double &g, double &dg, double epot ) const
 {
-    double u = (epot - _compVref) / _compTe;
+    double u = (epot - _comp.Vref) / _comp.Te;
     if( u <= 0.0 ) {
         g = 0.0;
         dg = 0.0;
@@ -364,7 +290,7 @@ void EpotSolver::comp_newton( double &g, double &dg, double epot ) const
     }
     double e = exp( -u );
     g  = 1.0 - e;
-    dg = e / _compTe;
+    dg = e / _comp.Te;
 }
 
 
@@ -373,21 +299,15 @@ void EpotSolver::set_beam_compensation( double Te, double Vref, double rho_min,
 {
     if( Te <= 0.0 )
         throw( Error( ERROR_LOCATION, "compensation temperature must be positive" ) );
-    // Turning compensation on can switch the problem from linear to
-    // nonlinear (linear() returns false when _comp), so that needs the full
-    // reset. Re-arming it -- new Te/Vref/rho_min/region, or a switch
-    // between the plain and ascent forms -- changes only Jacobian values:
-    // the region and confinement mask are evaluated per node in
-    // update_nonlinear_node(), and the ascent mask is rebuilt in every
-    // build_mat_vec().
-    bool params_only = _comp;
-    _comp             = true;
-    _comp_ascent      = false;
-    _comp_bbox_set    = false;
-    _compTe           = Te;
-    _compVref         = Vref;
-    _compRhoMin       = rho_min;
-    _comp_region_func = region;
+    // Enabling the model can make a linear problem nonlinear. Anything
+    // else changes parameters of the nonlinear term only.
+    bool params_only = _comp.enabled;
+    _comp = Compensation();
+    _comp.enabled = true;
+    _comp.Te      = Te;
+    _comp.Vref    = Vref;
+    _comp.rho_min = rho_min;
+    _comp.region  = region;
     if( params_only )
         reset_nonlinear_parameters();
     else
@@ -398,11 +318,8 @@ void EpotSolver::set_beam_compensation( double Te, double Vref, double rho_min,
 void EpotSolver::set_beam_compensation_ascent( double Te, double Vref, double rho_min,
                                                CallbackFunctorB_V *region )
 {
-    // set_beam_compensation() does whichever reset is needed; the two flags
-    // set afterwards do not affect it.
     set_beam_compensation( Te, Vref, rho_min, region );
-    _comp_ascent   = true;
-    _comp_bbox_set = false;
+    _comp.ascent = true;
 }
 
 
@@ -415,19 +332,16 @@ void EpotSolver::set_beam_compensation_ascent( double Te, double Vref, double rh
             throw( Error( ERROR_LOCATION, "compensation box has bmax < bmin on axis "
                           + to_string(a) ) );
     set_beam_compensation( Te, Vref, rho_min, region );
-    _comp_ascent   = true;
-    _comp_bbox_set = true;
-    _comp_bmin     = bmin;
-    _comp_bmax     = bmax;
+    _comp.ascent   = true;
+    _comp.bbox_set = true;
+    _comp.bmin     = bmin;
+    _comp.bmax     = bmax;
 }
 
 
 void EpotSolver::unset_beam_compensation( void )
 {
-    _comp = false;
-    _comp_ascent = false;
-    _comp_bbox_set = false;
-    _comp_region_func = NULL;
+    _comp = Compensation();
     reset_problem();
 }
 
@@ -466,12 +380,8 @@ void EpotSolver::nsimp_newton( double &rhs, double &drhs, double epot ) const
 
 void EpotSolver::preprocess( MeshScalarField &epot )
 {
-    // Refuse to run a solver that does not implement Neumann masks on a
-    // geometry that contains one. See supports_neumann_mask()'s doc
-    // comment: the failure would otherwise be silent and physical-looking
-    // (the mask would act as a Dirichlet block at whatever potential
-    // happened to be stored there), which is exactly the kind of thing
-    // that gets mistaken for a real result.
+    // A solver without Neumann masks would use a mask as an electrode at
+    // whatever potential is stored at its nodes.
     if( !supports_neumann_mask() ) {
 	for( uint32_t n = 7; n <= _geom.number_of_boundaries(); n++ ) {
 	    if( _geom.get_boundary(n).type() == BOUND_NEUMANN )
@@ -511,20 +421,11 @@ void EpotSolver::preprocess( MeshScalarField &epot )
 
 
     // Set forced vacuum nodes and dirichlet nodes to correct
-    // potential. Mark fixed vacuum nodes with a tag. Every node only
-    // reads/writes its own (i,j,k) slot of _geom.mesh()/epot(), with no
-    // dependency on any other node, so this is embarrassingly parallel.
-    // The one requirement this imposes: _force_pot_func/_force_pot_func2/
-    // _init_plasma_func (user-supplied callbacks) and
-    // Boundary::value() must be safe to call concurrently from multiple
-    // threads, since this loop calls them with no locking.
-    // node_id should always be one of the three cases handled below --
-    // the final "else" is a defensive, should-never-happen case. It used
-    // to just throw directly, which is fine in a serial loop but is
-    // undefined behavior (typically std::terminate) if it escapes an
-    // OpenMP parallel region uncaught. So it's turned into a shared
-    // flag instead, checked (and thrown from, serially) after the
-    // parallel loop ends.
+    // potential. Mark fixed vacuum nodes with a tag. The user functions
+    // (forced potential, initial plasma, boundary values) are called from
+    // several threads at once, so they have to be thread safe. An error is
+    // flagged and thrown after the loop, as an exception must not leave a
+    // parallel region.
     std::atomic<bool> bad_node( false );
     int nthreads = (int)ibsimu.get_thread_count();
 #pragma omp parallel for num_threads(nthreads) collapse(3) schedule(dynamic,64)
@@ -541,65 +442,20 @@ void EpotSolver::preprocess( MeshScalarField &epot )
 		if( node_id == SMESH_NODE_ID_NEAR_SOLID ||
 		    node_id == SMESH_NODE_ID_PURE_VACUUM ) {
 
-		    // Vacuum -- but this can *also* be genuinely dielectric
-		    // material, in two different ways: directly (raw
-		    // SMESH_NODE_ID_PURE_VACUUM[_FIX] tag with a solid
-		    // number >=7 in the lower bits -- see
-		    // Geometry::build_mesh_parallel_thread_3d() -- because
-		    // it satisfies the same homogeneous Laplace stencil
-		    // shape as vacuum, just with a position-dependent
-		    // permittivity applied by add_vacuum_node()/
-		    // vacuum_face_coefficient()), or more subtly, tagged
-		    // SMESH_NODE_ID_NEAR_SOLID instead: a dielectric that
-		    // reaches a simulation box edge gets reset and
-		    // reclassified by the ordinary box-edge decision tree
-		    // (Geometry::override_dielectric_box_boundary_3d()), and
-		    // if a *real conductor* also happens to be adjacent to
-		    // that same node along a different axis, that tree
-		    // tags it NEAR_SOLID -- discarding the material number,
-		    // so it looks exactly like an ordinary near-conductor
-		    // vacuum node by raw tag alone. Either way it is
-		    // emphatically not a region a plasma or a forced
-		    // potential can occupy: unlike real vacuum, it is a
-		    // fixed physical medium and must always stay a
-		    // genuinely free node. is_dielectric_at() (see its doc
-		    // comment above) catches both cases -- fast raw-tag
-		    // path for the first, geometric fallback for the
-		    // second -- and is deliberately checked *after* the
-		    // cheaper force_pot_func/force_pot_func2/init_plasma_func
-		    // predicates below, so the (potentially expensive,
-		    // STL-backed) geometry query only runs on nodes where
-		    // forcing would otherwise actually apply. Missing the
-		    // NEAR_SOLID case here is exactly what let a dielectric
-		    // squeezed between a box wall and a grounded electrode
-		    // stay pinned to the plasma potential right at that
-		    // corner, even after the box-edge Neumann case was
-		    // fixed.
-		    // A Neumann solid's SURFACE LAYER carries a vacuum tag so
-		    // that it stays in the solve (Geometry::neumann_surface_
-		    // retag()), but it is *inside* a solid: it is the node the
-		    // field mirrors about, not a region a plasma or a forced
-		    // potential may occupy. It is excluded from forcing for
-		    // exactly the reason a dielectric is -- see the comment
-		    // above -- and it must be, or the branches below turn it
-		    // into a PURE_VACUUM_FIX node; postprocess() only restores
-		    // those away from the box faces, so one lying on a face is
-		    // stranded with a FIX tag that the next preprocess() then
-		    // rejects as an unknown node id.
-		    if( _geom.is_neumann_surface( i, j, k ) )
-			continue;
-
+		    // A node inside a dielectric (which a near-solid node
+		    // can be as well) is never fixed: there is no plasma
+		    // and no forced potential inside a solid.
 		    double val;
 		    if( _force_pot_func2 &&
 			comp_isfinite( (val = (*_force_pot_func2)( x ))) &&
-			!is_dielectric_at( _geom, i, j, k ) ) {
+			!_geom.dielectric_material_at( i, j, k ) ) {
 
 			// Mark as fixed vacuum
 			_geom.mesh(i,j,k) |= SMESH_NODE_FIXED;
 			epot(i,j,k) = val;
 
 		    } else if( _force_pot_func && (*_force_pot_func)( x ) &&
-			       !is_dielectric_at( _geom, i, j, k ) ) {
+			       !_geom.dielectric_material_at( i, j, k ) ) {
 
 			// Mark as fixed vacuum
 			_geom.mesh(i,j,k) |= SMESH_NODE_FIXED;
@@ -608,7 +464,7 @@ void EpotSolver::preprocess( MeshScalarField &epot )
 		    } else if( (_plasma == PLASMA_PEXP_INITIAL ||
 				_plasma == PLASMA_NSIMP_INITIAL) &&
 			       _init_plasma_func && (*_init_plasma_func)( x ) &&
-			       !is_dielectric_at( _geom, i, j, k ) ) {
+			       !_geom.dielectric_material_at( i, j, k ) ) {
 
 			// Mark as fixed vacuum
 			_geom.mesh(i,j,k) |= SMESH_NODE_FIXED;
@@ -618,27 +474,10 @@ void EpotSolver::preprocess( MeshScalarField &epot )
 
 		} else if( node_id == SMESH_NODE_ID_NEUMANN ) {
 
-		    // A dielectric reaching this Neumann box wall had its
-		    // material number discarded when its tag was
-		    // reclassified (see the doc comment on
-		    // is_dielectric_at() above) -- it must still be
-		    // excluded from forcing, exactly like the dielectric-
-		    // interior case above, even though the raw tag alone
-		    // can't tell us that anymore. Without this check, a
-		    // dielectric slab reaching the mirror/Neumann side
-		    // walls would get pinned to the plasma's initial
-		    // potential right at that edge (while the rest of the
-		    // slab solved correctly), instead of behaving like an
-		    // ordinary permittivity-weighted mirror node the way
-		    // add_neumann_node() already treats it. is_dielectric_at()
-		    // does a real geometric query (Geometry::inside()), so
-		    // it's deliberately checked *after* the cheaper
-		    // force_pot_func/init_plasma_func predicates, not on
-		    // every Neumann node unconditionally -- only nodes where
-		    // forcing would otherwise actually apply pay for it.
+		    // Not inside a dielectric, as above.
 		    if( _force_pot_func && (*_force_pot_func)( x ) ) {
 
-			if( !is_dielectric_at( _geom, i, j, k ) ) {
+			if( !_geom.dielectric_material_at( i, j, k ) ) {
 			    // Mark as fixed vacuum
 			    _geom.mesh(i,j,k) = SMESH_NODE_ID_PURE_VACUUM_FIX;
 			    epot(i,j,k) = _force_pot;
@@ -648,7 +487,7 @@ void EpotSolver::preprocess( MeshScalarField &epot )
 				_plasma == PLASMA_NSIMP_INITIAL) &&
 			       _init_plasma_func && (*_init_plasma_func)( x ) ) {
 
-			if( !is_dielectric_at( _geom, i, j, k ) ) {
+			if( !_geom.dielectric_material_at( i, j, k ) ) {
 			    // Mark as fixed vacuum
 			    _geom.mesh(i,j,k) = SMESH_NODE_ID_PURE_VACUUM_FIX;
 			    epot(i,j,k) = _Up;
@@ -663,21 +502,8 @@ void EpotSolver::preprocess( MeshScalarField &epot )
 
 		} else if( node_id == SMESH_NODE_ID_NEUMANN_MASK ) {
 
-		    // Inside a Neumann-mask solid: no equation and no value.
-		    //
-		    // Deliberately does NOT write epot here. The node carries
-		    // the SMESH_NODE_FIXED bit so it is eliminated from the
-		    // matrix, but unlike a Dirichlet node its stored potential
-		    // is never read back into any live row --
-		    // EpotMatrixSolver::set_link() diverts links pointing at
-		    // it onto the row's own diagonal instead of onto the right
-		    // hand side. Whatever epot holds here is therefore inert.
-		    //
-		    // It is left at its previous value rather than zeroed so
-		    // that a masked region plots as a smooth continuation of
-		    // its surroundings instead of a hole, and so that nothing
-		    // downstream mistakes a zero for a solved value. Nothing
-		    // in the solve depends on it either way.
+		    // Neumann mask: the node is not solved for and its
+		    // potential is never used. It is left as it is.
 
 		} else {
 
@@ -695,11 +521,7 @@ void EpotSolver::preprocess( MeshScalarField &epot )
 
 void EpotSolver::postprocess( void )
 {
-    // Remove fixed vacuum tags. Every node only touches its own
-    // _geom.mesh(i,j,k) slot (pure bitmask logic, no callbacks, no
-    // cross-node reads), so this is a safe, no-caveat parallel loop --
-    // the gain is smaller than preprocess()'s since there's no callback
-    // work here, but it's essentially free.
+    // Remove fixed vacuum tags.
     int nthreads = (int)ibsimu.get_thread_count();
 #pragma omp parallel for num_threads(nthreads) collapse(3) schedule(dynamic,64)
     for( uint32_t k = 0; k < _geom.size(2); k++ ) {
@@ -785,11 +607,8 @@ void EpotSolver::postprocess( void )
 
 bool EpotSolver::linear( void ) const
 {
-    // The compensation model is nonlinear in phi in its own right, so a
-    // problem carrying it is nonlinear even with no plasma_mode_e set.
-    // Without this the Newton loop is skipped and the term is silently
-    // never evaluated -- the solve converges, to the uncompensated answer.
-    if( _comp )
+    // The compensation model is nonlinear without any plasma model too.
+    if( _comp.enabled )
 	return( false );
 
     switch( _plasma ) {
@@ -887,10 +706,6 @@ uint8_t EpotSolver::boundary_index_general( uint32_t i, uint32_t j, uint32_t k )
 MeshScalarField *EpotSolver::evaluate_scharge( const ScalarField &__scharge ) const
 {
     // If scharge not defined in same points as geometry, evaluate scharge at nodes.
-    // Every node is independent (writes only to its own (i,j,k) slot, no
-    // read of any neighbour), so this is embarrassingly parallel -- the
-    // only requirement is that __scharge's operator() is safe to call
-    // concurrently from multiple threads, since it gets no locking here.
     MeshScalarField *scharge = new MeshScalarField( _geom );
     int nthreads = (int)ibsimu.get_thread_count();
 #pragma omp parallel for num_threads(nthreads) collapse(3) schedule(dynamic,64)

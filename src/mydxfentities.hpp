@@ -146,6 +146,12 @@ public:
      */
     virtual EntityType get_type( void ) const = 0;
 
+    /*! \brief Return this entity as a path entity, or NULL if it is not one.
+     *
+     *  Lets inside_loop() avoid a dynamic_cast per entity per point test.
+     */
+    virtual const class MyDXFPathEntity *as_path( void ) const { return( 0 ); }
+
     /*! \brief Set entity handle.
      */
     void set_handle( const std::string &handle ) { _handle = handle; }
@@ -197,6 +203,8 @@ public:
     /*! \brief Virtual destructor.
      */
     virtual ~MyDXFPathEntity() {}
+
+    virtual const MyDXFPathEntity *as_path( void ) const { return( this ); }
 
     /*! \brief Get start point of path entity.
      */

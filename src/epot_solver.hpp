@@ -230,23 +230,28 @@ protected:
     CallbackFunctorB_V *_init_plasma_func; /*!< \brief Initial plasma region function. */
     CallbackFunctorB_V *_plasma_calc_func; /*!< \brief Definition of plasma calculation region. */
 
-    /* --- Beam space-charge compensation by trapped electrons -------------
+    /*! \brief Beam space charge compensation by trapped electrons.
      *
-     * ADDITIVE, not a plasma_mode_e. Compensation coexists with the source
-     * plasma model rather than replacing it: pexp supplies the electrons in
-     * the source, this supplies the ones trapped in the beam's own well
-     * downstream, and a run needs BOTH at once. It therefore carries its own
-     * enable flag and its own region function, independent of _plasma and
-     * _plasma_calc_func. */
-    bool                _comp;             /*!< \brief Compensation model enabled. */
-    double              _compTe;           /*!< \brief Trapped-electron temperature (eV). */
-    double              _compVref;         /*!< \brief Wall/electrode potential (V). */
-    double              _compRhoMin;       /*!< \brief Ion-density floor (C/m3). */
-    CallbackFunctorB_V *_comp_region_func; /*!< \brief Compensation region, NULL = everywhere. */
-    bool                _comp_ascent;      /*!< \brief Use the trapped-electron ascent test. */
-    bool                _comp_bbox_set;    /*!< \brief Confine the ascent to a box. */
-    Vec3D               _comp_bmin;        /*!< \brief Box lower corner (m). */
-    Vec3D               _comp_bmax;        /*!< \brief Box upper corner (m). */
+     *  Not a plasma_mode_e: it is used together with the plasma model of
+     *  the source, which gives the electrons of the source plasma, while
+     *  this gives the ones trapped in the potential well of the beam
+     *  downstream.
+     */
+    struct Compensation {
+	bool                enabled;       /*!< \brief Model in use. */
+	double              Te;            /*!< \brief Trapped electron temperature (eV). */
+	double              Vref;          /*!< \brief Wall/electrode potential (V). */
+	double              rho_min;       /*!< \brief Ion density floor (C/m3). */
+	CallbackFunctorB_V *region;        /*!< \brief Compensation region, NULL = everywhere. */
+	bool                ascent;        /*!< \brief Use the trapped electron ascent test. */
+	bool                bbox_set;      /*!< \brief Confine the ascent test to a box. */
+	Vec3D               bmin;          /*!< \brief Box lower corner (m). */
+	Vec3D               bmax;          /*!< \brief Box upper corner (m). */
+
+	Compensation() : enabled(false), Te(1.0), Vref(0.0), rho_min(0.0),
+			 region(0), ascent(false), bbox_set(false) {}
+    };
+    Compensation        _comp;                     /*!< \brief Beam compensation model. */
 
     double              _plA;              /*!< \brief Plasma parameter.
 				            *   For positive ion extraction: rho_th * h^2 / epsilon_0,
@@ -282,10 +287,9 @@ protected:
      */
     void pexp_newton( double &rhs, double &drhs, double epot ) const;
 
-    /*! \brief Compensation shape function g and dg/dphi.
-     *
-     *  Returns the DIMENSIONLESS g in [0,1); the caller multiplies by the
-     *  local rho_i*h^2/epsilon_0, exactly as the shield model does. */
+    /*! \brief Fraction g of the ion charge that the electrons compensate
+     *  at potential \a epot, and its derivative dg/dphi.
+     */
     void comp_newton( double &g, double &dg, double epot ) const;
 
     /*! \brief Return non-linear right-hand-side and it's derivative
@@ -345,22 +349,9 @@ protected:
      */
     void preprocess( MeshScalarField &epot );
 
-    /*! \brief Does this solver implement Neumann-mask solids?
-     *
-     *  A Neumann mask (a solid given BOUND_NEUMANN, see
-     *  Geometry::set_boundary()) removes its nodes from the solve and puts
-     *  a zero-flux condition on every face separating one of them from a
-     *  live node. In EpotMatrixSolver that falls out of set_link()
-     *  redirecting such a face onto the row's own diagonal, so every
-     *  stencil builder gets it for free.
-     *
-     *  The Gauss-Seidel and multigrid solvers do not go through set_link()
-     *  -- they carry their own hand-written stencils per node type -- so
-     *  they would silently treat a masked node as an ordinary fixed node
-     *  and read its (meaningless) stored potential into their neighbours'
-     *  right hand sides. Rather than let that happen quietly, preprocess()
-     *  refuses to run them on a geometry containing a mask. Override to
-     *  true once a solver actually handles it.
+    /*! \brief Does the solver implement Neumann masks (solids with
+     *  BOUND_NEUMANN)? preprocess() throws an error if the geometry has
+     *  one and the solver does not.
      */
     virtual bool supports_neumann_mask( void ) const { return( false ); }
 
@@ -375,19 +366,13 @@ protected:
      */
     virtual void reset_problem( void ) = 0;
 
-    /*! \brief Called instead of reset_problem() when a setter changes only
-     *  the parameters of the nonlinear model already in use (plasma
-     *  density/temperature/potential, compensation Te/Vref/region, plasma
-     *  calculation region), not the model type or which nodes are fixed.
+    /*! \brief Called instead of reset_problem() when only the parameters
+     *  of the nonlinear model in use change (plasma density, temperature
+     *  and potential, plasma calculation region, compensation
+     *  parameters), and neither the model nor the set of fixed nodes.
      *
-     *  Those parameters enter only the Jacobian values -- the plasma
-     *  coefficients are recomputed in preprocess() and the nonlinear term
-     *  is re-evaluated every Newton iteration -- so the matrix pattern and
-     *  node elimination are unchanged. The default is a full
-     *  reset_problem(), which is always safe. Solvers that cache work that
-     *  depends only on the pattern (EpotBiCGSTABSolver's GMG hierarchy)
-     *  override this to keep it: callers that update the plasma model
-     *  every major cycle would otherwise rebuild it every cycle.
+     *  The matrix pattern stays the same then, so a solver can override
+     *  this to keep what it has built from the pattern.
      */
     virtual void reset_nonlinear_parameters( void ) { reset_problem(); }
 
@@ -459,45 +444,15 @@ public:
     void set_initial_plasma( double Up,
 			     CallbackFunctorB_V *init_plasma_func );
 
-    /*! \brief Seed \a scharge with a guessed space-charge density \a
-     *  rho throughout the region where \a plasma_region_func returns
-     *  true, leaving every other node untouched.
+    /*! \brief Set space charge density \a scharge to \a rho at the nodes
+     *  where \a plasma_region_func returns true and that are not inside a
+     *  solid.
      *
-     *  This is an alternative to set_initial_plasma(): instead of
-     *  force-fixing the potential in an assumed plasma region for one
-     *  linear bootstrap solve (PLASMA_PEXP_INITIAL/PLASMA_NSIMP_INITIAL)
-     *  and then switching to the real nonlinear model
-     *  (PLASMA_PEXP/PLASMA_NSIMP) once particles have flown -- which
-     *  changes which nodes are eliminated from the matrix between the
-     *  first major cycle and the rest, forcing
-     *  EpotBiCGSTABSolver/GMG_Precond to rebuild the whole preconditioner
-     *  hierarchy at that transition -- this lets set_pexp_plasma()/
-     *  set_nsimp_plasma() be called once, before the very first solve,
-     *  with \a scharge already carrying a physically reasonable initial
-     *  guess in the plasma volume. The degrees of freedom and matrix
-     *  sparsity pattern are then identical from the first major cycle
-     *  onward: every solve is the same nonlinear problem, just with
-     *  scharge itself updated (e.g. by blending in the particle-tracked
-     *  density each major cycle, as the caller already does), so
-     *  GMG_Precond's node map never changes and its expensive
-     *  prepare() step only ever needs to run once.
-     *
-     *  Mirrors the plain loop over Geometry's mesh nodes this replaces
-     *  (see test_no_plasma.cpp for the pattern this generalizes):
-     *  \a plasma_region_func is called once per mesh node with that
-     *  node's position, exactly like \a init_plasma_func above, and
-     *  \a scharge is otherwise assumed already sized to \a geom (i.e.
-     *  constructed from the same Geometry passed to this solver).
-     *
-     *  \a plasma_region_func only needs to describe the plasma's
-     *  geometric extent (e.g. "z < 0") -- solid nodes within that
-     *  region are always skipped regardless of what it returns, since a
-     *  dielectric node is an ordinary free row whose right hand side
-     *  directly includes \a rho (see add_vacuum_node()): seeding it
-     *  there would inject a spurious free-charge source term into a
-     *  medium that has no mobile charge at all. A conductor node is
-     *  eliminated from the matrix and would just be a silent no-op, but
-     *  is skipped too for clarity.
+     *  An alternative to set_initial_plasma(): the nonlinear plasma model
+     *  is used from the first solve on, with this as the initial guess of
+     *  the ion charge in the plasma. No nodes are fixed for the first
+     *  solve, so the problem has the same free nodes in every solve and a
+     *  solver can keep its matrix and preconditioner.
      */
     void set_initial_plasma_rho( MeshScalarField &scharge, double rho,
 				  CallbackFunctorB_V *plasma_region_func ) const;
@@ -526,112 +481,65 @@ public:
      */
     void set_pexp_plasma( double rhoe, double Te, double Up );
 
-    /*! \brief Enable beam space-charge compensation by trapped electrons.
+    /*! \brief Enable beam space charge compensation by trapped electrons.
      *
-     *  Adds, at every node of \a region carrying at least \a rho_min of ion
-     *  charge, a compensating electron density
+     *  At every node of \a region with an ion charge density of at least
+     *  \a rho_min, the electron charge density
      *
-     *    rho_e = -rho_i * ( 1 - exp( -(phi - Vref)/Te ) ),   phi > Vref
+     *    rho_e = -rho_i * ( 1 - exp( -(phi - Vref)/Te ) )   for phi > Vref
      *
-     *  and zero below Vref. \a rho_i is read from the space charge passed to
-     *  solve(), so that field must contain the ION charge only -- the
-     *  compensating charge is generated here and must not also be supplied.
+     *  is added, where rho_i is the space charge density given to solve(),
+     *  which must therefore be that of the ions only. The model is used
+     *  in addition to the plasma model that is set.
      *
-     *  Unlike set_pexp_plasma(), whose prefactor is a single constant, the
-     *  prefactor is the LOCAL ion density; the term is therefore bounded by
-     *  rho_i rather than growing without limit, which is what keeps Newton
-     *  well behaved.
+     *  \a region has to leave out the source plasma, whose electrons
+     *  come from the plasma model, and the acceleration gap, where the
+     *  potential is far above \a Vref but no electrons are trapped.
      *
-     *  This is ADDITIVE: it does not disturb whatever plasma_mode_e is set,
-     *  and both are evaluated at every node. A run modelling an extraction
-     *  system needs the source plasma AND the compensated drift at once.
-     *
-     *  \a region MUST exclude the source plasma and the acceleration gap.
-     *  There phi - Vref runs up to the full extraction voltage, the model
-     *  reads that as an arbitrarily deep trap, and any beam inside it is
-     *  reported as fully compensated -- while the source plasma's electrons
-     *  are ALREADY supplied by set_pexp_plasma(), so it would double-count
-     *  them where the ion density is largest. NULL means "everywhere", which
-     *  is only correct if no beam exists outside the compensated drift.
-     *
-     *  \param Te      trapped-electron temperature (eV), > 0
-     *  \param Vref    wall/electrode potential the barrier is measured from
-     *  \param rho_min ion-density floor; nodes below it get no compensation
-     *  \param region  spatial predicate, or NULL for the whole mesh
+     *  \param Te      electron temperature (eV), > 0
+     *  \param Vref    potential of the wall that confines the electrons (V)
+     *  \param rho_min lowest ion charge density compensated (C/m3)
+     *  \param region  compensated region, NULL for the whole mesh
      */
     void set_beam_compensation( double Te, double Vref, double rho_min = 0.0,
                                 CallbackFunctorB_V *region = NULL );
 
-    /*! \brief Beam compensation with a TRAPPED-ELECTRON test (ascent variant).
+    /*! \brief Beam compensation with a test of electron confinement.
      *
-     *  Same charge as set_beam_compensation(),
+     *  The model of set_beam_compensation(), used only at the nodes where
+     *  an electron starting at rest is confined. From each node the
+     *  potential is followed uphill, as the electron would go. If the path
+     *  ends at a potential maximum inside \a region the node is
+     *  compensated, and if it ends in a solid or leaves \a region it is
+     *  not. With this test an acceleration gap that is not closed off by
+     *  an electron barrier stays uncompensated without having to be left
+     *  out of \a region.
      *
-     *    rho_e = -rho_i * ( 1 - exp( -(phi - Vref)/Te ) ),
-     *
-     *  but applied only where a cold electron released at rest is actually
-     *  CONFINED. Confinement is decided by following steepest ascent in phi
-     *  from the node -- which is the electron's own initial trajectory, since
-     *  it accelerates toward higher potential -- and asking where the path
-     *  ends:
-     *
-     *    interior maximum inside \a region  -> trapped, compensation applies
-     *    walks into a solid                 -> absorbed, no compensation
-     *    leaves \a region                   -> escaped,  no compensation
-     *
-     *  WHY THIS EXISTS. set_beam_compensation() reads the barrier as
-     *  phi - Vref, which is only meaningful where the region is closed off
-     *  from the extraction gap by an electron barrier (a suppressor). Without
-     *  one -- a plain extractor at V_bias below the source -- phi - Vref is
-     *  large and positive throughout the acceleration gap, so that model
-     *  reports the extraction beam as fully compensated when in truth the
-     *  electrons are swept out at once. Measured on the reference geometry
-     *  with the suppressor removed: 100% of drift beam nodes compensated with
-     *  a mean barrier of 66 eV, against 0% here.
-     *
-     *  The region matters much less than it does for the plain model: over
-     *  comp_x0 = 0.5..30 mm the reference case gives an identical answer to
-     *  four decimals, because the ascent excludes the gap on its own. It is a
-     *  guard against overlapping the source plasma (whose electrons
-     *  set_pexp_plasma() already supplies) and a bound on cost, not a fitted
-     *  parameter.
-     *
-     *  NOTE the mask is boolean, so a node flipping trapped/escaped between
-     *  iterations is a discontinuity in the residual. It is recomputed each
-     *  Newton iteration; if that proves unstable, freeze it per major cycle.
+     *  The test is redone on every Newton iteration.
      */
     void set_beam_compensation_ascent( double Te, double Vref, double rho_min = 0.0,
                                        CallbackFunctorB_V *region = NULL );
 
-    /*! \brief Ascent variant confined to an axis-aligned box.
+    /*! \brief Beam compensation with a test of electron confinement,
+     *  limited to the box from \a bmin to \a bmax.
      *
-     *  Identical model, but the confinement sweep and every array it needs are
-     *  restricted to \a bmin..\a bmax instead of the whole mesh. Leaving the
-     *  box counts as escape, exactly as leaving \a region does.
-     *
-     *  This is what makes the variant usable in 3D. The functor form has to
-     *  visit every node and allocate mesh-sized workspace, because a predicate
-     *  cannot be inverted into an extent: at 1e8 nodes the ascent's own
-     *  next[] array alone would be 800 MB, for a region that may occupy 1% of
-     *  the mesh. With a box, cost and memory scale with the COMPENSATED VOLUME.
-     *
-     *  \a region may still be given and is applied on top of the box.
-     *
-     *  In MODE_CYL component 0 is the axis of propagation and component 1 is
-     *  the radius, so the box is (x_min,r_min,0)..(x_max,r_max,0). Unused
-     *  components are ignored.
+     *  Leaving the box counts as leaving the region. The work and memory
+     *  of the test are those of the box and not of the whole mesh. \a
+     *  region, if given, applies inside the box. In cylindrical geometry
+     *  the box is (x_min,r_min,0) to (x_max,r_max,0).
      */
     void set_beam_compensation_ascent( double Te, double Vref, double rho_min,
                                        const Vec3D &bmin, const Vec3D &bmax,
                                        CallbackFunctorB_V *region = NULL );
 
-    /*! \brief Is the ascent variant in use? */
-    bool get_beam_compensation_ascent( void ) const { return _comp && _comp_ascent; }
+    /*! \brief Is the test of electron confinement in use? */
+    bool get_beam_compensation_ascent( void ) const { return _comp.enabled && _comp.ascent; }
 
     /*! \brief Disable beam space-charge compensation. */
     void unset_beam_compensation( void );
 
     /*! \brief Is the compensation model enabled? */
-    bool get_beam_compensation( void ) const { return _comp; }
+    bool get_beam_compensation( void ) const { return _comp.enabled; }
 
     /*! \brief Define initial plasma boundary location to negative ion
      *  extraction problem.
