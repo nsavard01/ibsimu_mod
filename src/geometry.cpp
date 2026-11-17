@@ -1647,6 +1647,18 @@ void Geometry::validate_neumann_mask_alignment( void ) const
 			double da = fabs( cross - xa[axis] );
 			double db = fabs( cross - xb[axis] );
 			double off = ( da < db ) ? da : db;
+
+			// Where the node outside the mask is in vacuum it is the
+			// live node the field mirrors about, so the surface has to
+			// lie on that node, not on the masked one.
+			const Vec3D &xl = ia ? xb : xa;
+			bool vacuum = true;
+			for( uint32_t m = 7; m <= _n+6 && vacuum; m++ )
+			    if( m != n && inside( m, xl ) )
+				vacuum = false;
+			if( vacuum )
+			    off = ia ? db : da;
+
 			if( off > worst ) {
 			    worst = off;
 			    worst_axis = axis;
@@ -1662,9 +1674,10 @@ void Geometry::validate_neumann_mask_alignment( void ) const
 	if( worst > tol ) {
 	    std::ostringstream ss;
 	    ss << "solid " << n << " is not usable as a Neumann mask (BOUND_NEUMANN): "
-	       << "its surface must be axis-perpendicular and lie on mesh node planes. "
-	       << "Found a crossing " << worst << " m (" << (worst/_h)
-	       << " cells) off the nearest node plane at " << worst_at
+	       << "its surface must be axis-perpendicular and lie on the last live "
+	       << "node plane (the node ON the surface must be outside the solid: "
+	       << "use x > x0, not x >= x0). Found a crossing " << worst << " m ("
+	       << (worst/_h) << " cells) off that node plane at " << worst_at
 	       << " along axis " << worst_axis << "; tolerance is " << tol << " m. "
 	       << "A mask is a node-centred symmetry plane: the field mirrors about "
 	       << "the last live node, particles reflect at the analytic surface, and "
